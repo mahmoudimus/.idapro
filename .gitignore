@@ -1,0 +1,4 @@
+*.hexlic
+*.reg
+_backup
+extras/
