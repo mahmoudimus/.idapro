@@ -1,4 +1,5 @@
 import inspect
+import logging
 import time  # Import time module for tracking execution time
 import types
 import typing
@@ -11,6 +12,8 @@ import idaapi
 import idautils
 import idc
 from capstone import CS_ARCH_X86, CS_MODE_64, Cs, CsInsn
+
+logger = logging.getLogger("deflowv1")
 
 
 def clear_window(window):
@@ -175,15 +178,21 @@ def deflow(functions=None, text_seg_buffer=False):
     // 'functions' is an iterable of function entry points (start addresses) in the .text section.
     // This uses IDA's Python API to retrieve and patch bytes in the .text section.
     """
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Starting deflow with functions: %s, text_seg_buffer: %s",
+            ", ".join([format_addr(f) for f in functions]),
+            text_seg_buffer,
+        )
 
     # Get the start of the .text segment and its size in IDA.
-    # Adjust these as needed for your environment:
     text_seg = ida_segment.get_segm_by_name(".text")
     if not text_seg:
         print("[-] Could not find .text segment.")
         return
     base_address = text_seg.start_ea
     buffer = None
+
     # if do not pass functions, we will use the entire .text segment as buffer.
     if not functions:
         functions = idautils.Functions(text_seg.start_ea, text_seg.end_ea)
@@ -192,42 +201,42 @@ def deflow(functions=None, text_seg_buffer=False):
     if text_seg_buffer:
         seg_size = text_seg.end_ea - text_seg.start_ea
         # Read .text bytes into a local buffer.
-        # In many IDA versions, get_bytes can retrieve the segment's bytes:
         buffer = ida_bytes.get_bytes(base_address, seg_size)
+        logger.debug(
+            "Loaded .text segment into buffer: base_address=0x%x, size=%d",
+            base_address,
+            seg_size,
+        )
 
     for func_addr in ida_tguidm(functions):
+        logger.debug("Processing function at address: 0x%x", func_addr)
         # if buffer is None, we use the function's entire range as buffer
         # unless we asked to use the entire .text segment as buffer.
         if functions and not text_seg_buffer:
             func = ida_funcs.get_func(func_addr)
             buffer_size = func.end_ea - func_addr
             buffer = ida_bytes.get_bytes(func_addr, buffer_size)
-            print(f"@ func: {func_addr} with buffer size: {buffer_size}")
+            logger.debug("Function 0x%x: buffer size %d", func_addr, buffer_size)
 
         chunks = deflow_chunk(buffer, base_address, func_addr)
+        logger.debug(
+            "Initial chunks from deflow_chunk for function 0x%x: %s", func_addr, chunks
+        )
         while chunks:
             new_chunks = []
             for c in chunks:
+                logger.debug("Processing chunk at 0x%x", c)
                 new_chunks.extend(deflow_chunk(buffer, base_address, c))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "New chunks after iteration: %s",
+                    ", ".join([format_addr(c) for c in new_chunks]),
+                )
             chunks = new_chunks
 
 
 def deflow_chunk(buffer, base_address, address):
-    """
-    function DeflowChunk(address)
-        List<ulong> newChunks;
-
-        // 63th bit indicates if this address was extracted from a negative jump or not
-        bool isNegative = address >> 63 == 1;
-        address &= 1 << 63;
-
-        // Check if already discovered
-        if(_alreadyDiscovered.Contains(address))
-            return newChunks;
-
-        ...
-    """
-
+    logger.debug("Starting deflow_chunk analysis for address: 0x%x", address)
     new_chunks = []
 
     is_negative = address < 0
@@ -235,6 +244,7 @@ def deflow_chunk(buffer, base_address, address):
 
     # Check if we have already discovered this address
     if address in _already_discovered:
+        logger.debug("Address 0x%x already discovered, skipping.", address)
         return new_chunks
 
     _already_discovered.add(address)
@@ -254,11 +264,19 @@ def deflow_chunk(buffer, base_address, address):
     # If address < base_address, handle accordingly (in_range checks, etc.).
     start_offset = address - base_address
     if start_offset < 0 or start_offset >= len(buffer):
-        # Address not within the buffer range—nothing to do
+        logger.debug(
+            "Address 0x%x out of range in buffer, offset: %d", address, start_offset
+        )
         return new_chunks
 
     # Disassemble from 'address' until we run out of bytes
     for insn in md.disasm(buffer[start_offset:], address):
+        logger.debug(
+            "Disassembled instruction at 0x%x: %s %s",
+            insn.address,
+            insn.mnemonic,
+            insn.op_str,
+        )
         insn = typing.cast(CsInsn, insn)
         # We'll track potential jump targets
         target = 0
@@ -279,9 +297,9 @@ def deflow_chunk(buffer, base_address, address):
             or insn.mnemonic in ["ret", "retn"]
             or insn.mnemonic.startswith("ret")
         ):
-            # In Capstone, invalid instructions won't usually appear,
-            # but you can check insn.id == 0 if needed, or break on disassembly failure.
-            # This covers the "ud_mnemonic_code.Invalid" and "ud_mnemonic_code.Ret" logic:
+            logger.debug(
+                "Encountered return or invalid instruction at 0x%x", insn.address
+            )
             if last_target == 0:
                 return new_chunks  # Only accept when no lastTarget
             # If there is a last_target, continue analysis.
@@ -291,39 +309,72 @@ def deflow_chunk(buffer, base_address, address):
             # if(lastTarget == 0)
             if last_target == 0:
                 target = calc_target_jump(insn)
+                logger.debug(
+                    "Conditional jump at 0x%x with target 0x%x", insn.address, target
+                )
 
                 # Check if in range
                 if not is_in_range(target, base_address, len(buffer)):
+                    logger.debug("Target 0x%x out of range", target)
                     is_jmp = False
                 else:
                     # Check if instruction is bigger than 2,
                     # if so it won't be obfuscated but we do want to analyze the target location
                     if insn.size > 2:
+                        logger.debug(
+                            "Instruction size > 2 at 0x%x; adding target 0x%x and stopping jump analysis",
+                            insn.address,
+                            target,
+                        )
                         is_jmp = False
                         new_chunks.append(target)
             else:
                 # We already have a last_target (might be looking at junk code)
+                logger.debug(
+                    "Skipping conditional jump at 0x%x due to existing last_target 0x%x",
+                    insn.address,
+                    last_target,
+                )
                 is_jmp = False
         # 3) Check for unconditional jumps or calls
         elif insn.mnemonic in ["jmp", "call"] and last_target == 0:
-            new_address = calc_target_jump(insn)
-            if not is_in_range(new_address, base_address, len(buffer)):
+            target = calc_target_jump(insn)
+            real_head = idc.get_item_head(target)
+            logger.debug(
+                "Unconditional %s at 0x%x with target 0x%x",
+                insn.mnemonic,
+                insn.address,
+                target,
+            )
+            if not is_in_range(target, base_address, len(buffer)):
+                logger.debug("New address 0x%x out of range", target)
                 is_jmp = False
-            else:
+            elif target == real_head:
                 # If it's a CALL, add the next instruction
                 # (since CALL returns eventually)
                 if insn.mnemonic == "call":
                     # address + insn.size => next instruction's address
                     next_insn_addr = address + insn.size
+                    logger.debug(
+                        "Call instruction: adding next instruction address 0x%x",
+                        next_insn_addr,
+                    )
                     new_chunks.append(next_insn_addr)
                 # Add instruction target for further analysis
-                new_chunks.append(new_address)
+                new_chunks.append(target)
                 return new_chunks
-
+            else:
+                logger.debug(
+                    "Unconditional %s at 0x%x with target 0x%x is obfuscated",
+                    insn.mnemonic,
+                    insn.address,
+                    target,
+                )
+                new_chunks.append(target)
         #
         # "quick mafs" from the original snippet:
         #
-        location = insn.address  # In Capstone, insn.address is the runtime address
+        location = insn.address  # In Capstone, insn.address is the runtime addres
         steps_left = last_target - location  # Only valid if we have a last_target
 
         # Setup a new target if current instruction is a conditional jump
@@ -332,10 +383,19 @@ def deflow_chunk(buffer, base_address, address):
             last_branch = location
             last_branch_size = insn.size
             last_target = target
+            logger.debug(
+                "Setting branch info: last_branch=0x%x, last_branch_size=%d, last_target=0x%x",
+                last_branch,
+                last_branch_size,
+                last_target,
+            )
         elif steps_left == 0 and last_target != 0:
-            # stepsLeft was zero, meaning no collision
-            # add both target address and next instruction address
-            # so we can exit current analysis
+            logger.debug(
+                "Exact collision at 0x%x; adding 0x%x and 0x%x",
+                location,
+                last_branch + last_branch_size,
+                last_target,
+            )
             new_chunks.append(last_branch + last_branch_size)
             new_chunks.append(last_target)
             return new_chunks
@@ -345,6 +405,9 @@ def deflow_chunk(buffer, base_address, address):
             # (The original code is a bit ambiguous, but the comment suggests
             #  we measure how many bytes we are "into" the next instruction)
             count = last_target - last_branch
+            logger.debug(
+                "Obfuscated branch detected at 0x%x; count: %d", last_branch, count
+            )
             if count > 0:
                 # making sure we are a positive jump
                 buffer_offset = last_branch - base_address  # index in local buffer
@@ -352,23 +415,31 @@ def deflow_chunk(buffer, base_address, address):
                 # NOP slide everything except our own instruction
                 # for (int i = 0; i < count - lastBranchSize; i++)
                 for i in range(count - last_branch_size):
-                    ida_bytes.patch_byte(
-                        base_address + buffer_offset + last_branch_size + i,
-                        # We use NOP (0x90) for negative jumps
-                        # and int3 (0xCC) for positive
-                        0x90 if is_negative else 0xCC,
+                    patch_addr = base_address + buffer_offset + last_branch_size + i
+                    patch_byte = 0x90 if is_negative else 0xCC
+                    ida_bytes.patch_byte(patch_addr, patch_byte)
+                    logger.debug(
+                        "Patching byte at 0x%x with 0x%x", patch_addr, patch_byte
                     )
 
                 if not is_negative:
                     # Force unconditional jump
                     ida_bytes.patch_byte(base_address + buffer_offset, 0xEB)
+                    logger.debug(
+                        "Forced unconditional jump at 0x%x",
+                        base_address + buffer_offset,
+                    )
 
                 # add next instruction for analysis and exit current analysis
                 new_chunks.append(last_target)
+                logger.debug("Added new chunk target 0x%x", last_target)
                 return new_chunks
             else:
                 # we are a negative jump, set 63rd bit to indicate negative jump
                 last_target = -last_target
+                logger.debug(
+                    "Negative jump encountered. Adjusted last_target: 0x%x", last_target
+                )
                 # add target to analyzer and exit current analysis
                 new_chunks.append(last_target)
                 return new_chunks
@@ -387,7 +458,7 @@ def calc_target_jump(insn: CsInsn):
     In Capstone, you can often inspect insn.operands[0].imm for near branches.
     """
     operand = idc.get_operand_value(insn.address, 0)
-    print(
+    logger.debug(
         f"@ insn.address: {format_addr(insn.address)} with jump target: {format_addr(operand)}"
     )
     # doesn't work for some reason
@@ -414,8 +485,22 @@ def is_in_range(addr, base_address, buf_size):
     return True
 
 
+def configure_logging(log, debug=False):
+    log.propagate = False
+    log.setLevel(logging.DEBUG if debug else logging.INFO)
+
+    formatter = logging.Formatter("[%(levelname)s] @ %(asctime)s %(message)s")
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    handler.setLevel(logging.DEBUG if debug else logging.INFO)
+
+    log.handlers = []
+    log.addHandler(handler)
+
+
 if __name__ == "__main__":
     clear_output()
+    configure_logging(logger, debug=False)
     func = ida_funcs.get_func(idc.here())
-    # deflow()
-    deflow(functions=[func.start_ea], text_seg_buffer=False)
+    deflow()
+    # deflow(functions=[func.start_ea], text_seg_buffer=True)
