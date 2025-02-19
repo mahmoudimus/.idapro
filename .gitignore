@@ -2,3 +2,4 @@
 *.reg
 _backup
 extras/
+.pyxbuild/
