@@ -28,8 +28,10 @@ class ForceAnalyzeActionHandler(ida_helpers.BaseActionHandler):
             start_ea = func.start_ea
             end_ea = func.end_ea
         else:
-            start_ea, end_ea = idaapi.read_range_selection(idaapi.get_current_viewer())
-            if start_ea != idaapi.BADADDR and end_ea != idaapi.BADADDR:
+            is_selected, start_ea, end_ea = idaapi.read_range_selection(
+                idaapi.get_current_viewer()
+            )
+            if is_selected and start_ea != idaapi.BADADDR and end_ea != idaapi.BADADDR:
                 # reset ea to start_ea since we selected a range specifically to the
                 # start and end of the range
                 ea = start_ea
@@ -56,11 +58,11 @@ class ForceAnalyzeActionHandler(ida_helpers.BaseActionHandler):
         return 1
 
     def update(self, ctx):
-        return (
-            idaapi.AST_ENABLE_FOR_WIDGET
-            if ctx.widget_type == idaapi.BWN_DISASM
-            else idaapi.AST_DISABLE_FOR_WIDGET
-        )
+        match ctx.widget_type:
+            case idaapi.BWN_DISASM:
+                return idaapi.AST_ENABLE_FOR_WIDGET
+            case _:
+                return idaapi.AST_DISABLE_FOR_WIDGET
 
     @staticmethod
     def force_code_creation(start, end):

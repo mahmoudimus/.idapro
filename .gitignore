@@ -2,4 +2,7 @@
 *.reg
 _backup
 extras/
+
+# cython
 .pyxbuild/
+*.pyd

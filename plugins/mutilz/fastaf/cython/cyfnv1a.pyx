@@ -13,7 +13,7 @@ from cython import Py_ssize_t, uchar, ulonglong
     mask=ulonglong,
 )
 @cython.returns(ulonglong)
-def fnv1a_hash(data: bytes) -> int:
+def fnv1a_hash(data: memoryview | bytes | bytearray) -> int:
     """Fowler-Noll-Vo hash function
 
     >>> fnv1a_hash(b'3ce6330f-ab86-45df-b2ff-b16cad4f24f1')

@@ -1,9 +1,13 @@
 import inspect
 import time
 import types
+import typing
 from dataclasses import dataclass
 
+import ida_bytes
+import ida_ida
 import ida_kernwin
+import ida_nalt
 import ida_ua
 import idaapi
 
@@ -162,6 +166,65 @@ class WaitBox:
             WaitBox.shown = False
 
 
+def monitored_iter(iterable, timeout=60, diagnostic=None):
+    """
+    Wraps an iterable or generator to monitor its iteration time.
+    If processing takes longer than `timeout` seconds, prompts the user
+    with optional diagnostic information.
+
+    Parameters:
+        iterable: An iterable or generator to be wrapped.
+        timeout: Number of seconds to wait before prompting the user (default is 60).
+        diagnostic: Optional diagnostic information.
+            - If a string, it will be appended to the prompt.
+            - If a callable, it is called with (index, item) and should return a string.
+
+    Yields:
+        Each item from the original iterable.
+
+    Raises:
+        StopIteration: If the user chooses not to continue.
+
+    Example:
+
+    >>> def sample_diagnostic(idx, item):
+    >>>     return f"Processing item {idx}: {item}"
+    >>>
+    >>> # An example generator that yields numbers 0 to 9 with a delay.
+    >>> def slow_generator():
+    >>>     for i in range(10):
+    >>>         time.sleep(10)  # simulate long processing
+    >>>         yield i
+    >>>
+    >>> try:
+    >>>     for number in monitored_iter(slow_generator(), timeout=15, diagnostic=sample_diagnostic):
+    >>>         print(f"Got number: {number}")
+    >>> except StopIteration as e:
+    >>>     print(e)
+    """
+    t = time.time()
+    asked = False
+    for index, item in enumerate(iterable):
+        # Check if the elapsed time exceeds the timeout
+        if time.time() - t > timeout and not asked:
+            message = "The process is taking too long."
+            if diagnostic:
+                # Allow diagnostic to be a callable or a string
+                if callable(diagnostic):
+                    message += " " + diagnostic(index, item)
+                else:
+                    message += " " + str(diagnostic)
+            message += " Do you want to continue?"
+            response = idaapi.ask_yn(1, message)
+            asked = True  # Only ask once per timeout event
+            if response != 1:
+                raise StopIteration("Iteration aborted by the user.")
+            else:
+                t = time.time()  # Reset timer after confirmation
+                asked = False
+        yield item
+
+
 @dataclass
 class BaseActionHandler(idaapi.action_handler_t):
     """An action handler for IDA Pro with automatic metadata extraction.
@@ -259,3 +322,87 @@ class HookedActionMeta(type):
 
 def is_disassembly_widget(widget, popup, ctx):
     return idaapi.get_widget_type(widget) == idaapi.BWN_DISASM
+
+
+def find_signature(ida_signature: str) -> list:
+    binary_pattern = idaapi.compiled_binpat_vec_t()
+    idaapi.parse_binpat_str(binary_pattern, ida_ida.inf_get_min_ea(), ida_signature, 16)
+    results = []
+    ea = ida_ida.inf_get_min_ea()
+    while True:
+        occurence, _ = ida_bytes.bin_search(
+            ea,
+            ida_ida.inf_get_max_ea(),
+            binary_pattern,
+            ida_bytes.BIN_SEARCH_NOCASE | ida_bytes.BIN_SEARCH_FORWARD,
+        )
+        if occurence == idaapi.BADADDR:
+            break
+        results.append(occurence)
+        ea = occurence + 1
+    return results
+
+
+# TODO (mr): use find_bytes
+# https://github.com/mandiant/capa/issues/2339
+def find_byte_sequence(start: int, end: int, seq: list[int]) -> typing.Iterator[int]:
+    """yield all ea of a given byte sequence
+
+    args:
+        start: min virtual address
+        end: max virtual address
+        seq: bytes to search e.g. b"\x01\x03"
+    """
+    patterns = ida_bytes.compiled_binpat_vec_t()
+
+    seqstr = " ".join([f"{b:02x}" if b != -1 else "?" for b in seq])
+    err = ida_bytes.parse_binpat_str(
+        patterns,
+        start,
+        seqstr,
+        16,
+        ida_nalt.get_default_encoding_idx(  # use one byte-per-character encoding
+            ida_nalt.BPU_1B
+        ),
+    )
+
+    if err:
+        return
+
+    while True:
+        ea = ida_bytes.bin_search(start, end, patterns, ida_bytes.BIN_SEARCH_FORWARD)
+        # "drc_t" in IDA 9
+        ea = ea[0]
+        if ea == idaapi.BADADDR:
+            break
+        start = ea + 1
+        yield ea
+
+
+# def scan(pattern):
+#     ea = idc.find_binary(0, idc.SEARCH_DOWN | idc.SEARCH_CASE, pattern)
+#     print("Found match at %x +%x" % (ea, ea - idaapi.get_imagebase()))
+
+
+# def fullscan(pattern):
+#     ea = 0
+#     while True:
+#         ea = idc.find_binary(ea + 1, idc.SEARCH_DOWN | idc.SEARCH_CASE, pattern)
+#         if ea == idc.BADADDR:
+#             break
+#         print("Found match at %x +%x" % (ea, ea - idaapi.get_imagebase()))
+
+
+def sig_bytes_to_ida_pattern(
+    sig: str | list[int],
+    sep: str = ", ",
+    wildcards: set[int | str] = {"?", -1},
+) -> str:
+    """
+    Cannot pass in bytes or bytearray because wildcards are difficult to
+    differentiate between 0xFF and -1. Maybe we can do ord("?") which is
+    63 or 0x3F? not sure.
+    """
+    if isinstance(sig, str):
+        sig = [int(b, 16) for b in sig.split(sep)]
+    return " ".join([f"{b:02x}" if b not in wildcards else b for b in sig])
