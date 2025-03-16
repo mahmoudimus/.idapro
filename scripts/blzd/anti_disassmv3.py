@@ -54,7 +54,6 @@ NOP_PATTERNS = [
 CONDITIONAL_JUMPS = list(range(ida_allins.NN_ja, ida_allins.NN_jz + 1))
 ALL_JUMPS = CONDITIONAL_JUMPS + [ida_allins.NN_jmp]
 CALL_INSTRUCTIONS = {ida_allins.NN_call, ida_allins.NN_callfi, ida_allins.NN_callni}
-
 CONDITIONAL_JUMPS_MNEMONICS = [
     "ja",
     "jae",
@@ -765,7 +764,7 @@ def deflow(matches):
     deflow = DeFlow()
     patch_operations = []
     BUFFER_SIZE = 129  # Max size of anti-disassembly block
-    for match_start, match_len, desc, match_bytes, is_always in matches:
+    for match_start, match_len, desc, match_bytes in matches:
         match_end = match_start + match_len
         block_end = match_start + BUFFER_SIZE
         patch_operations.extend(
@@ -797,7 +796,7 @@ class JumpTargetAnalyzer:
     )
     jump_details: list = field(init=False, default_factory=list)
 
-    def process(self, mem: MemHelper, is_always: bool):
+    def process(self, mem: MemHelper):
         # Process each jump match in match_bytes.
         for jump_match in re.finditer(rb"[\xEB\x70-\x7F]", self.match_bytes):
             jump_offset = jump_match.start()
@@ -809,8 +808,6 @@ class JumpTargetAnalyzer:
                 print(
                     f"  Found {jump_match.group().hex()} @ 0x{jump_ea:X} targeting 0x{final_target:X}"
                 )
-                if is_always:
-                    break
         return self
 
     def follow_jump_chain(self, mem, current_ea, visited=None):
@@ -883,17 +880,62 @@ class JumpTargetAnalyzer:
             yield final_candidate
 
 
+@dataclass
+class MatchSegment:
+    start: int
+    length: int
+    description: str
+    matched_bytes: bytes
+
+
+class MatchChain:
+    def __init__(self, base_address: int):
+        self.base_address = base_address
+        self.segments: typing.List[MatchSegment] = []
+
+    def add_segment(self, segment: MatchSegment):
+        self.segments.append(segment)
+
+    def overall_start(self) -> int:
+        return self.segments[0].start if self.segments else 0
+
+    def overall_length(self) -> int:
+        if not self.segments:
+            return 0
+        first = self.segments[0]
+        last = self.segments[-1]
+        return (last.start + last.length) - first.start
+
+    def overall_matched_bytes(self) -> bytes:
+        return b"".join(seg.matched_bytes for seg in self.segments)
+
+    def append_junk(
+        self, junk_start: int, junk_len: int, junk_desc: str, junk_bytes: bytes
+    ):
+        seg = MatchSegment(
+            start=junk_start,
+            length=junk_len,
+            description=junk_desc,
+            matched_bytes=junk_bytes,
+        )
+        self.add_segment(seg)
+
+    def update_description(self, new_desc: str):
+        if self.segments:
+            self.segments[0].description = new_desc
+
+
 def find_stage1(mem, ea, end_ea):
     print("Searching for stage1 patterns from 0x{:X} to 0x{:X}".format(ea, end_ea))
 
     # Combine all patterns, keeping your original format
     patterns = [
-        (MULTI_PART_PATTERNS, "Multi-Part Conditional Jumps", False),
-        (SINGLE_PART_PATTERNS, "Single-Part Conditional Jumps", True),
+        (MULTI_PART_PATTERNS, "Multi-Part Conditional Jumps"),
+        (SINGLE_PART_PATTERNS, "Single-Part Conditional Jumps"),
     ]
 
     all_matches = []
-    for pattern_group, desc, is_always in patterns:
+    for pattern_group, desc in patterns:
         if not isinstance(pattern_group, list):
             pattern_group = [pattern_group]
         print(f"\nLooking for {desc} patterns:")
@@ -912,11 +954,10 @@ def find_stage1(mem, ea, end_ea):
                         match_len,
                         desc,
                         mem.mem_results[m.start() : m.end()],
-                        is_always,
                     )
                 )
 
-    for found, match_len, desc, matched_bytes, is_always in all_matches:
+    for found, match_len, desc, matched_bytes in all_matches:
         print(
             f"{desc.rjust(32, ' ')} @ 0x{found:X} - "
             f"{matched_bytes.hex()[:16]}"
@@ -947,7 +988,6 @@ def find_junk_instructions_after_stage1(mem, stage1_matches, start_ea, func_end)
         stage1_len,
         stage1_desc,
         stage1_bytes,
-        stage1_is_always,
     ) in stage1_matches:
         # Calculate the position immediately after the Stage1 match in mem_results
         current_pos = stage1_start + stage1_len - start_ea
@@ -1004,7 +1044,6 @@ def find_junk_instructions_after_stage1(mem, stage1_matches, start_ea, func_end)
                     stage1_len + total_junk_len,
                     combined_desc,
                     stage1_bytes + combined_junk_bytes,
-                    stage1_is_always,
                 )
             )
             print(
@@ -1012,12 +1051,12 @@ def find_junk_instructions_after_stage1(mem, stage1_matches, start_ea, func_end)
             )
         else:
             updated_matches.append(
-                (stage1_start, stage1_len, stage1_desc, stage1_bytes, stage1_is_always)
+                (stage1_start, stage1_len, stage1_desc, stage1_bytes)
             )
             print(f"No junk instructions follow {stage1_desc}")
 
     # Optionally sort and display matches (similar to your original code)
-    for match_start, match_len, desc, match_bytes, is_always in updated_matches:
+    for match_start, match_len, desc, match_bytes in updated_matches:
         print(
             f"{desc.rjust(32, ' ')} @ 0x{match_start:X} - "
             f"{match_bytes.hex()[:16]}{'...' if match_len > 16 else ''}"
@@ -1198,7 +1237,7 @@ def find_ending_big_instructions(mem, matches, start_ea, func_end):
     updated_matches = []
     BUFFER_SIZE = 129  # Max size of anti-disassembly block
 
-    for match_start, match_len, desc, match_bytes, is_always in matches:
+    for match_start, match_len, desc, match_bytes in matches:
         match_end = match_start + match_len
         print(f"Analyzing match: {desc} @ 0x{match_start:X} (length: {match_len})")
 
@@ -1211,7 +1250,7 @@ def find_ending_big_instructions(mem, matches, start_ea, func_end):
 
         jump_targets = JumpTargetAnalyzer(
             match_bytes, match_start, block_end, start_ea
-        ).process(mem=mem, is_always=is_always)
+        ).process(mem=mem)
         for most_likely_target in jump_targets:
             # The most_likely_target represents the most likely jump target within the
             # stub—likely the point where execution exits to the unobfuscated code.
