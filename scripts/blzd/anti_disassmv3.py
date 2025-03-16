@@ -90,6 +90,88 @@ CONDITIONAL_JUMPS_MNEMONICS = [
     "js",
     "jz",
 ]
+
+
+# Define padding pattern (common in anti-disassembly sequences)
+PADDING = rb"((\xC0[\xE0-\xFF]\x00)|(\x86|\x8A)[\xC0\xC9\xD2\xDB\xE4\xED\xF6\xFF])"
+
+# Multi-part jump patterns: pairs of conditional jumps with optional padding
+MULTI_PART_PATTERNS = [
+    rb"\x70." + PADDING + rb"*\x71.",  # JO ... JNO
+    rb"\x71." + PADDING + rb"*\x70.",  # JNO ... JO
+    rb"\x72." + PADDING + rb"*\x73.",  # JB ... JAE
+    rb"\x73." + PADDING + rb"*\x72.",  # JAE ... JB
+    rb"\x74." + PADDING + rb"*\x75.",  # JE ... JNE
+    rb"\x75." + PADDING + rb"*\x74.",  # JNE ... JE
+    rb"\x76." + PADDING + rb"*\x77.",  # JBE ... JA
+    rb"\x77." + PADDING + rb"*\x76.",  # JA ... JBE
+    rb"\x78." + PADDING + rb"*\x79.",  # JS ... JNS
+    rb"\x79." + PADDING + rb"*\x78.",  # JNS ... JS
+    rb"\x7A." + PADDING + rb"*\x7B.",  # JP ... JNP
+    rb"\x7B." + PADDING + rb"*\x7A.",  # JNP ... JP
+    rb"\x7C." + PADDING + rb"*\x7D.",  # JL ... JGE
+    rb"\x7D." + PADDING + rb"*\x7C.",  # JGE ... JL
+    rb"\x7E." + PADDING + rb"*\x7F.",  # JLE ... JG
+    rb"\x7F." + PADDING + rb"*\x7E.",  # JG ... JLE
+]
+
+# Single-part jump patterns: prefix instruction + optional padding + conditional jump
+SINGLE_PART_PATTERNS = [
+    rb"\xF8" + PADDING + rb"?\x73.",  # CLC ... JAE
+    rb"\xF9" + PADDING + rb"?\x76.",  # STC ... JBE
+    rb"\xF9" + PADDING + rb"?\x72.",  # STC ... JB
+    rb"\xA8." + PADDING + rb"?\x71.",  # TEST AL, imm8 ... JNO
+    rb"\xA9...." + PADDING + rb"?\x71.",  # TEST EAX, imm32 ... JNO
+    rb"\xF6.." + PADDING + rb"?\x71.",  # TEST r/m8, imm8 ... JNO
+    rb"\xF7....." + PADDING + rb"?\x71.",  # TEST r/m32, imm32 ... JNO
+    rb"\x84." + PADDING + rb"?\x71.",  # TEST r/m8, r8 ... JNO
+    rb"\x85." + PADDING + rb"?\x71.",  # TEST r/m32, r32 ... JNO
+    rb"\xA8." + PADDING + rb"?\x73.",  # TEST AL, imm8 ... JAE
+    rb"\xA9...." + PADDING + rb"?\x73.",  # TEST EAX, imm32 ... JAE
+    rb"\xF6.." + PADDING + rb"?\x73.",  # TEST r/m8, imm8 ... JAE
+    rb"\xF7....." + PADDING + rb"?\x73.",  # TEST r/m32, imm32 ... JAE
+    rb"\x84." + PADDING + rb"?\x73.",  # TEST r/m8, r8 ... JAE
+    rb"\x85." + PADDING + rb"?\x73.",  # TEST r/m32, r32 ... JAE
+    rb"\x80[\xE0-\xE7]\xFF" + PADDING + rb"?\x71.",  # AND r/m8, 0xFF ... JNO
+    rb"\x24\xFF" + PADDING + rb"?\x71.",  # AND AL, 0xFF ... JNO
+    rb"\x80[\xC8-\xCF]\x00" + PADDING + rb"?\x71.",  # OR r/m8, 0x00 ... JNO
+    rb"\x0C\x00" + PADDING + rb"?\x71.",  # OR AL, 0x00 ... JNO
+    rb"\x80[\xF0-\xF7]\x00" + PADDING + rb"?\x71.",  # XOR r/m8, 0x00 ... JNO
+    rb"\x34\x00" + PADDING + rb"?\x71.",  # XOR AL, 0x00 ... JNO
+    rb"\x80[\xE0-\xE7]\xFF" + PADDING + rb"?\x73.",  # AND r/m8, 0xFF ... JAE
+    rb"\x24\xFF" + PADDING + rb"?\x73.",  # AND AL, 0xFF ... JAE
+    rb"\x80[\xC8-\xCF]\x00" + PADDING + rb"?\x73.",  # OR r/m8, 0x00 ... JAE
+    rb"\x0C\x00" + PADDING + rb"?\x73.",  # OR AL, 0x00 ... JAE
+    rb"\x80[\xF0-\xF7]\x00" + PADDING + rb"?\x73.",  # XOR r/m8, 0x00 ... JAE
+    rb"\x34\x00" + PADDING + rb"?\x73.",  # XOR AL, 0x00 ... JAE
+]
+
+JUNK_PATTERNS = [
+    (rb"\x0F\x31", "RDTSC"),
+    (rb"\x0F[\x80-\x8F]..[\x00\x01]\x00", "TwoByte Conditional Jump"),
+    (rb"\xE8..[\x00\x01]\x00", "Invalid CALL"),
+    (rb"\x81[\xC0-\xC3\xC5-\xC7]....", "ADD reg32, imm32"),
+    (rb"\x80[\xC0-\xC3\xC5-\xC7].", "ADD reg8, imm8"),
+    (rb"\x83[\xC0-\xC3\xC5-\xC7].", "ADD reg32, imm8"),
+    (rb"\xC6[\xC0-\xC3\xC5-\xC7].", "MOV reg8, imm8"),
+    (rb"\xC7[\xC0-\xC3\xC5-\xC7]....", "MOV reg32, imm32"),
+    (rb"\xF6[\xD8-\xDB\xDD-\xDF]", "NEG reg8"),
+    (rb"\x80[\xE8-\xEB\xED-\xEF].", "AND reg8, imm8"),
+    (rb"\x81[\xE8-\xEB\xED-\xEF]....", "AND reg32, imm32"),
+    (rb"\x68....", "PUSH imm32"),
+    (rb"\x6A.", "PUSH imm8"),
+    (rb"[\x70-\x7F].", "Random 112-127"),
+    (rb"[\x50-\x5F]", "Single-byte PUSH/POP"),
+]
+    
+# Define "big instruction" opcode arrays
+SINGLE_BYTE_OPCODES = b"\xc8\x05\x0d\x15\x1d\x25\x2d\x35\x3d\x68\xa0\xa1\xa2\xa3\xa9\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf\xe8\xe9\x69\x81\xc7\xf7"
+MED_OPCODES = b"\xa0\xa1\xa2\xa3\x00\x01\x02\x03\x08\x09\x0a\x0b\x0f\x10\x11\x12\x13\x18\x19\x1a\x1b\x20\x21\x22\x23\x28\x29\x2a\x2b\x30\x31\x32\x33\x38\x39\x3a\x3b\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x6b\x80\x83\xf6"
+BIG_OPCODES = b"\x69\x81\x6b\x80\x83\xc0\xc1\xf6"
+ANTI_DISASM_EXTRA_BYTE = 0xF4
+SINGLE_BYTE_OPCODE_SET = set(SINGLE_BYTE_OPCODES)
+MED_OPCODE_SET = set(MED_OPCODES)
+BIG_OPCODE_SET = set(BIG_OPCODES)
 # fmt: on
 
 
@@ -679,265 +761,18 @@ class DeFlow:
         return idc.generate_disasm_line(ea, idc.GENDSM_FORCE_CODE)
 
 
-def find_stage1(mem, ea, end_ea):
-    print("Searching for stage1 patterns from 0x{:X} to 0x{:X}".format(ea, end_ea))
-
-    # Define padding pattern (common in anti-disassembly sequences)
-    padding = rb"((\xC0[\xE0-\xFF]\x00)|(\x86|\x8A)[\xC0\xC9\xD2\xDB\xE4\xED\xF6\xFF])"
-
-    # Multi-part jump patterns: pairs of conditional jumps with optional padding
-    multi_part_patterns = [
-        rb"\x70." + padding + rb"*\x71.",  # JO ... JNO
-        rb"\x71." + padding + rb"*\x70.",  # JNO ... JO
-        rb"\x72." + padding + rb"*\x73.",  # JB ... JAE
-        rb"\x73." + padding + rb"*\x72.",  # JAE ... JB
-        rb"\x74." + padding + rb"*\x75.",  # JE ... JNE
-        rb"\x75." + padding + rb"*\x74.",  # JNE ... JE
-        rb"\x76." + padding + rb"*\x77.",  # JBE ... JA
-        rb"\x77." + padding + rb"*\x76.",  # JA ... JBE
-        rb"\x78." + padding + rb"*\x79.",  # JS ... JNS
-        rb"\x79." + padding + rb"*\x78.",  # JNS ... JS
-        rb"\x7A." + padding + rb"*\x7B.",  # JP ... JNP
-        rb"\x7B." + padding + rb"*\x7A.",  # JNP ... JP
-        rb"\x7C." + padding + rb"*\x7D.",  # JL ... JGE
-        rb"\x7D." + padding + rb"*\x7C.",  # JGE ... JL
-        rb"\x7E." + padding + rb"*\x7F.",  # JLE ... JG
-        rb"\x7F." + padding + rb"*\x7E.",  # JG ... JLE
-    ]
-
-    # Single-part jump patterns: prefix instruction + optional padding + conditional jump
-    single_part_patterns = [
-        rb"\xF8" + padding + rb"?\x73.",  # CLC ... JAE
-        rb"\xF9" + padding + rb"?\x76.",  # STC ... JBE
-        rb"\xF9" + padding + rb"?\x72.",  # STC ... JB
-        rb"\xA8." + padding + rb"?\x71.",  # TEST AL, imm8 ... JNO
-        rb"\xA9...." + padding + rb"?\x71.",  # TEST EAX, imm32 ... JNO
-        rb"\xF6.." + padding + rb"?\x71.",  # TEST r/m8, imm8 ... JNO
-        rb"\xF7....." + padding + rb"?\x71.",  # TEST r/m32, imm32 ... JNO
-        rb"\x84." + padding + rb"?\x71.",  # TEST r/m8, r8 ... JNO
-        rb"\x85." + padding + rb"?\x71.",  # TEST r/m32, r32 ... JNO
-        rb"\xA8." + padding + rb"?\x73.",  # TEST AL, imm8 ... JAE
-        rb"\xA9...." + padding + rb"?\x73.",  # TEST EAX, imm32 ... JAE
-        rb"\xF6.." + padding + rb"?\x73.",  # TEST r/m8, imm8 ... JAE
-        rb"\xF7....." + padding + rb"?\x73.",  # TEST r/m32, imm32 ... JAE
-        rb"\x84." + padding + rb"?\x73.",  # TEST r/m8, r8 ... JAE
-        rb"\x85." + padding + rb"?\x73.",  # TEST r/m32, r32 ... JAE
-        rb"\x80[\xE0-\xE7]\xFF" + padding + rb"?\x71.",  # AND r/m8, 0xFF ... JNO
-        rb"\x24\xFF" + padding + rb"?\x71.",  # AND AL, 0xFF ... JNO
-        rb"\x80[\xC8-\xCF]\x00" + padding + rb"?\x71.",  # OR r/m8, 0x00 ... JNO
-        rb"\x0C\x00" + padding + rb"?\x71.",  # OR AL, 0x00 ... JNO
-        rb"\x80[\xF0-\xF7]\x00" + padding + rb"?\x71.",  # XOR r/m8, 0x00 ... JNO
-        rb"\x34\x00" + padding + rb"?\x71.",  # XOR AL, 0x00 ... JNO
-        rb"\x80[\xE0-\xE7]\xFF" + padding + rb"?\x73.",  # AND r/m8, 0xFF ... JAE
-        rb"\x24\xFF" + padding + rb"?\x73.",  # AND AL, 0xFF ... JAE
-        rb"\x80[\xC8-\xCF]\x00" + padding + rb"?\x73.",  # OR r/m8, 0x00 ... JAE
-        rb"\x0C\x00" + padding + rb"?\x73.",  # OR AL, 0x00 ... JAE
-        rb"\x80[\xF0-\xF7]\x00" + padding + rb"?\x73.",  # XOR r/m8, 0x00 ... JAE
-        rb"\x34\x00" + padding + rb"?\x73.",  # XOR AL, 0x00 ... JAE
-    ]
-
-    # Combine all patterns, keeping your original format
-    patterns = [
-        (multi_part_patterns, "Multi-Part Conditional Jumps", False),
-        (single_part_patterns, "Single-Part Conditional Jumps", True),
-    ]
-
-    all_matches = []
-    for pattern_group, desc, is_always in patterns:
-        if not isinstance(pattern_group, list):
-            pattern_group = [pattern_group]
-        print(f"\nLooking for {desc} patterns:")
-        for pattern in pattern_group:
-            match = re.finditer(pattern, mem.mem_results, re.DOTALL)
-            for m in match:
-                found = ea + m.start()
-                # Optionally remove this check for anti-disassembly sequences
-                # if idc.get_item_head(found) != found:
-                #     continue
-                match_len = m.end() - m.start()
-                matched_bytes = mem.mem_results[m.start() : m.start() + match_len]
-                all_matches.append(
-                    (
-                        found,
-                        match_len,
-                        desc,
-                        mem.mem_results[m.start() : m.end()],
-                        is_always,
-                    )
-                )
-    # pattern_groups = [
-    #     (multi_part_patterns, "Multi-Part Conditional Jumps", False),
-    #     (single_part_patterns, "Single-Part Conditional Jumps", True),
-    # ]
-
-    # always_taken_matches = []
-    # non_always_taken_matches = []
-
-    # for pattern_group, desc, is_always in pattern_groups:
-    #     print(f"\nLooking for {desc} patterns:")
-    #     for pattern in pattern_group:
-    #         for m in re.finditer(pattern, mem.mem_results, re.DOTALL):
-    #             found = ea + m.start()
-    #             match_len = m.end() - m.start()
-    #             matched_bytes = mem.mem_results[m.start() : m.end()]
-    #             if is_always:
-    #                 # Assume the match ends with a 2-byte conditional jump.
-    #                 # Compute the jump target:
-    #                 #  - The jump instruction is assumed to be at the end of the match.
-    #                 #  - jmp_ea is the address of the jump opcode.
-    #                 jmp_ea = found + match_len - 2
-    #                 # Read the displacement from the last byte of the match.
-    #                 jmp_disp = int.from_bytes(
-    #                     matched_bytes[-1:], byteorder="little", signed=True
-    #                 )
-    #                 # The jump instruction length is 2 bytes.
-    #                 jump_target = jmp_ea + 2 + jmp_disp
-    #                 # Final patch length covers everything from the start of the match
-    #                 # up to the jump target.
-    #                 final_patch_length = jump_target - found
-    #                 entry = (found, final_patch_length, desc, matched_bytes)
-    #                 always_taken_matches.append(entry)
-    #             else:
-    #                 entry = (found, match_len, desc, matched_bytes)
-    #                 non_always_taken_matches.append(entry)
-
-    # always_taken_matches.sort()
-    # non_always_taken_matches.sort()
-    # print("\nAlways-Taken Matches (final patch length computed):")
-    # for found, patch_len, desc, matched_bytes in always_taken_matches:
-    #     print(
-    #         f"{desc.rjust(32, ' ')} @ 0x{found:X} - "
-    #         f"{matched_bytes.hex()[:16]}"
-    #         f"{'...' if match_len >= 15 else ''}"
-    #     )
-
-    # print("\nNon-Always-Taken Matches:")
-    for found, match_len, desc, matched_bytes, is_always in all_matches:
-        print(
-            f"{desc.rjust(32, ' ')} @ 0x{found:X} - "
-            f"{matched_bytes.hex()[:16]}"
-            f"{'...' if match_len >= 15 else ''}"
+def deflow(matches):
+    deflow = DeFlow()
+    patch_operations = []
+    BUFFER_SIZE = 129  # Max size of anti-disassembly block
+    for match_start, match_len, desc, match_bytes, is_always in matches:
+        match_end = match_start + match_len
+        block_end = match_start + BUFFER_SIZE
+        patch_operations.extend(
+            deflow.deflow(match_start, block_end, match_start, match_end)
         )
-    return all_matches
-
-
-# Function to find junk instructions after stage1 matches
-def find_junk_instructions_after_stage1(mem, stage1_matches, start_ea, func_end):
-    """
-    - Register-based operations (0-57): ~58% chance.
-    - RDTSC (58-60): ~3% chance.
-    - PUSH imm32 (61-62): ~2% chance.
-    - PUSH imm8 (63-65): ~3% chance.
-    - Single-byte instructions (66-75): ~10% chance.
-    - Conditional jumps with 8-bit offset (76-80): ~5% chance.
-    - Conditional jumps with 32-bit offset (81-90): ~10% chance.
-    - CALL instruction (91-99): ~9% chance.
-    """
-    print(
-        f"\nPhase 2: Checking for junk instructions immediately following Stage1 matches"
-    )
-
-    junk_patterns = [
-        (rb"\x0F\x31", "RDTSC"),
-        (rb"\x0F[\x80-\x8F]..[\x00\x01]\x00", "TwoByte Conditional Jump"),
-        (rb"\xE8..[\x00\x01]\x00", "Invalid CALL"),
-        (rb"\x81[\xC0-\xC3\xC5-\xC7]....", "ADD reg32, imm32"),
-        (rb"\x80[\xC0-\xC3\xC5-\xC7].", "ADD reg8, imm8"),
-        (rb"\x83[\xC0-\xC3\xC5-\xC7].", "ADD reg32, imm8"),
-        (rb"\xC6[\xC0-\xC3\xC5-\xC7].", "MOV reg8, imm8"),
-        (rb"\xC7[\xC0-\xC3\xC5-\xC7]....", "MOV reg32, imm32"),
-        (rb"\xF6[\xD8-\xDB\xDD-\xDF]", "NEG reg8"),
-        (rb"\x80[\xE8-\xEB\xED-\xEF].", "AND reg8, imm8"),
-        (rb"\x81[\xE8-\xEB\xED-\xEF]....", "AND reg32, imm32"),
-        (rb"\x68....", "PUSH imm32"),
-        (rb"\x6A.", "PUSH imm8"),
-        (rb"[\x70-\x7F].", "Random 112-127"),
-        (rb"[\x50-\x5F]", "Single-byte PUSH/POP"),
-    ]
-
-    updated_matches = []
-    for (
-        stage1_start,
-        stage1_len,
-        stage1_desc,
-        stage1_bytes,
-        stage1_is_always,
-    ) in stage1_matches:
-        # Calculate the position immediately after the Stage1 match in mem_results
-        current_pos = stage1_start + stage1_len - start_ea
-        if current_pos >= len(mem.mem_results):
-            print(f"No room for junk after {stage1_desc} @ 0x{stage1_start:X}")
-            updated_matches.append(
-                (stage1_start, stage1_len, stage1_desc, stage1_bytes)
-            )
-            continue
-
-        # Extract the buffer after the Stage1 match
-        post_stage1_buffer = mem.mem_results[current_pos:]
-        junk_sequence = []
-        junk_descriptions = []
-        total_junk_len = 0
-
-        print(
-            f"\nSearching for junk instruction sequence after {stage1_desc} at 0x{stage1_start:X} "
-            f"(starting from 0x{stage1_start + stage1_len:X})"
-        )
-
-        # Iterate while there's enough space for another junk instruction (> 6 bytes)
-        while len(post_stage1_buffer) > 6:
-            junk_found = False
-            for junk_pattern, junk_desc in junk_patterns:
-                match = re.match(junk_pattern, post_stage1_buffer)
-                if match:
-                    junk_len = match.end() - match.start()
-                    junk_bytes = post_stage1_buffer[:junk_len]
-                    junk_sequence.append(junk_bytes)
-                    junk_descriptions.append(junk_desc)
-                    total_junk_len += junk_len
-                    post_stage1_buffer = post_stage1_buffer[junk_len:]
-                    junk_found = True
-                    print(
-                        f"  Found {junk_desc} @ 0x{stage1_start + stage1_len + total_junk_len - junk_len:X} "
-                        f"({junk_len} bytes: {junk_bytes.hex()})"
-                    )
-                    break  # Move to the next portion of the buffer
-
-            if not junk_found:
-                print(
-                    f"  No more junk instructions match with {len(post_stage1_buffer)} bytes remaining"
-                )
-                break  # Exit if no junk instruction matches
-
-        # Combine Stage1 with any junk instructions found
-        if junk_sequence:
-            combined_junk_bytes = b"".join(junk_sequence)
-            combined_desc = " -> ".join([stage1_desc] + junk_descriptions)
-            updated_matches.append(
-                (
-                    stage1_start,
-                    stage1_len + total_junk_len,
-                    combined_desc,
-                    stage1_bytes + combined_junk_bytes,
-                    stage1_is_always,
-                )
-            )
-            print(
-                f"Combined sequence: {combined_desc} (total length: {stage1_len + total_junk_len} bytes)"
-            )
-        else:
-            updated_matches.append(
-                (stage1_start, stage1_len, stage1_desc, stage1_bytes, stage1_is_always)
-            )
-            print(f"No junk instructions follow {stage1_desc}")
-
-    # Optionally sort and display matches (similar to your original code)
-    for match_start, match_len, desc, match_bytes, is_always in updated_matches:
-        print(
-            f"{desc.rjust(32, ' ')} @ 0x{match_start:X} - "
-            f"{match_bytes.hex()[:16]}{'...' if match_len > 16 else ''}"
-        )
-
-    return updated_matches  # Return only updated_matches for consistency
+    print(f"operations: {patch_operations}")
+    return patch_operations
 
 
 @dataclass
@@ -1048,14 +883,147 @@ class JumpTargetAnalyzer:
             yield final_candidate
 
 
-# Define "big instruction" opcode arrays
-SINGLE_BYTE_OPCODES = b"\xc8\x05\x0d\x15\x1d\x25\x2d\x35\x3d\x68\xa0\xa1\xa2\xa3\xa9\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf\xe8\xe9\x69\x81\xc7\xf7"
-MED_OPCODES = b"\xa0\xa1\xa2\xa3\x00\x01\x02\x03\x08\x09\x0a\x0b\x0f\x10\x11\x12\x13\x18\x19\x1a\x1b\x20\x21\x22\x23\x28\x29\x2a\x2b\x30\x31\x32\x33\x38\x39\x3a\x3b\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x6b\x80\x83\xf6"
-BIG_OPCODES = b"\x69\x81\x6b\x80\x83\xc0\xc1\xf6"
-ANTI_DISASM_EXTRA_BYTE = 0xF4
-SINGLE_BYTE_OPCODE_SET = set(SINGLE_BYTE_OPCODES)
-MED_OPCODE_SET = set(MED_OPCODES)
-BIG_OPCODE_SET = set(BIG_OPCODES)
+def find_stage1(mem, ea, end_ea):
+    print("Searching for stage1 patterns from 0x{:X} to 0x{:X}".format(ea, end_ea))
+
+    # Combine all patterns, keeping your original format
+    patterns = [
+        (MULTI_PART_PATTERNS, "Multi-Part Conditional Jumps", False),
+        (SINGLE_PART_PATTERNS, "Single-Part Conditional Jumps", True),
+    ]
+
+    all_matches = []
+    for pattern_group, desc, is_always in patterns:
+        if not isinstance(pattern_group, list):
+            pattern_group = [pattern_group]
+        print(f"\nLooking for {desc} patterns:")
+        for pattern in pattern_group:
+            match = re.finditer(pattern, mem.mem_results, re.DOTALL)
+            for m in match:
+                found = ea + m.start()
+                # Optionally remove this check for anti-disassembly sequences
+                # if idc.get_item_head(found) != found:
+                #     continue
+                match_len = m.end() - m.start()
+                matched_bytes = mem.mem_results[m.start() : m.start() + match_len]
+                all_matches.append(
+                    (
+                        found,
+                        match_len,
+                        desc,
+                        mem.mem_results[m.start() : m.end()],
+                        is_always,
+                    )
+                )
+
+    for found, match_len, desc, matched_bytes, is_always in all_matches:
+        print(
+            f"{desc.rjust(32, ' ')} @ 0x{found:X} - "
+            f"{matched_bytes.hex()[:16]}"
+            f"{'...' if match_len >= 15 else ''}"
+        )
+    return all_matches
+
+
+# Function to find junk instructions after stage1 matches
+def find_junk_instructions_after_stage1(mem, stage1_matches, start_ea, func_end):
+    """
+    - Register-based operations (0-57): ~58% chance.
+    - RDTSC (58-60): ~3% chance.
+    - PUSH imm32 (61-62): ~2% chance.
+    - PUSH imm8 (63-65): ~3% chance.
+    - Single-byte instructions (66-75): ~10% chance.
+    - Conditional jumps with 8-bit offset (76-80): ~5% chance.
+    - Conditional jumps with 32-bit offset (81-90): ~10% chance.
+    - CALL instruction (91-99): ~9% chance.
+    """
+    print(
+        f"\nPhase 2: Checking for junk instructions immediately following Stage1 matches"
+    )
+
+    updated_matches = []
+    for (
+        stage1_start,
+        stage1_len,
+        stage1_desc,
+        stage1_bytes,
+        stage1_is_always,
+    ) in stage1_matches:
+        # Calculate the position immediately after the Stage1 match in mem_results
+        current_pos = stage1_start + stage1_len - start_ea
+        if current_pos >= len(mem.mem_results):
+            print(f"No room for junk after {stage1_desc} @ 0x{stage1_start:X}")
+            updated_matches.append(
+                (stage1_start, stage1_len, stage1_desc, stage1_bytes)
+            )
+            continue
+
+        # Extract the buffer after the Stage1 match
+        post_stage1_buffer = mem.mem_results[current_pos:]
+        junk_sequence = []
+        junk_descriptions = []
+        total_junk_len = 0
+
+        print(
+            f"\nSearching for junk instruction sequence after {stage1_desc} at 0x{stage1_start:X} "
+            f"(starting from 0x{stage1_start + stage1_len:X})"
+        )
+
+        # Iterate while there's enough space for another junk instruction (> 6 bytes)
+        while len(post_stage1_buffer) > 6:
+            junk_found = False
+            for junk_pattern, junk_desc in JUNK_PATTERNS:
+                match = re.match(junk_pattern, post_stage1_buffer)
+                if match:
+                    junk_len = match.end() - match.start()
+                    junk_bytes = post_stage1_buffer[:junk_len]
+                    junk_sequence.append(junk_bytes)
+                    junk_descriptions.append(junk_desc)
+                    total_junk_len += junk_len
+                    post_stage1_buffer = post_stage1_buffer[junk_len:]
+                    junk_found = True
+                    print(
+                        f"  Found {junk_desc} @ 0x{stage1_start + stage1_len + total_junk_len - junk_len:X} "
+                        f"({junk_len} bytes: {junk_bytes.hex()})"
+                    )
+                    break  # Move to the next portion of the buffer
+
+            if not junk_found:
+                print(
+                    f"  No more junk instructions match with {len(post_stage1_buffer)} bytes remaining"
+                )
+                break  # Exit if no junk instruction matches
+
+        # Combine Stage1 with any junk instructions found
+        if junk_sequence:
+            combined_junk_bytes = b"".join(junk_sequence)
+            combined_desc = " -> ".join([stage1_desc] + junk_descriptions)
+            updated_matches.append(
+                (
+                    stage1_start,
+                    stage1_len + total_junk_len,
+                    combined_desc,
+                    stage1_bytes + combined_junk_bytes,
+                    stage1_is_always,
+                )
+            )
+            print(
+                f"Combined sequence: {combined_desc} (total length: {stage1_len + total_junk_len} bytes)"
+            )
+        else:
+            updated_matches.append(
+                (stage1_start, stage1_len, stage1_desc, stage1_bytes, stage1_is_always)
+            )
+            print(f"No junk instructions follow {stage1_desc}")
+
+    # Optionally sort and display matches (similar to your original code)
+    for match_start, match_len, desc, match_bytes, is_always in updated_matches:
+        print(
+            f"{desc.rjust(32, ' ')} @ 0x{match_start:X} - "
+            f"{match_bytes.hex()[:16]}{'...' if match_len > 16 else ''}"
+        )
+
+    return updated_matches  # Return only updated_matches for consistency
 
 
 def find_big_instruction(buffer_bytes, is_x64=False):
@@ -1301,20 +1269,6 @@ def find_ending_big_instructions(mem, matches, start_ea, func_end):
             print("No big instruction found...hmm, unlikely!")
 
     return updated_matches
-
-
-def deflow(matches):
-    deflow = DeFlow()
-    patch_operations = []
-    BUFFER_SIZE = 129  # Max size of anti-disassembly block
-    for match_start, match_len, desc, match_bytes, is_always in matches:
-        match_end = match_start + match_len
-        block_end = match_start + BUFFER_SIZE
-        patch_operations.extend(
-            deflow.deflow(match_start, block_end, match_start, match_end)
-        )
-    print(f"operations: {patch_operations}")
-    return patch_operations
 
 
 def process(func, patch_operations, using_deflow):
