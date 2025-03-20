@@ -17,7 +17,7 @@ import mutilz.helpers.ida as ida_helpers
 logger = logging.getLogger("mutilz.actions.revert_patches")
 
 
-def revert_range(start_ea, end_ea):
+def revert_range(start_ea, end_ea, force_reset=False):
     """
     Revert all the modified bytes within the given address range.
     """
@@ -26,17 +26,16 @@ def revert_range(start_ea, end_ea):
     for ea in range(start_ea, end_ea):
         ida_bytes.revert_byte(ea)
 
-    # 'undefine' the reverted bytes (helps with re-analysis)
-    length = end_ea - start_ea
-    ida_bytes.del_items(start_ea, ida_bytes.DELIT_KEEPFUNC, length)
+    if force_reset:
+        # 'undefine' the reverted bytes (helps with re-analysis)
+        length = end_ea - start_ea
+        ida_bytes.del_items(start_ea, ida_bytes.DELIT_KEEPFUNC, length)
 
     #
     # if the reverted patch seems to be in a code-ish area, we tell the
     # auto-analyzer to try and analyze it as code
     #
-
-    if ida_bytes.is_code(ida_bytes.get_flags(ida_bytes.prev_head(start_ea, 0))):
-        ida_auto.auto_mark_range(start_ea, end_ea, ida_auto.AU_CODE)
+    ida_auto.auto_mark_range(start_ea, end_ea, ida_auto.AU_CODE)
 
     # attempt to re-analyze the reverted region
     ida_auto.plan_and_wait(start_ea, end_ea, True)
@@ -59,27 +58,30 @@ class RevertpatchesActionHandler(ida_helpers.BaseActionHandler):
     icon: int = 171
 
     def activate(self, ctx):
-        is_selected, start_ea, end_ea = idaapi.read_range_selection(
+        is_selected, ea, end_ea = idaapi.read_range_selection(
             idaapi.get_current_viewer()
         )
-        if is_selected and start_ea != idaapi.BADADDR and end_ea != idaapi.BADADDR:
-            # reset ea to start_ea since we selected a range specifically to the
-            # start and end of the range
-            ea = start_ea
-        else:
-            start_ea = ea
-            print("No range selected.")
-            end_ea = ida_kernwin.ask_addr(start_ea, "Enter end address for selection:")
-            if end_ea is None:
-                print("Selection cancelled.")
-                return
-            if end_ea <= start_ea:
-                print("Error: End address must be greater than start address.")
-                return
-        print(f"Selection start: 0x{start_ea:X}, end: 0x{end_ea:X} (user-defined)")
+        if not is_selected or (ea == idaapi.BADADDR or end_ea == idaapi.BADADDR):
+            # if the current address is the start of a function, select the entire function
+            ea = idaapi.get_screen_ea()
+            func = ida_funcs.get_func(ea)
+            if func and func.start_ea == ea:
+                end_ea = func.end_ea
+            else:
+                # prompt the user for a range
+                print("No range selected.")
+                end_ea = ida_kernwin.ask_addr(ea, "Enter end address for selection:")
+                if end_ea is None:
+                    print("Selection cancelled.")
+                    return
+                if end_ea <= ea:
+                    print("Error: End address must be greater than start address.")
+                    return
+
+        print(f"Selection start: 0x{ea:X}, end: 0x{end_ea:X} (user-defined)")
 
         try:
-            revert_range(start_ea, end_ea)
+            revert_range(ea, end_ea, force_reset=False)
         finally:
             idc.jumpto(ea)
 

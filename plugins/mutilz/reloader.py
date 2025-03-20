@@ -133,6 +133,10 @@ def _recursive_reload(module, target_name, visited):
         if attribute_name in ignore:
             continue
 
+        if attribute_name.startswith("ida_") or attribute_name == "idc":
+            # skip ida builtins!
+            continue
+
         attribute_value = getattr(module, attribute_name)
 
         if type(attribute_value) == types.ModuleType:
@@ -151,7 +155,7 @@ def _recursive_reload(module, target_name, visited):
             # print("TODO: should probably try harder to reload this...", attribute_name, type(attribute_value))
             continue
         else:
-            # print("UNKNOWN TYPE TO RELOAD", attribute_name, type(attribute_value))
+            print("UNKNOWN TYPE TO RELOAD", attribute_name, type(attribute_value))
             raise ValueError("OH NOO RELOADING IS HARD")
 
         if target_name not in attribute_module_name:

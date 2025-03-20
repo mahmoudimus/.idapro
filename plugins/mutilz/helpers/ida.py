@@ -268,7 +268,7 @@ class BaseActionHandler(idaapi.action_handler_t):
 
 
 class PopUpHook(idaapi.UI_Hooks):
-    def __init__(self, action_handler_cls, predicate):
+    def __init__(self, action_handler_cls, predicate, widget_populator=None):
         super().__init__()
         action_handler = action_handler_cls()
         self.action = idaapi.action_desc_t(
@@ -285,16 +285,22 @@ class PopUpHook(idaapi.UI_Hooks):
 
         self.predicate = predicate
         self.category = action_handler.category
+        self.widget_populator = widget_populator
 
     def term(self):
         idaapi.unregister_action(self.action.name)
 
-    # Right-click menu popup
-    def finish_populating_widget_popup(self, widget, popup, ctx):
+    def _widget_populator(self, widget, popup, ctx):
         if self.predicate(widget, popup, ctx):
             idaapi.attach_action_to_popup(
                 widget, popup, self.action.name, f"{self.category}/"
             )
+
+    # Right-click menu popup
+    def finish_populating_widget_popup(self, widget, popup, ctx):
+        if self.widget_populator:
+            return self.widget_populator(self, widget, popup, ctx)
+        return self._widget_populator(widget, popup, ctx)
 
 
 class HookedActionMeta(type):
@@ -345,7 +351,9 @@ def find_signature(ida_signature: str) -> list:
 
 # TODO (mr): use find_bytes
 # https://github.com/mandiant/capa/issues/2339
-def find_byte_sequence(start: int, end: int, seq: list[int]) -> typing.Iterator[int]:
+def find_byte_sequence(
+    start: int, end: int, seq: list[int] | bytes
+) -> typing.Iterator[int]:
     """yield all ea of a given byte sequence
 
     args:
@@ -355,7 +363,11 @@ def find_byte_sequence(start: int, end: int, seq: list[int]) -> typing.Iterator[
     """
     patterns = ida_bytes.compiled_binpat_vec_t()
 
-    seqstr = " ".join([f"{b:02x}" if b != -1 else "?" for b in seq])
+    if isinstance(seq, list):
+        seqstr = " ".join([f"{b:02x}" if b != -1 else "?" for b in seq])
+    else:
+        seqstr = seq.decode("utf-8")
+
     err = ida_bytes.parse_binpat_str(
         patterns,
         start,
