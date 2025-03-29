@@ -1,5 +1,10 @@
+import argparse
 import binascii
+import builtins
+import json
+import logging
 import os
+import pathlib
 import re
 import struct
 import sys
@@ -20,6 +25,11 @@ import idautils
 import idc
 from mutilz.fastaf.cython import crc4, cyfnv1a
 from mutilz.helpers.ida import clear_output
+from mutilz.logconf import EveryNFilter, configure_debug_logging, dprint
+
+logger = logging.getLogger(__name__)
+
+print = dprint(builtins.print, every_n=500)
 
 PAGE_SIZE = 0x1000  # 4 KB pages
 
@@ -191,28 +201,6 @@ class WowPatterns(Patterns):
         )
 
 
-# def get_section_by_name(name: str) -> idaapi.segment_t:
-#     """
-#     Given a segment name (e.g. ".text"), return the IDA segment object.
-#     If not found, returns None.
-#     """
-#     for seg_ea in idaapi.get_segm_qty():
-#         seg = idaapi.getnseg(seg_ea)
-#         if seg and idaapi.get_segm_name(seg) == name:
-#             return seg
-#     return None
-
-# def find_byte_sequence(start_ea: int, end_ea: int, pattern: bytes):
-#     """
-#     Generator that searches for a given byte sequence `pattern` between `start_ea` and `end_ea`.
-#     Yields each address `ea` where the pattern begins.
-#     """
-#     ea = idaapi.find_binary(start_ea, end_ea, pattern.hex(), 16, idaapi.SEARCH_DOWN)
-#     while ea != idaapi.BADADDR and ea < end_ea:
-#         yield ea
-#         ea = idaapi.find_binary(ea + 1, end_ea, pattern.hex(), 16, idaapi.SEARCH_DOWN)
-
-
 # --- Helper Functions ---
 def find_signature(ida_signature: str) -> list:
     binary_pattern = idaapi.compiled_binpat_vec_t()
@@ -269,11 +257,6 @@ def find_byte_sequence(start: int, end: int, seq: list[int]) -> typing.Iterator[
         yield ea
 
 
-def get_section_by_name(seg_name) -> ida_segment.segment_t:
-    """Gets a section by its name."""
-    return idaapi.get_segm_by_name(seg_name)
-
-
 def assemble_instruction(ea, assembly_string):
     """Assembles an instruction using IDA's built-in assembler."""
     result, assembled_bytes = idautils.Assemble(ea, assembly_string)
@@ -318,8 +301,8 @@ def extract_decoded_key(decoded_instruction: ida_ua.insn_t, ea: int) -> bytearra
     print("crypto_key_ea is 0x%x" % crypto_key_ea)
     print("file region offset is 0x%x" % idaapi.get_fileregion_offset(crypto_key_ea))
 
-    text_seg = get_section_by_name(".text")
-    rdata_seg = get_section_by_name(".rdata")
+    text_seg = idaapi.get_segm_by_name(".text")
+    rdata_seg = idaapi.get_segm_by_name(".rdata")
     rdata_offset_diff = (
         rdata_seg.start_ea
         - ida_loader.get_fileregion_offset(rdata_seg.start_ea)
@@ -351,16 +334,16 @@ class KeyExtractor:
     def __init__(self, patterns: Patterns):
         self.patterns = patterns
 
-    def find_crypt_key(self) -> bytearray:
+    def find_crypt_key(self) -> tuple[bytearray, int]:
         """
         Searches the .text segment for known byte patterns.
         For each match, decode the instruction and attempt to extract the key.
         Returns the first successful key found or an empty bytearray otherwise.
         """
-        text_seg = get_section_by_name(".text")
+        text_seg = idaapi.get_segm_by_name(".text")
         if not text_seg:
             print("[!] No .text segment found!")
-            return bytearray()
+            return bytearray(), idaapi.BADADDR
 
         for p in self.patterns.crypt_keys:
             # Look for each pattern 'p' in .text
@@ -373,9 +356,41 @@ class KeyExtractor:
                     key = extract_decoded_key(decoded_instruction, ea)
                     if key:
                         print(f"[+] Found crypt key at 0x{ea:X}: {key[:16].hex()}")
-                        return key
+                        return key, ea
         print("[!] No crypt key found.")
-        return bytearray()
+        return bytearray(), idaapi.BADADDR
+
+
+def get_garbage_blobs():
+    """
+    Yields pairs of (garbage_blog_ea, aligned)
+    """
+    text_seg = idaapi.get_segm_by_name(".text")
+    if not text_seg:
+        print("Error: .text section not found.")
+        return
+    for xref in idautils.XrefsTo(text_seg.start_ea):
+        ea = xref.frm
+        if idc.get_segm_name(ea) != ".text":
+            continue
+
+        if idc.GetMnem(ea) == "lea":
+            yield ea
+
+
+def get_aligned_offset(memory_page_offset: int) -> int:
+    # the maximum garbage blob offset is 0x2000 (hardcoded!)
+    aligned_offset = (memory_page_offset + (2 * PAGE_SIZE)) & (
+        ~(PAGE_SIZE - 1) - memory_page_offset
+    )
+    # aligned = aligned_offset + memory_page_offset
+    aligned = (memory_page_offset + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1)
+    print(
+        f"aligned_offset: 0x{aligned_offset:X}",
+        f"aligned: 0x{aligned:X}",
+        sep=os.linesep,
+    )
+    return aligned
 
 
 class OffsetExtractor:
@@ -391,7 +406,7 @@ class OffsetExtractor:
 
         This function is a generator: it yields pairs instead of returning a list.
         """
-        text_seg = get_section_by_name(".text")
+        text_seg = idaapi.get_segm_by_name(".text")
         if not text_seg:
             print("Error: .text section not found.")
             yield -1, -1
@@ -426,27 +441,22 @@ class OffsetExtractor:
             found_results.items(), key=lambda item: item[0] - item[1], reverse=True
         )  # Sort by diff
 
-        for memory_page_offset, pattern_addr in sorted_results:
-            # the maximum garbage blob offset is 0x2000 (hardcoded!)
-            aligned_offset = (memory_page_offset + (2 * PAGE_SIZE)) & (
-                ~(PAGE_SIZE - 1) - memory_page_offset
-            )
-            # aligned = aligned_offset + memory_page_offset
-            aligned = (memory_page_offset + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1)
-            file_page_offset = aligned - 0xC00
+        for garbage_blog_ea, pattern_addr in sorted_results:
+            # the garbage blobs are minimum 0x1000 to maximum 0x2000 (hardcoded!)
+            # so we align the garbage blog ea to the nearest multiple of 0x1000
+            aligned = get_aligned_offset(garbage_blog_ea)
+            # file_page_offset = aligned - 0xC00
             print(
-                f"aligned_offset: 0x{aligned_offset:X}",
-                f"memory_page_offset: {memory_page_offset:X}",
-                f"pattern_addr: 0x{pattern_addr:X}",
+                f"garbage_blog_ea: 0x{garbage_blog_ea:X}",
+                f"pattern_addr: {pattern_addr:X}",
                 f"aligned: 0x{aligned:X}",
-                f"file_page_offset: 0x{file_page_offset:X}",
                 sep=os.linesep,
             )
             # we actually do not need to calculate the file page offset
             # because we are doing this in IDA Pro, so we can just get
             # idc.get_bytes(ea, PAGE_SIZE)
-            # yield memory_page_offset, aligned
-            yield file_page_offset, aligned
+            yield aligned
+            # yield file_page_offset, aligned
 
     def validate(self, binary):
         """Validates the decrypted binary."""
@@ -461,7 +471,7 @@ def decrypt_page(
     crypt_key,
     crypt_offset_base: int,
     start_offset: int,
-    const1: int,
+    key_length: int,
     encrypt_mode: bool,
     page_hash: int,
     page_size: int,
@@ -473,26 +483,23 @@ def decrypt_page(
     :param crypt_key:   A memoryview (or bytes) containing key data.
     :param crypt_offset_base: Base offset into crypt_key.
     :param start_offset:  MemoryOffset.
-    :param const1:      A constant integer value.
+    :param key_length:   The length of the key.
     :param encrypt_mode: Must be False for decryption; otherwise, an error is raised.
     :param page_hash:    The current 64-bit page hash.
     """
     key_state = crc4.initialize_key_state(
-        crypt_key, const1, crypt_offset_base, page_hash
+        crypt_key, key_length, crypt_offset_base, page_hash
     )
-    print(f"Initial key state: {key_state[:16].hex()}")
     crc4.process(binary, start_offset, key_state, page_size)
     # Update and return the page hash (assuming fnv1a returns a 64-bit integer).
-    print(f"Decrypted binary: {binary[:16].hex()}")
     new_page_hash = cyfnv1a.fnv1a_hash(
         memoryview(binary[start_offset : start_offset + page_size])
     )
-    print(f"Computed page hash: 0x{new_page_hash:X}")
     return new_page_hash
 
 
 def validate_brute_force_page(
-    ea: int, end_ea: int, const1: int, const2: int, crypt_key: bytes
+    ea: int, end_ea: int, key_length: int, num_keys: int, crypt_key: bytes
 ) -> bool:
     """
     Validates a decrypted page using a brute force check based on the first qword within the page.
@@ -504,8 +511,8 @@ def validate_brute_force_page(
     Parameters:
         ea (int): The effective address where the current page begins.
         data (bytes): The bytes from the newly decrypted page.
-        const1 (int): The first constant used in computing the crypt offset.
-        const2 (int): The second constant used in combination with the modulo operation.
+        key_length (int): The length of the key.
+        num_keys (int): The number of keys.
         crypt_key (bytes): The decryption key used for further validation.
 
     Returns:
@@ -518,13 +525,13 @@ def validate_brute_force_page(
     # Loop through pages from the current effective address until the end of the .text section.
     while ea < end_ea:
         page_index = ea // PAGE_SIZE
-        crypt_offset_base = const1 * (page_index % const2)
-        print(
-            f"Validating page at offset 0x{ea:X}, cryptOffsetBase: 0x{crypt_offset_base:X}"
-        )
-        if crypt_offset_base + const1 >= len(crypt_key):
+        key_index = key_length * (page_index % num_keys)
+        # print(
+        #     f"Validating page at offset 0x{ea:X}, key_index: 0x{key_index:X}"
+        # )
+        if key_index + key_length >= len(crypt_key):
             print(
-                "Validation failed - cryptOffsetBase + const1 would exceed cryptKey length"
+                "Validation failed - key_index + key_length would exceed cryptKey length"
             )
             return False
         ea += PAGE_SIZE
@@ -533,24 +540,17 @@ def validate_brute_force_page(
     return True
 
 
-# ---------------------------------------------------------------------------
-# This is analogous to "TryFullDecrypt" in the C# code. We do partial or full
-# decryption on multiple pages starting at 'start_ea', up to 'size' bytes.
-# ---------------------------------------------------------------------------
 def try_full_decrypt(
     crypt_key: bytes,
-    file_page_offset: int,
-    memory_page_offset: int,
+    encrypted_page_address: int,
     size: int,
     full_size: int,
-    const1: int,
-    const2: int,
+    key_length: int,
+    num_keys: int,
     brute_force_check: bool,
+    dry_run: bool = False,
 ) -> bool:
     """
-    Equivalent to:
-      bool TryFullDecrypt(Span<uint8> binary, ... ) in your original code.
-
     :param crypt_key:        The key bytes
     :param start_ea:         Where to begin in IDA
     :param size:             How many bytes to process (24 pages? full size?)
@@ -559,43 +559,49 @@ def try_full_decrypt(
     :return: True if we found data that passes the "zero QWORD" or other check
              (and thus might be a correct guess).
     """
-    ea = memory_page_offset - idaapi.get_imagebase()
+    ea = encrypted_page_address - idaapi.get_imagebase()
     end_ea = ea + size
+    if size != full_size:
+        dbg_str = "Partial"
+    else:
+        dbg_str = "Full"
+    print(
+        f"{dbg_str} size decrypt from rva {ea:X} to {end_ea:X} (0x{encrypted_page_address:X} - 0x{encrypted_page_address + size:X})"
+    )
 
-    # In the C# code, there's a "resetState()" on the crypt object.
-    # If you have any global or class-based state, reset it here.
     page_hash = 0
-    while ea < end_ea:
-        # Derive crypt_offset_base for this page
+    for ea in range(ea, end_ea + PAGE_SIZE, PAGE_SIZE):
+        # Derive key_index for this page
         page_index = ea // PAGE_SIZE
-        crypt_offset_base = const1 * (page_index % const2)
+        key_index = key_length * (page_index % num_keys)
 
         # Check we won't read outside crypt_key
-        if crypt_offset_base + const1 >= len(crypt_key):
-            print(
-                f"crypt_offset_base + const1 would exceed cryptKey length @ EA {ea:X}"
-            )
+        if key_index + key_length >= len(crypt_key):
+            print(f"key_index + key_length would exceed cryptKey length @ EA {ea:X}")
             return False
 
         # Decrypt 4 KB in place
         data = bytearray(idc.get_bytes(ea + idaapi.get_imagebase(), PAGE_SIZE))
-        print(f"encrypted data: {data[:16].hex()}")
+        # print(f"encrypted data: {data[:16].hex()}")
         if not data:
+            print(f"Failed to read data from EA {ea:X}")
             return False
+
+        encrypted_data = data[:16].hex()
 
         page_hash = decrypt_page(
             # no need to use start_offset here because we've fetched the data
             # already from IDA from the ea with PAGE_SIZE length.
             data,
             crypt_key,
-            crypt_offset_base,
+            key_index,
             0,
-            const1,
+            key_length,
             False,
             page_hash,
             PAGE_SIZE,
         )
-        print(f"Decrypted page hash: 0x{page_hash:X}")
+        # print(f"Decrypted page hash: 0x{page_hash:X}")
         # If we're brute-forcing, check the first QWORD for 0
         if brute_force_check:
             # read first 8 bytes from the newly decrypted page
@@ -604,19 +610,23 @@ def try_full_decrypt(
             else:
                 first_qword = 0
 
-            print(f"  BF check @ EA {ea:X}, first_qword=0x{first_qword:X}")
+            # print(f"  BF check @ EA {ea:X}, first_qword=0x{first_qword:X}")
             if first_qword == 0:
                 return validate_brute_force_page(
-                    ea, (ea + full_size), const1, const2, crypt_key
+                    ea, (ea + full_size), key_length, num_keys, crypt_key
                 )
         else:
-            # patch the decrypted data in place
-            idaapi.patch_bytes(
-                ea + idaapi.get_imagebase(), struct.pack("B" * len(data), *data)
-            )
-
-        # Move to the next page
-        ea += PAGE_SIZE
+            if dry_run:
+                func = builtins.print if ea + PAGE_SIZE >= end_ea else print
+                func(
+                    f"Dry run: decrypted page at 0x{ea + idaapi.get_imagebase():X} with current page hash 0x{page_hash:X}",
+                    f"Dry run: encrypted data: {encrypted_data}",
+                    f"Dry run: decrypted data: {data[:16].hex(sep='-').upper()}",
+                    sep=os.linesep,
+                )
+            else:
+                # patch the decrypted data in place
+                idaapi.put_bytes(ea + idaapi.get_imagebase(), bytes(data))
 
     return False
 
@@ -628,118 +638,116 @@ def try_full_decrypt(
 # ---------------------------------------------------------------------------
 def decrypt_single_ea(
     crypt_key: bytes,
-    file_page_offset: int,
-    memory_page_offset: int,
+    encrypted_page_address: int,
     offset_extractor: OffsetExtractor,
     full_size: int,
     partial_pages: int = 24,  # mimic "pageSize * 24"
+    dry_run: bool = False,
 ) -> bool:
     """
     Equivalent to the second Decrypt(...) method in C#.
     We'll do a partial decrypt of 'partial_pages' pages,
     then if it looks good, do a full decrypt and validate.
     """
-    print(
-        f"== DecryptSingleEA start @ 0x{file_page_offset:X} and 0x{memory_page_offset:X} =="
-    )
-    print(f"crypt_key length: {len(crypt_key)}")
+    print(f"Starting decryption of partial pages @ 0x{encrypted_page_address:X}")
 
     partial_size = PAGE_SIZE * partial_pages
 
     # We'll do the big brute force over const1/const2:
     print("Getting crypt constants...")
-    print("  Searching const1 range: 0x1FF down to 0x100")
-    print("  Searching const2 range: 0xFF down to 0x10")
+    print("  Searching key_length range: 512 down to 256")
+    print("  Searching num_keys range: 200 down to 30")
 
-    for const1 in range(0x1FF, 0x0FF - 1, -1):
-        for const2 in range(0xFF, 0x10 - 1, -1):
-            # Derive crypt_offset_base for the partial check:
-            #  crypt_offset_base = const1 * ((start_ea // PAGE_SIZE) % const2)
-            # We do it inside try_full_decrypt anyway, so not needed here.
-
+    KEY_LENGTH_RANGE = range(512, 256 - 1, -1)
+    NUM_KEYS_RANGE = range(200, 30 - 1, -1)
+    # KEY_LENGTH_RANGE = range(0x193, 0x192, -1)
+    # NUM_KEYS_RANGE = range(0x9B, 0x9A, -1)
+    for key_length in KEY_LENGTH_RANGE:
+        for num_keys in NUM_KEYS_RANGE:
             # But let's see if it even fits in crypt_key:
-            page_index = (memory_page_offset - idaapi.get_imagebase()) // PAGE_SIZE
-            crypt_offset_base = const1 * (page_index % const2)
-            if crypt_offset_base + const1 >= len(crypt_key):
+            page_index = (encrypted_page_address - idaapi.get_imagebase()) // PAGE_SIZE
+            key_index = key_length * (page_index % num_keys)
+            if key_index + key_length >= len(crypt_key):
                 # skip early
                 # this matches your "Skipping constants..."
                 continue
 
-            # Attempt partial decrypt
-            # (We do not revert pages in IDA unless we store the original somewhere.)
             print(
-                f"Trying const1=0x{const1:X}, const2=0x{const2:X}, base=0x{crypt_offset_base:X}"
+                f"Trying key_length=0x{key_length:X}, num_keys=0x{num_keys:X}, key_index=0x{key_index:X}"
             )
 
             if try_full_decrypt(
                 crypt_key,
-                file_page_offset,
-                memory_page_offset,
+                encrypted_page_address,
                 partial_size,
                 full_size,
-                const1,
-                const2,
+                key_length,
+                num_keys,
                 brute_force_check=True,
+                dry_run=dry_run,
             ):
                 print(
-                    f"  Potentially valid constants! const1=0x{const1:X}, const2=0x{const2:X}"
+                    f"  Found potential key dimensions: key_length={key_length}, num_keys={num_keys}"
                 )
                 print("  Attempting full decryption...")
 
                 # Full decrypt
                 try_full_decrypt(
                     crypt_key,
-                    file_page_offset,
-                    memory_page_offset,
+                    encrypted_page_address,
                     full_size,
                     full_size,
-                    const1,
-                    const2,
+                    key_length,
+                    num_keys,
                     brute_force_check=False,
+                    dry_run=dry_run,
                 )
-                print("  Full decryption successful?")
-                idaapi.auto_make_code(memory_page_offset)
-                idaapi.plan_and_wait(memory_page_offset, full_size)
+                if dry_run:
+                    return key_length, num_keys
+                idaapi.auto_make_code(encrypted_page_address)
+                idaapi.plan_and_wait(encrypted_page_address, full_size)
                 # try to fix IDA function re-analyze issue after patching
                 idaapi.refresh_idaview_anyway()
                 idaapi.auto_wait()
                 # Validate
                 # read the newly decrypted data
-                data = idc.get_bytes(memory_page_offset, full_size)
+                data = idc.get_bytes(encrypted_page_address, full_size)
                 if not data:
                     continue
                 print("  Validating decrypted data...")
                 if offset_extractor.validate(data):
                     print("  Validation success!")
-                    return True
+                    return key_length, num_keys
                 else:
                     print("  Validation failed, continuing search...")
 
     print("Decryption failed :(")
-    return False
+    return None, None
 
 
 # ---------------------------------------------------------------------------
 # The main "Decrypt" logic from C# that tries multiple starting EAs.
 # ---------------------------------------------------------------------------
-def decrypt(
-    crypt_key: bytes, start_eas: list[int], offset_extractor: OffsetExtractor
+def _decrypt(
+    crypt_key: bytes,
+    decryption_addresses: list[int],
+    offset_extractor: OffsetExtractor,
+    dry_run: bool,
 ) -> bool:
-    """
-    Equivalent to:
-      bool Decrypt(ReadOnlySpan<uint8> cryptKey,
-                   IEnumerable<(int FileOffset, int MemoryOffset)> startingOffsets)
-    in your C# code, but for IDA addresses only.
-    """
     size_of_text_seg = get_section_sizeofrawdata_from_header_seg(".text")
-    print(f"size_of_text_seg: {size_of_text_seg}")
-    for start_ea, ending_ea in start_eas:
-        print(f"Decrypting from 0x{start_ea:X} to 0x{ending_ea:X}")
-        if decrypt_single_ea(
-            crypt_key, start_ea, ending_ea, offset_extractor, size_of_text_seg
-        ):
-            return True
-    return False
+    print(f"ending offset of .text segment: 0x{size_of_text_seg:X}")
+    for address in decryption_addresses:
+        print(f"Decrypting from 0x{address:X}")
+        key_length, num_keys = decrypt_single_ea(
+            crypt_key,
+            address,
+            offset_extractor,
+            size_of_text_seg - (address - idaapi.get_imagebase()),
+            dry_run=dry_run,
+        )
+        if key_length and num_keys:
+            return key_length, num_keys
+    return None, None
 
 
 # --- Main Script Logic ---
@@ -749,58 +757,99 @@ class DecryptException(Exception):
     pass
 
 
-def main(args=sys.argv[1:]):
-
+def execute(decrypt=False, dry_run=False):
     # Make sure our header is large enough to contain the Import Directory entry.
     if not PE or len(PE.header()) < IMPORT_TABLE_OFFSET + 4:
         raise DecryptException("PE header is too short!")
 
     patterns = WowPatterns()
     extractor = KeyExtractor(patterns)
-    crypt_key = extractor.find_crypt_key()
+    crypt_key, _key_addr = extractor.find_crypt_key()
     if crypt_key:
-        print(f"[*] Key found: {crypt_key[:16].hex()}... with length {len(crypt_key)}")
+        print(
+            f"[*] Key found: {crypt_key[:16].hex()}... with initial size of {len(crypt_key)}"
+        )
     else:
         print("[!] No key extracted")
         return -1
     offset_extractor = OffsetExtractor(patterns)
-    offsets = list(offset_extractor.get_crypt_start_offsets())
-    print(f"[*] Found {len(offsets)} offsets")
-    for offset in offsets:
-        print(f"  {offset[0]:X} - {offset[1]:X}")
+    start_decryption_offsets = list(offset_extractor.get_crypt_start_offsets())
+    if not start_decryption_offsets:
+        print("[!] No offsets found")
+        return -1
+    print(f"[*] Found {len(start_decryption_offsets)} offsets")
 
-    success = decrypt(crypt_key, offsets, offset_extractor)
-    if success:
-        print("Decryption succeeded with at least one offset!")
+    if decrypt:
+        key_length, num_keys = _decrypt(
+            crypt_key, start_decryption_offsets, offset_extractor, dry_run
+        )
+        if key_length and num_keys:
+            print(
+                f"Decryption succeeded! key located @ 0x{_key_addr:X} with num_keys={num_keys} and key_length={key_length}"
+            )
+            dump_key(key_num_keys=num_keys, key_length=key_length, key_offset=_key_addr)
+        else:
+            print("Decryption did not succeed.")
     else:
-        print("Decryption did not succeed.")
-    # crypt_helper = GameClientCryptHelper(patterns)
-    # crypt_engine = GameClientCrypt(
-    #     encrypt_mode=args.encrypt
-    # )  # Set to True for encryption.
+        size_of_text_seg = get_section_sizeofrawdata_from_header_seg(".text")
+        print(f"ending offset of .text segment: 0x{size_of_text_seg:X}")
 
-    # print("Getting crypt offsets...")
-    # crypt_start_offsets = list(crypt_helper.get_crypt_start_offsets())
-    # print(
-    #     [
-    #         f"0x{offset_start:X} - 0x{offset_end:X}"
-    #         for offset_start, offset_end in crypt_start_offsets
-    #     ]
-    # )
-    # print("Getting crypt key...")
-    # crypt_key = crypt_helper.get_crypt_key()
-    # if not crypt_key:
-    #     print("Failed to retrieve crypt key!")
-    #     return
 
-    # # print(f"Crypt Key: {crypt_key}")
+def dump_key(
+    key_num_keys: int,
+    key_length: int,
+    key_offset: int = None,
+    output_file: pathlib.Path = None,
+):
+    if key_offset is None:
+        patterns = WowPatterns()
+        extractor = KeyExtractor(patterns)
+        crypt_key, key_offset = extractor.find_crypt_key()
+        if crypt_key:
+            print(f"[*] Key found: 0x{key_offset:X}")
+        else:
+            print("[!] No key extracted")
+            return -1
+    if output_file is None:
+        input_path = pathlib.Path(idc.get_input_file_path())
+        output_file = input_path.with_name("g_bufCryptKey.json")
+    print(f"Dumping key to {output_file}")
 
-    # if args.bruteforce or args.encrypt:
-    #     bruteforce_decrypt(crypt_engine, crypt_helper, crypt_key, crypt_start_offsets)
-    # else:
-    #     print("Skipping brute-force search for crypt constants.")
+    # Get the complete binary blob of keys.
+    crypt_key = idc.get_bytes(key_offset, key_length * key_num_keys)
+    if crypt_key is None:
+        print("Failed to retrieve key bytes!")
+        return
+
+    # Create a 2D array: each key chunk is an array of bytes.
+    keys = [
+        list(crypt_key[i * key_length : (i + 1) * key_length])
+        for i in range(key_num_keys)
+    ]
+
+    # Construct JSON data according to the schema.
+    json_data = {
+        "encryption_key": keys,
+        "key_length": key_length,
+        "num_keys": key_num_keys,
+        "key_offset": f"0x{key_offset:X}",
+    }
+
+    # Write the JSON to the file.
+    with output_file.open("w+") as f:
+        json.dump(json_data, f, indent=4)
+
+
+def cli(args=sys.argv[1:]):
+    parser = argparse.ArgumentParser(description="Decrypt a binary file.")
+    parser.add_argument("--decrypt", action="store_true", help="Decrypt the binary")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run the decryption")
+    args = parser.parse_args()
+    execute(decrypt=args.decrypt, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
     clear_output()
-    main()
+    configure_debug_logging(log=logger)
+    execute(decrypt=True, dry_run=False)
+    # dump_key(key_num_keys=0x9B, key_length=0x193)

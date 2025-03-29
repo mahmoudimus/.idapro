@@ -626,7 +626,7 @@ def try_full_decrypt(
                 )
             else:
                 # patch the decrypted data in place
-                idaapi.patch_bytes(ea + idaapi.get_imagebase(), bytes(data))
+                idaapi.put_bytes(ea + idaapi.get_imagebase(), bytes(data))
 
     return False
 
@@ -660,8 +660,8 @@ def decrypt_single_ea(
 
     KEY_LENGTH_RANGE = range(512, 256 - 1, -1)
     NUM_KEYS_RANGE = range(200, 30 - 1, -1)
-    # KEY_LENGTH_RANGE = range(0x193, 0x192, -1)
-    # NUM_KEYS_RANGE = range(0x9B, 0x9A, -1)
+    KEY_LENGTH_RANGE = range(0x169, 0x192, -1)
+    NUM_KEYS_RANGE = range(0x5a, 0x9A, -1)
     for key_length in KEY_LENGTH_RANGE:
         for num_keys in NUM_KEYS_RANGE:
             # But let's see if it even fits in crypt_key:
