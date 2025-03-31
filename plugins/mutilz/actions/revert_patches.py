@@ -55,7 +55,7 @@ class RevertpatchesActionHandler(ida_helpers.BaseActionHandler):
 
     action_name: str = "mutilz:revert_patches"
     action_label: str = "Revert Patches"
-    icon: int = 171
+    icon: int = 116
 
     def activate(self, ctx):
         is_selected, ea, end_ea = idaapi.read_range_selection(

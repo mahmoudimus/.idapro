@@ -125,6 +125,8 @@ def undo_decryption(
 
     # --- Step 2: Compute the offset into the encrypted blob ---
     # Formula: offset = (i & 0xF) * ((i & 0xF) * (10*(i & 0xF) + 498) + 11279) + 57531
+
+
     offset = (
         (i_val & 0xF)
         * (((i_val & 0xF) * (PolynomialA * (i_val & 0xF) + PolynomialB)) + PolynomialC)
@@ -169,6 +171,7 @@ def undo_decryption(
     m = 0
     while m < 0x3F8:
         if decrypted_blob[m : m + 8] == marker1:
+            print(f"Patching marker1 at 0x{m:X}")
             decrypted_blob[m : m + 8] = replacement1
             m += 8
         else:
@@ -177,6 +180,7 @@ def undo_decryption(
     n = 0
     while n < 0x3F8:
         if decrypted_blob[n : n + 8] == marker2:
+            print(f"Patching marker2 at 0x{n:X}")
             decrypted_blob[n : n + 8] = replacement2
             n += 8
         else:
@@ -185,6 +189,7 @@ def undo_decryption(
     ii = 0
     while ii < 0x3FC:
         if decrypted_blob[ii : ii + 4] == marker3:
+            print(f"Patching marker3 at 0x{ii:X}")
             decrypted_blob[ii : ii + 4] = replacement3
             ii += 4
         else:

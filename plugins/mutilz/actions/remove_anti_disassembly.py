@@ -6,26 +6,25 @@ import itertools
 import logging
 import re
 import struct
-import time
 import typing
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-import capstone
 import ida_allins
 import ida_bytes
 import ida_funcs
+import ida_gdl
 import ida_ida
-import ida_idaapi
-import ida_idp
 import ida_kernwin
-import ida_segment
+import ida_name
 import ida_ua
+import ida_xref
 import idaapi
 import idautils
 import idc
 import mutilz.actions as actions
 import mutilz.helpers.ida as ida_helpers
+from mutilz.actions.force_analyze import ForceAnalyzeActionHandler
 from mutilz.helpers.ida import clear_output, format_addr
 from mutilz.logconf import configure_debug_logging
 
@@ -1350,7 +1349,7 @@ def process(start_ea, end_ea, patch_operations):
     return patch_operations
 
 
-def execute_action(start_ea: int, end_ea: int, patch=False):
+def execute_action(start_ea: int, end_ea: int, patch=False, force_analyze=False):
     """
     Main entry point for script.
 
@@ -1367,6 +1366,10 @@ def execute_action(start_ea: int, end_ea: int, patch=False):
         for patch in patch_operations:
             patch.apply()
         print("Patches applied.")
+    if force_analyze:
+        print("Force analyzing...")
+        ForceAnalyzeActionHandler.reanalyze_function(start_ea, end_ea)
+        print("Force analysis completed.")
 
 
 @dataclasses.dataclass
@@ -1411,7 +1414,7 @@ class RemoveantidisassemblyActionHandler(ida_helpers.BaseActionHandler):
             start_ea, end_ea = self.get_selected_addresses()
         try:
             clear_output()
-            execute_action(start_ea, end_ea, patch=True)
+            execute_action(start_ea, end_ea, patch=True, force_analyze=True)
         finally:
             idc.jumpto(start_ea)
 

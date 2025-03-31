@@ -16,7 +16,7 @@ class RedecompilefunctionActionHandler(ida_helpers.BaseActionHandler):
 
     action_name: str = "mutilz:re_decompile_function"
     action_label: str = "Re-decompile Function"
-    icon: int = 171
+    icon: int = 156
 
     def activate(self, ctx):
         ea = idaapi.get_screen_ea()

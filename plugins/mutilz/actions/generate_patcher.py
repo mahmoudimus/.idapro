@@ -61,7 +61,7 @@ class GeneratepatcherActionHandler(ida_helpers.BaseActionHandler):
 
     action_name: str = "mutilz:generate_patcher"
     action_label: str = "Generate Patcher"
-    icon: int = 171
+    icon: int = 339
 
     def activate(self, ctx):
         self.patched_bytes = []

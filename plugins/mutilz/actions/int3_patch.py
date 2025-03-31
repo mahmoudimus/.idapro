@@ -28,6 +28,40 @@ except ImportError:
     patching = None
 
 
+def _determine_alignment_exponent(address: int) -> int:
+    """
+    Determines the alignment exponent (log2) based on the address.
+    Checks for 16, 8, 4, 2 byte alignment. Returns 0 if none match.
+    """
+    if (address % 16) == 0:
+        return 4  # log2(16)
+    elif (address % 8) == 0:
+        return 3  # log2(8)
+    elif (address % 4) == 0:
+        return 2  # log2(4)
+    elif (address % 2) == 0:
+        return 1  # log2(2)
+    else:
+        return 0  # No specific alignment (or 1-byte aligned)
+
+
+def _align(pad_start: int, pad_len: int):
+    align_exponent = _determine_alignment_exponent(pad_start)
+    align_val = 1 << align_exponent  # Calculate 2^exponent
+    logger.info(
+        f"Attempting to align padding at 0x{pad_start:X} (len {pad_len}) to {align_val} bytes (exponent {align_exponent})."
+    )
+    # Undefine padding first
+    if not ida_bytes.del_items(pad_start, ida_bytes.DELIT_EXPAND, pad_len):
+        logger.warning(f"Could not fully undefine padding range at 0x{pad_start:X}.")
+
+    # Create the alignment directive
+    if ida_bytes.create_align(pad_start, pad_len, align_exponent):
+        logger.info(f"Successfully created align directive for padding.")
+    else:
+        logger.info(f"No specific alignment needed for padding at 0x{pad_start:X}).")
+
+
 def execute_action(start_ea: int, end_ea: int):
     print(f"Hello! Called execute_action with range 0x{start_ea:X} - 0x{end_ea:X}")
     range_size = end_ea - start_ea
@@ -41,6 +75,7 @@ def execute_action(start_ea: int, end_ea: int):
     # generate a buffer of NOP's equal to the range we are filling in
     cc_buffer = cc_data * (range_size // cc_size)
     patching.core.patch(start_ea, cc_buffer, fill_nop=False)
+    _align(start_ea, range_size)
 
 
 @dataclasses.dataclass
@@ -49,7 +84,7 @@ class Int3PatchActionHandler(ida_helpers.BaseActionHandler):
 
     action_name: str = "mutilz:int3_patch"
     action_label: str = "INT3 Patch"
-    icon: int = 171
+    icon: int = 308
 
     def get_selected_addresses(self, ctx):
         is_selected, start_ea, end_ea = idaapi.read_range_selection(

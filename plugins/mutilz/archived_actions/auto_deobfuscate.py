@@ -15,7 +15,7 @@ import mutilz.actions as actions
 import mutilz.helpers.ida as ida_helpers
 
 from plugins.mutilz.actions.force_analyze import ForceAnalyzeAction
-from plugins.mutilz.actions.remove_junk import RemoveJunkAction
+from mutilz.archived_actions.remove_junk import RemoveJunkAction
 
 
 @dataclasses.dataclass

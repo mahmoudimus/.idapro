@@ -19,7 +19,7 @@ class ForceAnalyzeActionHandler(ida_helpers.BaseActionHandler):
 
     action_name: str = "mutilz:force_analyze"
     action_label: str = "Force Analyze"
-    icon: int = 171  # lightning bolt icon
+    icon: int = 347  # lightning bolt icon
 
     def activate(self, ctx):
         ea = idaapi.get_screen_ea()
