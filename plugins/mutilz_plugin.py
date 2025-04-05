@@ -72,6 +72,10 @@ class mutilz_t(ida_idaapi.plugin_t):
         self.reload()
         self.core.test()
 
+    @property
+    def reload_module(self):
+        return reloader
+
 
 def PLUGIN_ENTRY():
     """

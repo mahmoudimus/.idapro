@@ -44,7 +44,7 @@ class PluginCore:
     defer_load: bool = field(default=False)
     loaded: bool = field(default=False, init=False)
     _startup_hooks: _UIHooks = field(default_factory=_UIHooks, init=False)
-    _ext: deque[actions.action_t] = field(default_factory=deque, init=False)
+    _ext: deque["actions.action_t"] = field(default_factory=deque, init=False)
 
     @classmethod
     def deferred_load(cls):

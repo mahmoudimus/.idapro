@@ -8,6 +8,7 @@ This module is modified but most of the code was shamelessly taken from:
 
 import importlib
 import inspect
+import logging
 import sys
 import types
 import weakref
@@ -151,12 +152,14 @@ def _recursive_reload(module, target_name, visited):
             isinstance(attribute_value, dict)
             or isinstance(attribute_value, list)
             or isinstance(attribute_value, int)
+            or isinstance(attribute_value, (bytes, bytearray, set))
+            or isinstance(attribute_value, logging.Logger)
         ):
             # print("TODO: should probably try harder to reload this...", attribute_name, type(attribute_value))
             continue
         else:
-            print("UNKNOWN TYPE TO RELOAD", attribute_name, type(attribute_value))
-            raise ValueError("OH NOO RELOADING IS HARD")
+            err = f"Ignoring attribute {attribute_name} of type {type(attribute_value)} from module {module.__name__}. Target module: {target_name}."
+            print(err)
 
         if target_name not in attribute_module_name:
             # print(" - Not a module of interest...")

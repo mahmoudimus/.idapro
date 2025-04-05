@@ -42,7 +42,7 @@ def _IsAVX2Available() -> bool:
 
 # Globals
 __author__ = "mahmoudimus"
-__version__ = "1.0.9"
+__version__ = "1.1.2"
 
 PLUGIN_NAME = "Signature Maker (py)"
 PLUGIN_VERSION = __version__
@@ -628,6 +628,52 @@ def set_wildcardable_operand_type_bitmask():
         )
 
 
+class _ActionHandler(idaapi.action_handler_t):
+
+    def __init__(self, action_function):
+        super().__init__()
+        self.action_function = action_function
+
+    def activate(self, ctx):
+        self.action_function(ctx=ctx)
+        return 1
+
+    def update(self, ctx):
+        if ctx.widget_type == idaapi.BWN_DISASM:
+            return idaapi.AST_ENABLE_FOR_WIDGET
+        return idaapi.AST_DISABLE_FOR_WIDGET
+
+
+def is_disassembly_widget(widget, popup, ctx):
+    return idaapi.get_widget_type(widget) == idaapi.BWN_DISASM
+
+
+class _PopupHook(idaapi.UI_Hooks):
+
+    def __init__(
+        self, action_name, predicate=None, widget_populator=None, category=None
+    ):
+        super().__init__()
+        self.action_name = action_name
+        self.predicate = predicate or is_disassembly_widget
+        self.widget_populator = widget_populator or self._default_populator
+        self.category = category
+
+    def term(self):
+        idaapi.unregister_action(self.action_name)
+
+    @staticmethod
+    def _default_populator(instance, widget, popup_handle, ctx):
+        if instance.predicate(widget, popup_handle, ctx):
+            args = [widget, popup_handle, instance.action_name]
+            if instance.category:
+                args.append(f"{instance.category}/")
+            idaapi.attach_action_to_popup(*args)
+
+    def finish_populating_widget_popup(self, widget, popup_handle, ctx=None):
+        return self.widget_populator(self, widget, popup_handle, ctx)
+
+
 class PySigMaker(ida_idaapi.plugin_t):
     flags = ida_idaapi.PLUGIN_KEEP
     comment = f"{PLUGIN_NAME} v{PLUGIN_VERSION} for IDA Pro by {PLUGIN_AUTHOR}"
@@ -636,15 +682,49 @@ class PySigMaker(ida_idaapi.plugin_t):
     wanted_hotkey = "Ctrl-Alt-S"
     IS_ARM = False
 
+    ACTION_SHOW_SIGMAKER = "pysigmaker:show"
+
     def init(self):
+        self.progress_dialog = ProgressDialog()
+        self._hooks = self._init_hooks(_PopupHook(self.ACTION_SHOW_SIGMAKER))
+        self._register_actions()
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
-        self.progress_dialog = ProgressDialog()
         self.run_plugin()
 
     def term(self):
-        pass
+        # unregister our actions & free their resources
+        self._deregister_actions()
+        # unhook our plugin hooks
+        self._deinit_hooks(*self._hooks)
+
+    def _init_hooks(self, *hooks):
+        for hook in hooks:
+            hook.hook()
+        return hooks
+
+    def _deinit_hooks(self, *hooks):
+        for hook in hooks:
+            hook.unhook()
+
+    def _register_actions(self):
+        # If the action is already registered, unregister it first.
+        self._deregister_actions()
+        # Describe the action using python3 copy
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_SHOW_SIGMAKER,  # The action name.
+                "SigMaker",  # The action text.
+                _ActionHandler(self.run_plugin),  # The action handler.
+                self.wanted_hotkey,  # Optional: action shortcut
+                "Show the signature maker dialog.",  # Optional: tooltip
+                154,  # magnifying glass icon
+            )
+        )
+
+    def _deregister_actions(self):
+        return idaapi.unregister_action(self.ACTION_SHOW_SIGMAKER)
 
     # -------------------------
     # Processor and operand handling
@@ -762,8 +842,14 @@ class PySigMaker(ida_idaapi.plugin_t):
         )
         results = []
         ea = ida_ida.inf_get_min_ea()
+        _bin_search = getattr(ida_bytes, "bin_search", None)
+        # See https://github.com/mahmoudimus/ida-pysigmaker/pull/2
+        # In particular this discussion:
+        # https://github.com/mahmoudimus/ida-pysigmaker/pull/2#discussion_r1991913976
+        if not _bin_search:
+            _bin_search = getattr(ida_bytes, "bin_search3")
         while True:
-            occurence, _ = ida_bytes.bin_search(
+            occurence, _ = _bin_search(
                 ea,
                 ida_ida.inf_get_max_ea(),
                 binary_pattern,
@@ -1115,7 +1201,7 @@ class PySigMaker(ida_idaapi.plugin_t):
     # -------------------------
     # Main plugin UI and dispatch
     # -------------------------
-    def run_plugin(self):
+    def run_plugin(self, ctx=None):
         # Determine processor type and set globals.
         self.IS_ARM = self.IsARM()
 
@@ -1173,15 +1259,14 @@ class PySigMaker(ida_idaapi.plugin_t):
                     )
             elif action == 2:
                 # Copy selected code.
-                sel = ida_kernwin.read_range_selection(idaapi.get_current_viewer())
-                if sel:
-                    start, end = sel
+                start, end = get_selected_addresses(idaapi.get_current_viewer())
+                if start and end:
                     with self.progress_dialog("Please stand by..."):
                         self.PrintSelectedCode(
                             start, end, sig_type, wildcard_operands, wildcard_optimized
                         )
                 else:
-                    idc.msg("Select a range to copy the code\n")
+                    idc.msg("Select a range to copy the code!\n")
             elif action == 3:
                 # Search for a signature.
                 input_signature = idaapi.ask_str(
@@ -1195,6 +1280,47 @@ class PySigMaker(ida_idaapi.plugin_t):
         except Exception as e:
             print(e, os.linesep, traceback.format_exc())
             return
+
+
+def get_selected_addresses(ctx):
+    is_selected, start_ea, end_ea = idaapi.read_range_selection(ctx)
+    if is_selected:
+        return start_ea, end_ea
+
+    # maybe it's the same line?
+    p0, p1 = ida_kernwin.twinpos_t(), ida_kernwin.twinpos_t()
+    ida_kernwin.read_selection(ctx, p0, p1)
+    p0.place(ctx)
+    p1.place(ctx)
+    if p0.at and p1.at:
+        start_ea = p0.at.toea()
+        end_ea = p1.at.toea()
+        if start_ea == end_ea:
+            start_ea = idc.get_item_head(start_ea)
+            end_ea = idc.get_item_end(start_ea)
+            return start_ea, end_ea
+
+    # if we are here, we haven't selected anything, so we use the current address
+    start_ea = idaapi.get_screen_ea()
+    try:
+        end_ea = ida_kernwin.ask_addr(start_ea, "Enter end address for selection:")
+    finally:
+        # restore the cursor to the original address
+        idc.jumpto(start_ea)
+
+    if end_ea and end_ea <= start_ea:
+        print(
+            f"Error: End address 0x{end_ea:X} must be greater than start address 0x{start_ea:X}."
+        )
+        end_ea = None
+
+    if end_ea is None:
+        # if we canceled the dialog, let's assume the user wants
+        # to select just the line they're on
+        end_ea = idc.get_item_end(start_ea)
+        print(f"No end address selected, using line end: 0x{end_ea:X}")
+
+    return start_ea, end_ea
 
 
 def PLUGIN_ENTRY():

@@ -44,22 +44,32 @@ ${action_doc}
     action_label: str = "${action_label}"
     icon: int = ${icon}
     
-    def get_selected_addresses(self):
+    def get_selected_addresses(self, ctx):
         is_selected, start_ea, end_ea = idaapi.read_range_selection(
             idaapi.get_current_viewer()
         )
-        if is_selected and start_ea != idaapi.BADADDR and end_ea != idaapi.BADADDR:
-            # reset ea to start_ea since we selected a range specifically to the
-            # start and end of the range
+        if is_selected:
+            return start_ea, end_ea
+
+        # maybe it's the same line?
+        p0, p1 = ida_kernwin.twinpos_t(), ida_kernwin.twinpos_t()
+        range_selected = ida_kernwin.read_selection(ctx.widget, p0, p1)
+        p0.place(ctx.widget)
+        p1.place(ctx.widget)
+        start_ea = p0.at.toea()
+        end_ea = p1.at.toea()
+        if start_ea == end_ea:
+            start_ea = idc.get_item_head(start_ea)
+            end_ea = idc.get_item_end(start_ea)
             return start_ea, end_ea
 
         print("No range selected!")
         if not start_ea:
             start_ea = idaapi.get_screen_ea()
-            print(f"Cannot determine start address, using current address: 0x{start_ea:X}")
-        end_ea = ida_kernwin.ask_addr(
-            start_ea, "Enter end address for selection:"
-        )
+            print(
+                f"Cannot determine start address, using current address: 0x{start_ea:X}"
+            )
+        end_ea = ida_kernwin.ask_addr(start_ea, "Enter end address for selection:")
         if end_ea is None:
             print("Selection canceled. Returning start address.")
             return start_ea, None
@@ -69,11 +79,12 @@ ${action_doc}
         return start_ea, end_ea
             
     def activate(self, ctx):
-        start_ea, end_ea = self.get_selected_addresses()
+        curr_ea = idaapi.get_screen_ea()
+        start_ea, end_ea = self.get_selected_addresses(ctx)
         try:
             execute_action(start_ea, end_ea)
         finally:
-            idc.jumpto(start_ea)        
+            idc.jumpto(curr_ea)
 
     def update(self, ctx):
         match ctx.widget_type:
