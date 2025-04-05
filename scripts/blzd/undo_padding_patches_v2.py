@@ -1,12 +1,19 @@
+import logging
 import re
 import typing
 from dataclasses import dataclass
 from enum import Enum
 
 import ida_bytes
+import ida_funcs
 import idaapi
 import idautils
 import idc
+
+# Initialize logger
+logger = logging.getLogger(__name__)
+# Basic configuration (can be adjusted or handled externally)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 # Assuming PatternCategory is an Enum defined elsewhere
@@ -76,18 +83,35 @@ def is_non_executable(ea):
     return (seg.perm & idaapi.SEGPERM_EXEC) == 0
 
 
+# --- Added helper function ---
+def _determine_alignment_exponent(address: int) -> int:
+    """
+    Determines the alignment exponent (log2) based on the address.
+    Checks for 16, 8, 4, 2 byte alignment. Returns 0 if none match.
+    """
+    if (address % 16) == 0:
+        return 4  # log2(16)
+    elif (address % 8) == 0:
+        return 3  # log2(8)
+    elif (address % 4) == 0:
+        return 2  # log2(4)
+    elif (address % 2) == 0:
+        return 1  # log2(2)
+    else:
+        return 0  # No specific alignment (or 1-byte aligned)
+
+
 # Main function with dry-run option
 def undo_function_padding_patching(start_ea, end_ea, dry_run=True):
-    print(
-        "[+] Starting function padding unpatching (Dry Run: {})...".format(
-            "Enabled" if dry_run else "Disabled"
-        )
+    logger.info(
+        "Starting function padding unpatching (Dry Run: %s)...",
+        "Enabled" if dry_run else "Disabled",
     )
 
     # Get file boundaries
     start_ea = start_ea or idc.get_inf_attr(idc.INF_MIN_EA)
     end_ea = end_ea or idc.get_inf_attr(idc.INF_MAX_EA)
-    print(f"[+] File EA range: {hex(start_ea)} - {hex(end_ea)}")
+    logger.info(f"File EA range: {hex(start_ea)} - {hex(end_ea)}")
     # Initialize MemHelper to retrieve memory bytes
     mem_helper = MemHelper(start_ea, end_ea)
 
@@ -110,44 +134,95 @@ def undo_function_padding_patching(start_ea, end_ea, dry_run=True):
         # Find the end of the sequence
         p_end = p_patch_bytes
         while p_end < mem_helper.end:
-            # Stop if we reach an executable section
-            # if not is_non_executable(p_end):
-            #     break
-
             # Calculate RVA relative to image base
             rva = p_end - idaapi.get_imagebase()
 
-            # Check end conditions: 16-byte alignment or special sequence
-            if (rva & 0xF) == 0 or is_special_sequence(p_end):
-                sequence_length = p_end - p_patch_bytes
-                if sequence_length >= 5:
-                    # Valid sequence found
-                    print(
-                        f"[+] Candidate at EA {hex(p_patch_bytes)} to {hex(p_end - 1)}"
-                    )
-                    if dry_run:
-                        print(
-                            f"    [Dry Run] Would patch {sequence_length} bytes to 0xCC"
-                        )
-                    else:
-                        # Patch the sequence to 0xCC
-                        ida_bytes.patch_bytes(p_patch_bytes, b"\xcc" * sequence_length)
-                        print(f"    Patched {sequence_length} bytes to 0xCC")
-                    patched_count += 1
-                break  # Move to next match
-            p_end += 1
+            # Check if end conditions are NOT met
+            is_aligned = (rva & 0xF) == 0
+            is_special = is_special_sequence(p_end)
 
-    print(f"[+] Unpatching complete. Found {patched_count} sequences.")
+            if not (is_aligned or is_special):
+                p_end += 1
+                continue  # Continue searching if neither condition is met
+
+            # --- End conditions met, process the sequence ---
+            sequence_length = p_end - p_patch_bytes
+            if sequence_length >= 5:
+                # Valid sequence found
+                logger.info(f"Candidate at EA {hex(p_patch_bytes)} to {hex(p_end - 1)}")
+                if dry_run:
+                    logger.info(
+                        f"    [Dry Run] Would patch {sequence_length} bytes to 0xCC and align"
+                    )
+                else:
+                    # Patch the sequence to 0xCC
+                    logger.info(f"    Patching {sequence_length} bytes to 0xCC...")
+                    ida_bytes.patch_bytes(p_patch_bytes, b"\xcc" * sequence_length)
+                    logger.info(f"    Patched {sequence_length} bytes to 0xCC.")
+
+                    # --- Add alignment logic ---
+                    next_ea = (
+                        p_end  # Address immediately following the patched sequence
+                    )
+                    align_exponent = _determine_alignment_exponent(next_ea)
+                    align_val = 1 << align_exponent
+
+                    logger.info(
+                        f"    Attempting to undefine and align patched range to {align_val} bytes (exponent {align_exponent})..."
+                    )
+
+                    # Undefine padding first
+                    if not ida_bytes.del_items(
+                        p_patch_bytes, ida_bytes.DELIT_EXPAND, sequence_length
+                    ):
+                        logger.warning(
+                            f"    Could not fully undefine padding range at 0x{p_patch_bytes:X} before alignment."
+                        )
+
+                    # Create the alignment directive
+                    if align_exponent > 0:
+                        if ida_bytes.create_align(
+                            p_patch_bytes, sequence_length, align_exponent
+                        ):
+                            logger.info(
+                                f"    Successfully created align {align_val} directive for patched range."
+                            )
+                        else:
+                            logger.warning(
+                                f"    Failed to create align directive for patched range at 0x{p_patch_bytes:X}."
+                            )
+                    else:
+                        logger.info(
+                            f"    No specific alignment needed (exponent is 0, next_ea=0x{next_ea:X})."
+                        )
+                    # --- End alignment logic ---
+
+                patched_count += 1
+                return
+            # Break the inner while loop since we found the end or the sequence wasn't valid
+            break
+            # The p_end += 1 is now handled by the continue statement above
+
+    logger.info(f"Unpatching complete. Found {patched_count} sequences.")
 
 
 # Run the script (dry-run by default)
 if __name__ == "__main__":
-    seg = idaapi.get_segm_by_name(".text")
-    if not seg:
-        print("No .text section found.")
+    # Optional: Configure logger here if you want specific settings for standalone runs
+    # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    curr_ea = idaapi.get_screen_ea()
+    func = ida_funcs.get_func(curr_ea)
+    if not func:
+        # Consider using logger.error or raising an exception
+        print(
+            "No function found at current cursor position."
+        )  # Kept print for initial error before logging might be set up
         exit(-1)
-    start = seg.start_ea
-    end = seg.end_ea
+    end = func.end_ea
+
+    # Using func.start_ea instead of curr_ea for the start range seems more appropriate
+    # Also, end + 0x100 might go too far, using func.end_ea is safer unless padding is known to extend significantly
     undo_function_padding_patching(
-        start, end, dry_run=True
+        curr_ea, end + 0x100, dry_run=True
     )  # Set to False to apply patches

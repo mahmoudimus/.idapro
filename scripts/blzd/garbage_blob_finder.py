@@ -693,6 +693,7 @@ def execute():
         )
 
     print("\nScript execution completed!")
+    idc.jumpto(current_ea + array_len)
 
 
 # --- Main Execution ---
