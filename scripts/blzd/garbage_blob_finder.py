@@ -36,6 +36,12 @@ BLOB_NAME_PATTERN = "g_bufInitBlob{idx}"
 SHARED_STATE_DICT_NAME = "g_script_state_storage"
 # Key specific to this script within the shared dictionary
 CACHE_KEY_NAME = "blob_finder_next_index"
+# Default search range offsets from cursor for padding
+DEFAULT_PADDING_SEARCH_START_OFFSET = 0x1000
+DEFAULT_PADDING_SEARCH_MAX_DISTANCE = (
+    0x2000  # Max distance from cursor for *any* heuristic
+)
+DEFAULT_MIN_PADDING_LEN = 2
 
 
 logger = logging.getLogger("wowsigs")
@@ -141,7 +147,7 @@ def _search_range(
     max_range: int = 0x200,
     strategy: SearchStrategy = SearchStrategy.BACKWARD_SCAN,
 ) -> typing.Optional[int]:
-    # (Implementation remains the same as previous correct version)
+    # (Implementation remains the same)
     if strategy == SearchStrategy.BACKWARD_SCAN:
         start_addr = max(ea - max_range, 0)
         current = ea
@@ -198,9 +204,7 @@ def set_type(ea, type_str, name):
     if not idaapi.parse_decl(tif, None, type_str, 0):
         logger.error(f"Error parsing type declaration: '{type_str}'")
         # Still try to set name as public even if type parse failed? Let's try.
-        name_flags = (
-            idaapi.SN_NOCHECK | idaapi.SN_FORCE | idaapi.SN_PUBLIC
-        )  # <-- Add SN_PUBLIC
+        name_flags = idaapi.SN_NOCHECK | idaapi.SN_FORCE | idaapi.SN_PUBLIC
         if idaapi.set_name(ea, name, name_flags):
             logger.info(
                 f"Parsed type failed, but set name '{name}' at 0x{ea:X} (PUBLIC)."
@@ -283,10 +287,7 @@ def apply_signature(ea, sig):
         logger.error(f"Failed to parse signature declaration: {decl}")
 
 
-# --- Rest of the classes (GarbageBlobFinder, FunctionPaddingFinder) ---
-# --- and execute() function remain the same as the previous correct version ---
-
-
+# --- GarbageBlobFinder Class (Unchanged) ---
 class GarbageBlobFinder:
     # (Implementation remains the same as previous correct version)
     @staticmethod
@@ -456,19 +457,23 @@ class GarbageBlobFinder:
         return blobs
 
 
+# --- FunctionPaddingFinder Class (Modified) ---
 class FunctionPaddingFinder:
 
     @staticmethod
     def is_cc_byte(ea):
+        """Checks if the byte at the given address is 0xCC."""
         try:
             if ida_bytes.is_loaded(ea):
                 return ida_bytes.get_byte(ea) == 0xCC
             return False
-        except Exception as e:
+        except Exception:  # Catch potential IDA exceptions
+            logger.error(f"Error reading byte at 0x{ea:X}", exc_info=True)
             return False
 
     @classmethod
     def find_cc_sequences(cls, start_ea, end_ea, min_length=2):
+        """Finds sequences of 0xCC bytes within a range."""
         result = []
         current_start = None
         ea = start_ea
@@ -486,121 +491,258 @@ class FunctionPaddingFinder:
                         )
                         result.append((current_start, ea - 1, seq_len))
                     current_start = None
+            # Handle potential errors during byte read
+            if not ida_bytes.is_loaded(ea):
+                logger.warning(f"Address 0x{ea:X} became unloaded during scan.")
+                break  # Stop scan if we hit unloaded memory
             ea += 1
+
+        # Check if a sequence ends exactly at end_ea
         if current_start is not None:
-            last_ea = end_ea - 1
-            if cls.is_cc_byte(last_ea):
-                seq_len = end_ea - current_start
-                if seq_len >= min_length:
-                    logger.debug(
-                        f"Found CC sequence ending at boundary: 0x{current_start:X}-0x{last_ea:X} (len {seq_len})"
-                    )
-                    result.append((current_start, last_ea, seq_len))
-        logger.debug(f"Found {len(result)} CC sequences in total.")
+            seq_len = end_ea - current_start
+            if seq_len >= min_length:
+                logger.debug(
+                    f"Found CC sequence ending at boundary: 0x{current_start:X}-0x{end_ea-1:X} (len {seq_len})"
+                )
+                result.append((current_start, end_ea - 1, seq_len))
+
+        logger.debug(f"Found {len(result)} CC sequences in total in the range.")
         return result
 
     @staticmethod
     def is_special_sequence(ea):
+        """Checks if the address starts with known multi-byte NOP sequences."""
         if not ida_bytes.is_loaded(ea):
             return False
-        bytes_at_ea = ida_bytes.get_bytes(ea, 3)
+        # Known multi-byte NOPs (Intel Optimization Manual)
+        sequences = [
+            b"\x66\x90",  # xchg ax,ax
+            b"\x0f\x1f\x00",  # nop dword ptr [rax]
+            b"\x0f\x1f\x40\x00",  # nop dword ptr [rax + 0]
+            b"\x0f\x1f\x44\x00\x00",  # nop dword ptr [rax + rax*1 + 0]
+            b"\x66\x0f\x1f\x44\x00\x00",  # nop word ptr [rax + rax*1 + 0]
+            b"\x0f\x1f\x80\x00\x00\x00\x00",  # nop dword ptr [rax + 0]
+            b"\x0f\x1f\x84\x00\x00\x00\x00\x00",  # nop dword ptr [rax + rax*1 + 0]
+            b"\x66\x0f\x1f\x84\x00\x00\x00\x00\x00",  # nop word ptr [rax + rax*1 + 0]
+            # Add more if needed, up to a reasonable length
+        ]
+        max_len = max(len(s) for s in sequences)
+        bytes_at_ea = ida_bytes.get_bytes(ea, max_len)
         if not bytes_at_ea:
             return False
-        sequences = [
-            b"\x66\x90",
-            b"\x0f\x1f\x00",
-            b"\x0f\x1f\x40\x00",
-            b"\x0f\x1f\x44\x00\x00",
-            b"\x66\x0f\x1f\x44\x00\x00",
-            b"\x0f\x1f\x80\x00\x00\x00\x00",
-            b"\x0f\x1f\x84\x00\x00\x00\x00\x00",
-            b"\x66\x0f\x1f\x84\x00\x00\x00\x00\x00",
-            b"\x66\x66\x0f\x1f\x84\x00\x00\x00\x00\x00",
-            b"\x66\x66\x66\x0f\x1f\x84\x00\x00\x00\x00\x00",
-        ]
-        short_sequences = [s for s in sequences if len(s) <= len(bytes_at_ea)]
-        return any(bytes_at_ea.startswith(seq) for seq in short_sequences)
+
+        return any(bytes_at_ea.startswith(seq) for seq in sequences)
+
+    @classmethod
+    def _check_predicate_and_prompt(
+        cls,
+        cursor_pos: int,
+        iteration_count: int,
+        seq_start: int,
+        seq_len: int,
+        next_ea: int,
+        heuristic_name: str,
+    ) -> typing.Optional[typing.Tuple[int, int, int]]:
+        """
+        Helper to check alignment/special sequence predicate and prompt user.
+        Returns (seq_start, seq_len, next_ea) if user confirms, else None.
+        """
+        if not ida_bytes.is_loaded(next_ea):
+            logger.debug(
+                f"Address after potential padding (0x{next_ea:X}) is not loaded. Skipping."
+            )
+            return None
+
+        is_aligned = (next_ea % 16) == 0  # Check for 16-byte alignment
+        is_special = cls.is_special_sequence(next_ea)
+
+        if is_aligned or is_special:
+            predicate_reason = (
+                "16-byte aligned" if is_aligned else "special NOP sequence"
+            )
+            print(
+                f"[{heuristic_name}] Found {seq_len} CC bytes at 0x{seq_start:X} - 0x{seq_start + seq_len - 1:X}"
+            )
+            print(
+                f"  -> Predicate match: next address 0x{next_ea:X} is {predicate_reason}."
+            )
+
+            array_length = seq_start - cursor_pos
+            print(
+                f"  -> Calculated array length relative to 0x{cursor_pos:X}: {array_length} (0x{array_length:X})"
+            )
+
+            if array_length <= 0:
+                logger.warning(
+                    f"Calculated array length is non-positive ({array_length}). Skipping."
+                )
+                return None
+
+            name = BLOB_NAME_PATTERN.format(idx=iteration_count)
+            type_str = f"const unsigned __int8 {name}[{array_length}];"
+            prompt_msg = (
+                f"Found potential blob at 0x{cursor_pos:X} (using {heuristic_name}).\n"
+                f"Padding starts at 0x{seq_start:X} (length {seq_len}).\n"
+                f"Next item starts at 0x{next_ea:X} ({predicate_reason}).\n"
+                f"Calculated array size: {array_length} (0x{array_length:X}).\n\n"
+                f"Define as:\n{type_str}\n\n"
+                f"Proceed?"
+            )
+            user_choice = ida_kernwin.ask_yn(0, prompt_msg)
+
+            if user_choice == 1:  # Yes
+                logger.info(
+                    f"User confirmed. Will define array at 0x{cursor_pos:X}: {type_str}"
+                )
+                return (seq_start, seq_len, next_ea)
+            elif user_choice == 0:  # No
+                logger.info(f"User declined to define array at 0x{cursor_pos:X}.")
+                return None  # User declined this specific finding
+            else:  # Cancel (-1)
+                logger.info(f"User canceled operation at 0x{cursor_pos:X}.")
+                raise UserWarning("User cancelled operation")  # Propagate cancellation
+
+        else:
+            logger.debug(
+                f"Found {seq_len} CC bytes at 0x{seq_start:X}-0x{seq_start + seq_len - 1:X}, "
+                f"but predicate failed at 0x{next_ea:X} (not aligned or special NOP)."
+            )
+            return None  # Predicate failed
 
     @classmethod
     def find_padding_from_cursor(
         cls,
-        cursor_pos,
-        iteration_count,
-        start_offset=0x1000,
-        ending_offset=0x2000,
-        min_len=2,
-    ) -> bool:
-        start_range = cursor_pos + start_offset
-        end_range = cursor_pos + ending_offset
-        if not ida_bytes.is_loaded(start_range) or not ida_bytes.is_loaded(
-            end_range - 1
+        cursor_pos: int,
+        iteration_count: int,
+        start_offset: int = DEFAULT_PADDING_SEARCH_START_OFFSET,
+        max_search_distance: int = DEFAULT_PADDING_SEARCH_MAX_DISTANCE,
+        min_len: int = DEFAULT_MIN_PADDING_LEN,
+    ) -> typing.Optional[typing.Tuple[int, int, int]]:
+        """
+        Finds padding (CC bytes) after a cursor position using multiple heuristics.
+
+        Args:
+            cursor_pos: The starting address (likely blob start).
+            iteration_count: The current blob index being searched for (e.g., 0, 1, ...).
+            start_offset: The offset from cursor_pos to start the primary search.
+            max_search_distance: The maximum offset from cursor_pos to search.
+            min_len: The minimum number of CC bytes to consider as padding.
+
+        Returns:
+            A tuple (padding_start_ea, padding_length, next_item_ea) if padding
+            is found, confirmed by the user, and meets predicates.
+            Returns None otherwise.
+            Raises UserWarning if the user cancels the operation via the prompt.
+        """
+        search_start_ea = cursor_pos + start_offset
+        search_end_ea = cursor_pos + max_search_distance
+
+        if not ida_bytes.is_loaded(search_start_ea) or not ida_bytes.is_loaded(
+            search_end_ea - 1  # Check last byte of range too
         ):
             logger.warning(
-                f"Search range 0x{start_range:X} - 0x{end_range:X} is not fully loaded. Aborting search."
+                f"Search range 0x{search_start_ea:X} - 0x{search_end_ea:X} is not fully loaded. Aborting search."
             )
-            return False
-        print(f"Searching for CC padding from 0x{start_range:X} to 0x{end_range:X}...")
-        cc_sequences = cls.find_cc_sequences(start_range, end_range, min_length=min_len)
-        if not cc_sequences:
-            print("No CC padding found in the specified range.")
-            return False
-        found_and_defined = False
-        padding_info = None  # Store result here
-        for seq_start, seq_end, seq_len in cc_sequences:
-            next_ea = seq_end + 1
-            if not ida_bytes.is_loaded(next_ea):
-                logger.debug(
-                    f"Address after CC sequence (0x{next_ea:X}) is not loaded. Skipping."
-                )
-                continue
-            is_aligned = (next_ea & 0xF) == 0
-            is_special = cls.is_special_sequence(next_ea)
-            if is_aligned or is_special:
-                predicate_reason = "aligned" if is_aligned else "special sequence"
-                print(
-                    f"Found {seq_len} CC bytes at 0x{seq_start:X} - 0x{seq_end:X} (predicate match: {predicate_reason} at 0x{next_ea:X})"
-                )
-                array_length = seq_start - cursor_pos
-                print(
-                    f"  -> Calculated array length relative to 0x{cursor_pos:X}: {array_length} (0x{array_length:X})"
-                )
-                if array_length <= 0:
-                    logger.warning(
-                        f"Calculated array length is non-positive ({array_length}). Skipping."
+            return None
+
+        # --- Heuristic 1: Search for CC sequences in the full range ---
+        print(
+            f"Searching for CC padding from 0x{search_start_ea:X} to 0x{search_end_ea:X}..."
+        )
+        cc_sequences = cls.find_cc_sequences(
+            search_start_ea, search_end_ea, min_length=min_len
+        )
+
+        if cc_sequences:
+            logger.info(f"Found {len(cc_sequences)} CC sequence(s) in the range.")
+            for seq_start, seq_end, seq_len in cc_sequences:
+                next_ea = seq_end + 1
+                try:
+                    result = cls._check_predicate_and_prompt(
+                        cursor_pos,
+                        iteration_count,
+                        seq_start,
+                        seq_len,
+                        next_ea,
+                        "CC Sequence Scan",
                     )
-                    continue
-                name = f"g_bufInitBlob{iteration_count}"
-                type_str = f"const unsigned __int8 {name}[{array_length}];"
-                prompt_msg = (
-                    f"Found potential blob at 0x{cursor_pos:X}.\n"
-                    f"Padding starts at 0x{seq_start:X} (length {seq_len}).\n"
-                    f"Calculated array size: {array_length} (0x{array_length:X}).\n\n"
-                    f"Define as:\n{type_str}\n\n"
-                    f"Proceed?"
-                )
-                user_choice = ida_kernwin.ask_yn(0, prompt_msg)
-                if user_choice == 1:  # Yes
-                    logger.info(
-                        f"User confirmed. Attempting to define array at 0x{cursor_pos:X}: {type_str}"
-                    )
-                    # Store padding info to return, but don't define here
-                    padding_info = (seq_start, seq_len, next_ea)
-                    break
-                elif user_choice == 0:  # No
-                    logger.info(f"User declined to define array at 0x{cursor_pos:X}.")
-                    break
-                else:  # Cancel (-1)
-                    logger.info(f"User canceled operation at 0x{cursor_pos:X}.")
-                    break
-            else:
-                print(
-                    f"Found {seq_len} CC bytes at 0x{seq_start:X} - 0x{seq_end:X} (does not match predicate at 0x{next_ea:X})"
-                )
-        if not padding_info and cc_sequences:
+                    if result:
+                        return result  # User confirmed this one
+                except UserWarning:
+                    return None  # User cancelled
+
             print(
-                "Found CC sequences, but either none matched the predicate, the user declined/cancelled, or definition failed."
+                "Found CC sequences, but none met the predicate or were confirmed by the user."
             )
-        return padding_info  # Return None or (pad_start, pad_len, next_ea)
+        else:
+            print("No CC padding sequences found within the primary search range.")
+
+        # --- Heuristic 2: Find next function and check preceding bytes ---
+        print(
+            f"\nAttempting heuristic: Find next function within 0x{max_search_distance:X} bytes..."
+        )
+        next_func_ea = idc.get_next_func(cursor_pos)
+
+        if next_func_ea == idaapi.BADADDR:
+            print("No function found after the cursor position.")
+            return None
+
+        if next_func_ea >= search_end_ea:
+            print(
+                f"Next function at 0x{next_func_ea:X} is beyond the maximum search distance (0x{search_end_ea:X})."
+            )
+            return None
+
+        logger.info(
+            f"Found next function at 0x{next_func_ea:X}. Checking bytes immediately before it."
+        )
+
+        # Scan backwards from next_func_ea - 1 for CC bytes
+        pad_end_ea = next_func_ea - 1
+        pad_start_ea = idaapi.BADADDR
+        current_ea = pad_end_ea
+        cc_count = 0
+
+        while current_ea >= cursor_pos:  # Don't scan back past the blob start
+            if not ida_bytes.is_loaded(current_ea):
+                logger.warning(
+                    f"Encountered unloaded byte at 0x{current_ea:X} while scanning backwards from function start."
+                )
+                break  # Stop if we hit unloaded memory
+            if cls.is_cc_byte(current_ea):
+                pad_start_ea = current_ea  # Keep track of the earliest CC
+                cc_count += 1
+                current_ea -= 1
+            else:
+                break  # End of CC sequence
+
+        if cc_count >= min_len:
+            pad_len = cc_count  # Or next_func_ea - pad_start_ea
+            logger.info(
+                f"Found {pad_len} CC bytes immediately preceding function at 0x{next_func_ea:X} (from 0x{pad_start_ea:X} to 0x{pad_end_ea:X})"
+            )
+            try:
+                # The 'next_ea' for the predicate is the function start itself
+                result = cls._check_predicate_and_prompt(
+                    cursor_pos,
+                    iteration_count,
+                    pad_start_ea,
+                    pad_len,
+                    next_func_ea,
+                    "Next Function Boundary",
+                )
+                if result:
+                    return result  # User confirmed this one
+            except UserWarning:
+                return None  # User cancelled
+        else:
+            print(
+                f"Did not find sufficient CC padding (found {cc_count}, need {min_len}) immediately before function at 0x{next_func_ea:X}."
+            )
+
+        # --- All heuristics failed ---
+        print("\nAll heuristics failed to find suitable padding.")
+        return None
 
 
 def execute():
@@ -620,17 +762,16 @@ def execute():
         f"Attempting to find and define blob for lowest available index: {current_blob_index}"
     )
 
-    # --- Find potential blob locations ---
-    garbage_blobs = GarbageBlobFinder.get_tls_region()
-    if not garbage_blobs:
-        logger.error("Could not identify any garbage blob start addresses. Aborting.")
-        return
+    # --- Find potential blob locations (Optional but good context) ---
+    # garbage_blobs = GarbageBlobFinder.get_tls_region()
+    # if not garbage_blobs:
+    #     logger.warning("Could not identify any garbage blob start addresses via LEA analysis. Relying solely on cursor.")
+    # return # Or maybe proceed anyway based on cursor? Let's proceed.
 
-    # --- Target the first identified blob ---
-    garbage_blob0 = garbage_blobs[0]
-    logger.info("Using garbage_blob0: 0x%X as base.", garbage_blob0)
-    if len(garbage_blobs) > 1:
-        logger.info("Identified garbage_blob12: 0x%X", garbage_blobs[1])
+    # if garbage_blobs:
+    #     logger.info("Using garbage_blob0: 0x%X as potential base.", garbage_blobs[0])
+    #     if len(garbage_blobs) > 1:
+    #         logger.info("Identified potential garbage_blob12: 0x%X", garbage_blobs[1])
 
     print("\n=== Function Padding Finder ===")
     current_ea = idaapi.get_screen_ea()
@@ -639,46 +780,75 @@ def execute():
         logger.error(f"Base address 0x{current_ea:X} not loaded.")
         return
 
-    # Call finder - it returns padding info if user confirmed
-    padding_result = FunctionPaddingFinder.find_padding_from_cursor(
-        current_ea, current_blob_index
-    )
+    # Call finder - it returns padding info if user confirmed, or None, or raises UserWarning
+    padding_result = None
+    try:
+        padding_result = FunctionPaddingFinder.find_padding_from_cursor(
+            current_ea,
+            current_blob_index,
+            start_offset=DEFAULT_PADDING_SEARCH_START_OFFSET,
+            max_search_distance=DEFAULT_PADDING_SEARCH_MAX_DISTANCE,
+            min_len=DEFAULT_MIN_PADDING_LEN,
+        )
+    except UserWarning as e:
+        print(f"\nOperation cancelled by user: {e}")
+        return  # Stop execution if user cancelled
 
     if padding_result:
         pad_start, pad_len, next_ea = padding_result
         blob_name = BLOB_NAME_PATTERN.format(idx=current_blob_index)
-        array_len = pad_start - current_ea  # Recalculate or pass from finder
+        array_len = (
+            pad_start - current_ea
+        )  # Calculate array length based on where padding starts
         blob_type_str = f"const unsigned __int8 {blob_name}[{array_len}];"
 
-        logger.info(f"Attempting to define main blob: {blob_type_str}")
+        logger.info(
+            f"Attempting to define main blob: {blob_type_str} at 0x{current_ea:X}"
+        )
         if set_type(current_ea, blob_type_str, blob_name):
             logger.info(f"Successfully defined {blob_name} (PUBLIC).")
             # Reset cache *after* successful definition
             reset_blob_index_cache()
+            logger.info(
+                f"Blob index cache reset. Next run will search for index {get_next_blob_index()}."
+            )
 
             # --- Now handle the padding alignment ---
             align_exponent = _determine_alignment_exponent(next_ea)
             align_val = 1 << align_exponent  # Calculate 2^exponent
             logger.info(
-                f"Attempting to align padding at 0x{pad_start:X} (len {pad_len}) to {align_val} bytes (exponent {align_exponent})."
+                f"Attempting to align padding at 0x{pad_start:X} (len {pad_len}) to {align_val} bytes (exponent {align_exponent}) based on next item at 0x{next_ea:X}."
             )
 
             # Undefine padding first
             if not ida_bytes.del_items(pad_start, ida_bytes.DELIT_EXPAND, pad_len):
                 logger.warning(
-                    f"Could not fully undefine padding range at 0x{pad_start:X}."
+                    f"Could not fully undefine padding range 0x{pad_start:X}-0x{pad_start+pad_len-1:X}."
                 )
 
-            # Create the alignment directive
-            if ida_bytes.create_align(pad_start, pad_len, align_exponent):
-                logger.info(f"Successfully created align directive for padding.")
+            # Create the alignment directive if needed (exponent > 0)
+            if align_exponent > 0:
+                # IDA's create_align uses the *length* and the *exponent*
+                if ida_bytes.create_align(pad_start, pad_len, align_exponent):
+                    logger.info(f"Successfully created align directive for padding.")
+                else:
+                    logger.error(
+                        f"Failed to create align directive for padding at 0x{pad_start:X} (len {pad_len}, exp {align_exponent})."
+                    )
+                    # Fallback: Mark as byte data if alignment fails
+                    logger.info("Marking padding as byte data as fallback.")
+                    ida_bytes.create_data(
+                        pad_start, ida_bytes.FF_BYTE, pad_len, idaapi.BADADDR
+                    )
+
             else:
                 logger.info(
-                    f"No specific alignment needed for padding at 0x{pad_start:X} (next_ea=0x{next_ea:X})."
+                    f"No specific alignment needed (align=1) for padding at 0x{pad_start:X}. Marking as byte data."
                 )
-                # As a fallback, maybe just mark as data?
-                # ida_bytes.del_items(pad_start, ida_bytes.DELIT_EXPAND, pad_len)
-                # ida_bytes.create_data(pad_start, ida_bytes.FF_BYTE, pad_len, ida_idaapi.BADADDR)
+                # Mark as byte data if no alignment needed
+                ida_bytes.create_data(
+                    pad_start, ida_bytes.FF_BYTE, pad_len, idaapi.BADADDR
+                )
 
         else:
             logger.error(
@@ -687,20 +857,21 @@ def execute():
             # Note: Cache was *not* reset because definition failed.
 
     else:
-        # find_padding_from_cursor returned None (no match or user declined/cancelled)
+        # find_padding_from_cursor returned None (no match or user declined)
         print(
-            f"Did not define array for index {current_blob_index} based on padding relative to 0x{current_ea:X}."
+            f"\nDid not define array for index {current_blob_index} based on padding relative to 0x{current_ea:X}."
         )
 
     print("\nScript execution completed!")
-    idc.jumpto(current_ea + array_len)
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
     idaapi.auto_wait()
     clear_output()
-    configure_logging(log=logger, level=logging.INFO)  # Use DEBUG for more cache info
+    configure_logging(
+        log=logger, level=logging.INFO
+    )  # Use DEBUG for more detailed logs
     execute()
     idaapi.refresh_idaview_anyway()
 
