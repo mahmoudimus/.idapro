@@ -763,7 +763,7 @@ class JumpTargetAnalyzer:
             yield final_candidate
 
 
-def find_stage1(mem, ea, end_ea):
+def find_stage1(mem, ea, end_ea) -> MatchChains:
     logger.info(
         "Searching for stage1 patterns from 0x{:X} to 0x{:X}".format(ea, end_ea)
     )
@@ -821,7 +821,9 @@ def find_stage1(mem, ea, end_ea):
     return all_chains
 
 
-def find_junk_instructions_after_stage1(mem, stage1_chains, start_ea, func_end):
+def find_junk_instructions_after_stage1(
+    mem, stage1_chains, start_ea, func_end
+) -> MatchChains:
     logger.info(
         f"\nPhase 2: Checking for junk instructions immediately following Stage1 matches"
     )
@@ -959,7 +961,7 @@ def find_big_instruction(buffer_bytes, is_x64=False):
     }
 
 
-def filter_match_chains(match_chains):
+def filter_match_chains(match_chains: MatchChains) -> list[MatchChains]:
     valid_chains = []
     for chain in match_chains:
         total_length = chain.overall_length()
@@ -972,7 +974,9 @@ def filter_match_chains(match_chains):
     return valid_chains
 
 
-def filter_antidisasm_patterns(mem, chains, start_ea, min_size=12, max_size=129):
+def filter_antidisasm_patterns(
+    mem, chains, start_ea, min_size=12, max_size=129
+) -> list[MatchChains]:
     logger.info("Stage 1: Basic validation")
     filtered_chains = []
     for chain in chains:
@@ -1077,9 +1081,11 @@ def filter_antidisasm_patterns(mem, chains, start_ea, min_size=12, max_size=129)
         f"  After big instruction validation: {len(validated_with_big_instr)} of {len(chains)} chains remain"
     )
     logger.info("Stage 3: Resolving overlaps")
-    sorted_chains = sorted(validated_with_big_instr, key=lambda c: c.overall_start())
-    final_chains = []
-    covered_ranges = []
+    sorted_chains: list[MatchChains] = sorted(
+        validated_with_big_instr, key=lambda c: c.overall_start()
+    )
+    final_chains: list[MatchChains] = []
+    covered_ranges: list[tuple[int, int]] = []
     for chain in sorted_chains:
         chain_start = chain.overall_start()
         big_instr_segments = [
@@ -1154,7 +1160,7 @@ def re_analyze(func_start: int, func_end: int):
     reset_problems_in_function(func_start, func_end)
 
 
-def process_chunk(chunk_base: int, chunk_bytes: bytes, chunk_end: int):
+def process_chunk(chunk_base: int, chunk_bytes: bytes, chunk_end: int) -> list[MatchChains]:
     """
     Process a chunk of the memory region.
     Create a MemHelper for the chunk, and override its mem_results with the given chunk_bytes.
@@ -1163,14 +1169,16 @@ def process_chunk(chunk_base: int, chunk_bytes: bytes, chunk_end: int):
     # Use the MemHelper class to create a memory object for this chunk.
     dummy_mem = MemHelper(chunk_base, chunk_end, mem_results=chunk_bytes)
 
-    chains = find_stage1(dummy_mem, chunk_base, chunk_end)
+    chains: MatchChains = find_stage1(dummy_mem, chunk_base, chunk_end)
     if not chains or not chains.chains:
         return []
-    chains = find_junk_instructions_after_stage1(
+    chains: MatchChains = find_junk_instructions_after_stage1(
         dummy_mem, chains, chunk_base, chunk_end
     )
-    chains = filter_match_chains(chains)
-    chains = filter_antidisasm_patterns(dummy_mem, chains, chunk_base)
+    chains: list[MatchChains] = filter_match_chains(chains)
+    chains: list[MatchChains] = filter_antidisasm_patterns(
+        dummy_mem, chains, chunk_base
+    )
     chains.sort()
     # Return the list of MatchChain objects from this chunk.
     return chains
@@ -1589,7 +1597,7 @@ def execute():
     finally:
         idc.jumpto(start_ea)
     # Optionally, reanalyze after patching.
-    
+
 
 # --- Main Execution ---
 if __name__ == "__main__":
