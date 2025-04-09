@@ -29,8 +29,9 @@ class RegexPatternMetadata:
 
 
 class MemHelper:
-    def __init__(self, start: int, end: int):
-        self.mem_results = b""
+
+    def __init__(self, start: int, end: int, mem_results: bytes = b""):
+        self.mem_results = mem_results
         self.mem_offsets = []
         self.start = start
         self.end = end
