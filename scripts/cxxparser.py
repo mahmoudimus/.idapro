@@ -1,97 +1,113 @@
-"""
+r"""
 execfile('<path>/cxxparser.py')
 parse_file('<path>/a.cpp',[r'-I<path>\LuaJIT-2.0.5\src', '-D__NT__', '-D__X64__', '-D__EA64__'])
 parse_file('<path>/malloc.c',['-target=x86_64-linux-gnu'])
-
-https://gist.github.com/Jinmo/5f131a8bf3335f747e0ae7d6d6b881a4
+Originally from: https://gist.github.com/Jinmo/5f131a8bf3335f747e0ae7d6d6b881a4
+Modified by Mahmoud Abdelkader @ https://gist.github.com/mahmoudimus/d16aa9ed85053fc4b7e46a2d37203b21
 """
 
 import re
+import sys
 from functools import reduce
-from clang.cindex import Index, CursorKind, TypeKind, BaseEnumeration, conf
 
-try:
-    import idaapi
-    from ida_bytes import *
-    from ida_typeinf import *
-    from idc import *
-except:
-    pass
+from clang.cindex import (
+    BaseEnumeration,
+    CursorKind,
+    Index,
+    TranslationUnit,
+    TypeKind,
+    conf,
+)
+
+# only import idapro if we're not running in ida
+if not any(sys.executable.endswith(x) for x in ["ida.exe", "ida64.exe"]):
+    import idapro
+
+import idaapi
+
+
+class _ParserConfig:
+    RAISE_ON_UNKNOWN_TYPE = False
 
 
 class CallingConv(BaseEnumeration):
+    """Describes the calling convention of a function."""
+
+    Default = 0
+    C = 1
+    X86StdCall = 2
+    X86FastCall = 3
+    X86ThisCall = 4
+    X86Pascal = 5
+    AAPCS = 6
+    AAPCS_VFP = 7
+    X86RegCall = 8
+    IntelOclBicc = 9
+    Win64 = 10
+    X86_64Win64 = Win64
+    X86_64SysV = 11
+    X86VectorCall = 12
+    Swift = 13
+    PreserveMost = 14
+    PreserveAll = 15
+    AArch64VectorCall = 16
+    Invalid = 100
+    Unexposed = 200
+
     _kinds = []
     _name_map = None
-    pass
 
 
-CallingConv.Default = CallingConv(0)
-CallingConv.C = CallingConv(1)
-CallingConv.X86StdCall = CallingConv(2)
-CallingConv.X86FastCall = CallingConv(3)
-
-CallingConv.X86ThisCall = CallingConv(4)
-CallingConv.X86Pascal = CallingConv(5)
-CallingConv.AAPCS = CallingConv(6)
-CallingConv.AAPCS_VFP = CallingConv(7)
-
-CallingConv.X86RegCall = CallingConv(8)
-CallingConv.IntelOclBicc = CallingConv(9)
-CallingConv.Win64 = CallingConv(10)
-CallingConv.X86_64Win64 = CallingConv.Win64
-
-CallingConv.X86_64SysV = CallingConv(11)
-CallingConv.X86VectorCall = CallingConv(12)
-CallingConv.Swift = CallingConv(13)
-CallingConv.PreserveMost = CallingConv(14)
-
-CallingConv.PreserveAll = CallingConv(15)
-CallingConv.AArch64VectorCall = CallingConv(16)
-CallingConv.Invalid = CallingConv(100)
-CallingConv.Unexposed = CallingConv(200)
 handlers = {}
+
+
 idati = idaapi.get_idati()
 # idati = idaapi.til_t()
 
 
 if idaapi.BADADDR == 2**64 - 1:
-    FF_POINTER = FF_QWORD
+    FF_POINTER = idaapi.FF_QWORD
     POINTER_SIZE = 8
 
 else:
-    FF_POINTER = FF_DWORD
+    FF_POINTER = idaapi.FF_DWORD
     POINTER_SIZE = 4
 
 
 def preprocess(dict):
-    return {
-        key: (
-            ida_type & 0xFFFFFFFF,
-            (
-                string
-                if string is None
-                else (parse_decl(string, 0)[1] if string != "void" else b"\x01")
-            ),
-        )
-        for key, (ida_type, string) in dict.items()
-    }
+    result = {}
+    for key, (ida_type, _string) in dict.items():
+        if _string is None:
+            _sv = _string
+        elif _string != "void":
+            tinfo = idaapi.tinfo_t(_string)
+            _sv = tinfo.get_decltype()
+        else:
+            _sv = b"\x01"
+        result[key] = (ida_type & 0xFFFFFFFF, _sv)
+    return result
 
 
 def _size_to_flags(size):
-    return {1: FF_BYTE, 2: FF_WORD, 4: FF_DWORD, 8: FF_QWORD}[size]
+    return {
+        1: idaapi.FF_BYTE,
+        2: idaapi.FF_WORD,
+        4: idaapi.FF_DWORD,
+        8: idaapi.FF_QWORD,
+    }[size]
 
 
 builtin_types = preprocess(
     {
-        TypeKind.RECORD: (FF_STRUCT, None),
-        TypeKind.ENUM: (FF_DWORD, "int"),
+        TypeKind.RECORD: (idaapi.FF_STRUCT, None),
+        TypeKind.ENUM: (idaapi.FF_DWORD, "int"),
         TypeKind.BOOL: (_size_to_flags(idati.cc.size_b), "bool"),
-        TypeKind.DOUBLE: (FF_DOUBLE, "double"),
-        TypeKind.LONGDOUBLE: (FF_DOUBLE, "double"),
-        TypeKind.FLOAT: (FF_FLOAT, "float"),
-        TypeKind.WCHAR: (FF_WORD, "unsigned short"),
-        TypeKind.CHAR16: (FF_WORD, "unsigned short"),
-        TypeKind.CHAR32: (FF_DWORD, "unsigned int"),
+        TypeKind.DOUBLE: (idaapi.FF_DOUBLE, "double"),
+        TypeKind.LONGDOUBLE: (idaapi.FF_DOUBLE, "double"),
+        TypeKind.FLOAT: (idaapi.FF_FLOAT, "float"),
+        TypeKind.WCHAR: (idaapi.FF_WORD, "unsigned short"),
+        TypeKind.CHAR16: (idaapi.FF_WORD, "unsigned short"),
+        TypeKind.CHAR32: (idaapi.FF_DWORD, "unsigned int"),
         TypeKind.SHORT: (_size_to_flags(idati.cc.size_s), "short"),
         TypeKind.USHORT: (_size_to_flags(idati.cc.size_s), "unsigned short"),
         TypeKind.INT: (_size_to_flags(idati.cc.size_i), "int"),
@@ -100,15 +116,15 @@ builtin_types = preprocess(
         TypeKind.UINT: (_size_to_flags(idati.cc.size_i), "unsigned int"),
         TypeKind.ULONG: (_size_to_flags(idati.cc.size_l), "unsigned long"),
         TypeKind.ULONGLONG: (_size_to_flags(idati.cc.size_ll), "unsigned long long"),
-        TypeKind.CHAR_S: (FF_BYTE, "signed char"),
-        TypeKind.CHAR_U: (FF_BYTE, "unsigned char"),
-        TypeKind.SCHAR: (FF_BYTE, "signed char"),
-        TypeKind.UCHAR: (FF_BYTE, "unsigned char"),
-        TypeKind.INT128: (FF_OWORD, "__int128"),
-        TypeKind.UINT128: (FF_OWORD, "unsigned __int128"),
-        TypeKind.VOID: (FF_0VOID, "void"),
-        TypeKind.POINTER: (FF_0OFF | FF_POINTER, None),
-        TypeKind.LVALUEREFERENCE: (FF_0OFF | FF_POINTER, None),
+        TypeKind.CHAR_S: (idaapi.FF_BYTE, "signed char"),
+        TypeKind.CHAR_U: (idaapi.FF_BYTE, "unsigned char"),
+        TypeKind.SCHAR: (idaapi.FF_BYTE, "signed char"),
+        TypeKind.UCHAR: (idaapi.FF_BYTE, "unsigned char"),
+        TypeKind.INT128: (idaapi.FF_OWORD, "__int128"),
+        TypeKind.UINT128: (idaapi.FF_OWORD, "unsigned __int128"),
+        TypeKind.VOID: (idaapi.FF_0VOID, "void"),
+        TypeKind.POINTER: (idaapi.FF_0OFF | FF_POINTER, None),
+        TypeKind.LVALUEREFERENCE: (idaapi.FF_0OFF | FF_POINTER, None),
     }
 )
 
@@ -137,9 +153,9 @@ def handle_enum(item, context):
     members = []
     for member in item.get_children():
         members.append((member.spelling, member.enum_value))
-    enum_id = add_enum(idaapi.BADADDR, item.spelling, 0)
+    enum_id = idaapi.add_enum(idaapi.BADADDR, item.spelling, 0)
     for name, value in members:
-        add_enum_member(enum_id, name, value, -1)
+        idaapi.add_enum_member(enum_id, name, value, -1)
 
 
 class Struct:
@@ -173,7 +189,7 @@ class Struct:
 
         while True:
             self.ti.create_udt(
-                self.udt, idaapi.BTF_STRUCT if not is_union else idaapi.BTF_UNION
+                self.udt, idaapi.BTF_STRUCT if not self.is_union else idaapi.BTF_UNION
             )
 
             res = self.ti.set_named_type(
@@ -222,10 +238,12 @@ def resolve_pointer(type, context):
         if not context.resolve(
             name, lambda name: pointee_type.get_named_type(idati, name)
         ):
-            pointee_type.create_forward_decl(idati, BTF_STRUCT, name)
+            pointee_type.create_forward_decl(idati, idaapi.BTF_STRUCT, name)
     if pointee_type is None:
         pointee_type = idaapi.tinfo_t()
-        assert pointee_type.create_forward_decl(idati, BTF_STRUCT, pointee.spelling)
+        assert pointee_type.create_forward_decl(
+            idati, idaapi.BTF_STRUCT, pointee.spelling
+        )
     tif.create_ptr(pointee_type)
     return tif
 
@@ -254,7 +272,7 @@ def _make_vtable(name, virtuals, context):
 
     for i, func in enumerate(virtuals):
         size = POINTER_SIZE
-        flag = FF_POINTER | FF_0OFF
+        flag = FF_POINTER | idaapi.FF_0OFF
         member_name = "%s" % (func.spelling)
 
         tif = resolve_function(func.type, context, class_=name)
@@ -310,7 +328,7 @@ def _create_forward_declaration(typename):
     tif = idaapi.tinfo_t()
     if tif.get_named_type(idati, typename):
         return tif
-    tif.create_forward_decl(idati, BTF_STRUCT, typename)
+    tif.create_forward_decl(idati, idaapi.BTF_STRUCT, typename)
     return tif
 
 
@@ -336,7 +354,7 @@ def _register_type(type, context, bases=[], virtuals=[]):
 
     if type.kind == TypeKind.ELABORATED:
         result["resolved"] = tif = idaapi.tinfo_t()
-        tif.create_typedef(idati, typename, BTF_STRUCT)
+        tif.create_typedef(idati, typename, idaapi.BTF_STRUCT)
         visited[typename] = result
         return tif
 
@@ -375,7 +393,7 @@ def _register_type(type, context, bases=[], virtuals=[]):
         #     del visited[typename]
         tif = _register_type(canonical, context)
         if original != typename and tif:
-            tif.set_named_type(idati, typename, NTF_TYPE)
+            tif.set_named_type(idati, typename, idaapi.NTF_TYPE)
             result["resolved"] = tif
             visited[typename] = result
 
@@ -492,8 +510,9 @@ def _register_type(type, context, bases=[], virtuals=[]):
                     # later fixed to array
                     size = type.element_type.get_size()
                 else:
-                    debug = type
-                    wtf
+                    print(type)
+                    if _ParserConfig.RAISE_ON_UNKNOWN_TYPE:
+                        raise Exception("Unknown type: %s" % type)
                     continue
             flag = 0
             canonical = type.get_canonical()
@@ -548,7 +567,7 @@ def handle_struct(item, context):
 def typedefs(item, context):
     type = _register_type(item.type, context)
     if item.kind in (CursorKind.FUNCTION_DECL, CursorKind.VAR_DECL):
-        address = get_name_ea_simple(item.spelling)
+        address = idaapi.get_name_ea_simple(item.spelling)
         if address != idaapi.BADADDR:
             res = idaapi.apply_tinfo(
                 address, type, idaapi.TINFO_DELAYFUNC | idaapi.TINFO_DEFINITE
@@ -567,6 +586,10 @@ def linkage(item, context):
 
 
 def parse_file(path, args=[]):
+    parse_file_with_settings(path, _ParserConfig, args)
+
+
+def parse_file_with_settings(path, opts, args=[]):
     index = Index.create()
     tx = index.parse(path, args)
     if idaapi.BADADDR == 2**64 - 1:

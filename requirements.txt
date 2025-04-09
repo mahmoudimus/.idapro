@@ -11,4 +11,6 @@ openai==1.70.0
 groq==0.22.0
 together==1.5.4
 ollama==0.4.7
+clang==20.1.0
+pywin32==310
 ipython
