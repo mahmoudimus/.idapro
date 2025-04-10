@@ -6,6 +6,9 @@ import sys
 import typing
 from enum import Enum, auto
 
+from mutilz.helpers.ida import clear_output, find_byte_sequence
+from mutilz.logconf import configure_logging
+
 import ida_auto
 import ida_bytes
 import ida_kernwin
@@ -16,43 +19,12 @@ import ida_ua
 import idaapi
 import idautils
 import idc
+
 import unicorn
-from mutilz.helpers.ida import clear_output, find_byte_sequence
-from mutilz.logconf import configure_logging
-from unicorn.x86_const import *
 
 logger = logging.getLogger("decrypt_binary_v4")
 
 PAGE_SIZE = 0x1000  # 4 KB pages
-
-
-KEY_LENGTH_SIGNATURES = [b"8B C3 48 8B 4C 24 ? FF C3 F7 F1 ? ? ? ? ? ? ? ? ? ? ?"]
-NUM_KEYS_SIGNATURES = [
-    b"8B 84 24 ? ? ? ? F7 F1",
-    b"8B 44 ? ? F7 F1",
-]
-
-KEY_OFFSET_SIGNATURES = [
-    b"48 C7 ? 24 ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
-    b"48 C7 ? 24 ? ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
-    b"48 C7 ? 24 ? ? ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
-    b"48 C7 ? 24 ? ? ? ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
-]
-
-KEY_LENGTH_VALIDATION = [
-    lambda x: isinstance(x, int),
-    lambda x: 0x100 <= x < 0x200,
-]
-
-NUM_KEYS_VALIDATION = [
-    lambda x: isinstance(x, int),
-    lambda x: 0x1E <= x < 0x100,
-]
-
-KEY_OFFSET_VALIDATION = [
-    lambda x: isinstance(x, int),
-    lambda x: idaapi.get_segm_name(idaapi.getseg(x)) == ".rdata",
-]
 
 
 class UnicornEmulator:
@@ -107,14 +79,16 @@ class UnicornEmulator:
 
     def _init_registers(self):
         # Initialize registers—all set to 0.
-        self.mu.reg_write(UC_X86_REG_RIP, self.stack_base)
-        self.mu.reg_write(UC_X86_REG_RAX, 0)
-        self.mu.reg_write(UC_X86_REG_RBX, 0)
-        self.mu.reg_write(UC_X86_REG_RCX, 0)
-        self.mu.reg_write(UC_X86_REG_RDX, 0)
-        self.mu.reg_write(UC_X86_REG_RSI, 0)
-        self.mu.reg_write(UC_X86_REG_RDI, 0)
-        self.mu.reg_write(UC_X86_REG_RSP, self.stack_base + self.stack_size - 0x1000)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RIP, self.stack_base)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RAX, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RBX, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RCX, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RDX, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RSI, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RDI, 0)
+        self.mu.reg_write(
+            unicorn.x86_const.UC_X86_REG_RSP, self.stack_base + self.stack_size - 0x1000
+        )
 
     def _dump_registers(self, uc=None):
         """Dump all x86_64 registers in a formatted output."""
@@ -176,10 +150,10 @@ class UnicornEmulator:
         This hook is called on every instruction executed.
         It prints the current instruction address, the disassembled line (from IDA),
         and some register values.
-        """
+        """        
+        self._dump_registers()
         disasm_line = idc.generate_disasm_line(address, 0)
         logger.info("Executing 0x%X: %s", address, disasm_line)
-        self._dump_registers()
 
     def _map_combined_segments(
         self, seg_name, prot, PAGE_SIZE=0x1000, copy_content=True
@@ -230,6 +204,505 @@ class UnicornEmulator:
         return self.mu
 
 
+class SearchDirection(Enum):
+    """
+    Enum defining different strategies for searching anchor instructions.
+
+    BACKWARD_SCAN: Scan byte-by-byte backwards from ea (memory efficient)
+    FORWARD_CHUNK: Read chunk of memory and scan forward (potentially faster)
+    """
+
+    BACKWARD = auto()  # Original strategy: scan backwards byte by byte
+    FORWARD = auto()  # New strategy: read chunk and scan forward
+
+
+# def _search_range(
+#     ea: int,
+#     check_instruction: typing.Callable[[ida_ua.insn_t], bool],
+#     max_range: int = 0x200,
+#     strategy: SearchStrategy = SearchStrategy.BACKWARD_SCAN,
+# ) -> typing.Optional[int]:
+#     """
+#     Searches for an instruction that matches the `check_instruction` function
+#     using the specified search strategy.
+
+#     Args:
+#         ea (int): Starting effective address to search from
+#         max_range (int): Maximum number of bytes to search (default: 0x200)
+#         strategy (AnchorSearchStrategy): Search strategy to use (default: BACKWARD_SCAN)
+
+#     Returns:
+#         Optional[int]: The anchor address if found, None otherwise
+#     """
+
+#     if strategy == SearchStrategy.BACKWARD_SCAN:
+#         # Original strategy: scan backwards byte by byte
+#         start_addr = max(ea - max_range, 0)
+#         current = ea
+#         while current >= start_addr:
+#             insn = ida_ua.insn_t()
+#             if ida_ua.decode_insn(insn, current) > 0:
+#                 if check_instruction(insn):
+#                     return current
+#                 current -= 1
+#             else:
+#                 current -= 1
+
+#     elif strategy == SearchStrategy.FORWARD_CHUNK:
+#         # Scan forward through the chunk
+#         current = ea
+#         while current < ea + max_range:
+#             insn = ida_ua.insn_t()
+#             if ida_ua.decode_insn(insn, current) > 0:
+#                 if check_instruction(insn):
+#                     return current
+#                 current += insn.size
+#             else:
+#                 current += 1
+
+#     logger.debug("No anchor found within %d bytes before 0x%X", max_range, ea)
+#     return None
+
+
+class Searcher:
+    """
+    Encapsulates searching logic within a specified range and direction.
+    """
+
+    def __init__(
+        self,
+        start_ea: int,
+        direction: SearchDirection,
+        processor: "KeyLengthProcessor",
+        max_distance: int = 0x1000,
+    ):
+        self.start_ea = start_ea
+        self.direction = direction
+        self.processor = processor
+        self.condition: typing.Callable[[ida_ua.insn_t], bool] = processor.anchor
+        self.max_distance = max_distance
+        self.processor.reset()
+
+    def search(self) -> typing.Optional[int]:
+        """
+        Searches for an instruction that matches the `check_instruction` function
+        using the specified search strategy.
+
+        Args:
+            ea (int): Starting effective address to search from
+            max_range (int): Maximum number of bytes to search (default: 0x200)
+            strategy (AnchorSearchStrategy): Search strategy to use (default: BACKWARD_SCAN)
+
+        Returns:
+            Optional[int]: The anchor address if found, None otherwise
+        """
+
+        if self.direction == SearchDirection.BACKWARD:
+            # Original strategy: scan backwards byte by byte
+            start_addr = max(self.start_ea - self.max_distance, 0)
+            current = self.start_ea
+            while current >= start_addr:
+                insn = ida_ua.insn_t()
+                if ida_ua.decode_insn(insn, current) > 0:
+                    if self.condition(insn):
+                        logger.debug("Found anchor at 0x%X", current)
+                        return current
+                    current -= 1
+                else:
+                    current -= 1
+
+        elif self.direction == SearchDirection.FORWARD:
+            # Scan forward through the chunk
+            current = self.start_ea
+            while current < self.start_ea + self.max_distance:
+                insn = ida_ua.insn_t()
+                if ida_ua.decode_insn(insn, current) > 0:
+                    if self.condition(insn):
+                        logger.debug("Found anchor at 0x%X", current)
+                        return current
+                    current += insn.size
+                else:
+                    current += 1
+
+        logger.debug(
+            "No anchor found within %d bytes before 0x%X",
+            self.max_distance,
+            self.start_ea,
+        )
+        return None
+
+    # def search(self) -> typing.Optional[int]:
+    #     """
+    #     Performs the search based on the initialized parameters.
+
+    #     Returns:
+    #         Optional[int]: The address of the found instruction, or None if not found.
+    #     """
+    #     current = self.start_ea
+    #     insn = ida_ua.insn_t()
+    #     searched_distance = 0
+    #     if self.direction == SearchDirection.BACKWARD:
+    #         end_ea = max(self.start_ea - self.max_distance, 0)
+    #         while current >= end_ea:
+    #             insn_len = ida_ua.decode_prev_insn(insn, current)
+    #             if insn_len == idaapi.BADADDR or insn_len == 0:
+    #                 # Could not decode previous instruction, move back one byte
+    #                 current -= 1
+    #                 searched_distance += 1
+    #                 continue
+
+    #             if self.condition(insn):
+    #                 return insn.ea  # Found the instruction
+
+    #             current = insn.ea  # Move to the start of the decoded instruction
+    #             searched_distance = self.start_ea - current
+    #             if searched_distance >= self.max_distance:
+    #                 break  # Stop if we've exceeded max distance
+
+    #         # Final check for the very first byte if needed
+    #         if current < end_ea:
+    #             insn_len = ida_ua.decode_insn(insn, end_ea)
+    #             if insn_len > 0 and self.condition(insn):
+    #                 return insn.ea
+
+    #     elif self.direction == SearchDirection.FORWARD:
+    #         end_ea = self.start_ea + self.max_distance
+    #         while current < end_ea:
+    #             insn_len = ida_ua.decode_insn(insn, current)
+    #             if insn_len <= 0:
+    #                 # Could not decode, advance by one byte
+    #                 current += 1
+    #                 searched_distance += 1
+    #                 continue
+
+    #             if self.condition(insn):
+    #                 return current  # Found the instruction
+
+    #             current += insn_len
+    #             searched_distance = current - self.start_ea
+    #             if searched_distance >= self.max_distance:
+    #                 break  # Stop if we've exceeded max distance
+
+    #     logger.debug(
+    #         "Search did not find matching instruction within %d bytes %s from 0x%X",
+    #         self.max_distance,
+    #         "before" if self.direction == SearchDirection.BACKWARD else "after",
+    #         self.start_ea,
+    #     )
+    #     return None
+
+
+# 69 45 00 82 81 46 61 DF 52 10 F4 0C D7 A9 5F 26 6F 3C 1D 15 6E E4 93 0D 77 AB 20 A6 99
+# -> Encrypted_Function_Pad
+
+# ? ? 2B EB 1E 6A DC 0F 91 12  -> ExecuteNthTime #15
+# -> polynomials
+# -> EncDataTransform_Start function addr
+# -> imageExeRange
+# -> tlsMirrorBase
+# -> tlsCryptoReady
+# -> EncryptedDataTransform function addr
+# -> encDataRandomTable
+# -> uberHash
+# -> uberHashChangeReported
+# -> tlsCodeHashInvalid
+# -> tlsCrash function addr
+
+
+class KeyLengthProcessor:
+    def __init__(self):
+        self._instructions = 0
+
+    def signatures(self) -> list[bytes]:
+        """List of byte signatures (IDA format with wildcards) to search for."""
+        return [
+            # look for:
+            # btr [rcx], eax
+            # jnb short xx
+            b"48 ? 44 24 20 0F B3 ? 73 ?",
+            b"48 ? 44 24 20 0F B3 ? 89 ? ? ? 00 00 73 ?",
+        ]
+
+    def is_valid(self, x: int) -> bool:
+        """Checks if the final emulated value (from RCX after div) is valid."""
+        return isinstance(x, int) and 0x100 <= x < 0x200
+
+    def find(self, finder):
+        """Finds potential locations using signatures."""
+        for signature in self.signatures():
+            yield from finder(signature)
+
+    def reset(self):
+        self._instructions = 0
+
+    def anchor(self, insn: ida_ua.insn_t, max_lookahead: int = 20) -> bool:
+        """
+        Checks if the given instruction 'insn' is the start of the target sequence.
+        It verifies this by looking ahead for specific subsequent instructions.
+        """
+        # 1. Check if the current instruction is the 'mov [mem/displ], imm' candidate
+        mnem = insn.get_canon_mnem().lower()
+        if not (
+            mnem == "mov"
+            and insn.ops[0].type in (ida_ua.o_mem, ida_ua.o_displ)
+            and insn.ops[1].type == ida_ua.o_imm
+        ):
+            return False  # Not the potential start instruction type
+
+        logger.debug(
+            "Potential anchor 'mov [mem], imm' found at 0x%X. Looking ahead...", insn.ea
+        )
+
+        # 2. Look ahead to verify the sequence
+        found_xor_edx = False
+        found_add_rax_count = 0
+        found_div_ecx = False
+
+        current_ea = insn.ea
+        steps = 0
+        sequence_ok = True  # Flag to track if sequence structure seems correct
+
+        while steps < max_lookahead:
+            next_insn = ida_ua.insn_t()
+            # Use next_head to move forward, ensuring we handle instruction sizes correctly
+            next_ea = idc.next_head(current_ea)
+            if next_ea == idc.BADADDR or ida_ua.decode_insn(next_insn, next_ea) <= 0:
+                logger.debug(
+                    "Lookahead stopped at 0x%X due to decode error or end.", next_ea
+                )
+                sequence_ok = False
+                break  # Stop if decoding fails or end of segment
+
+            current_ea = next_ea
+            steps += 1
+            next_mnem = next_insn.get_canon_mnem().lower()
+            logger.debug(
+                "  [Lookahead %d] 0x%X: %s",
+                steps,
+                current_ea,
+                idc.generate_disasm_line(current_ea, 0),
+            )
+
+            # Check for 'xor edx, edx' - must appear before adds and div
+            if not found_xor_edx:
+                if (
+                    next_mnem == "xor"
+                    and next_insn.ops[0].type == ida_ua.o_reg
+                    and next_insn.ops[1].type == ida_ua.o_reg
+                ):
+                    reg1_name = idaapi.get_reg_name(next_insn.ops[0].reg, 4)
+                    reg2_name = idaapi.get_reg_name(next_insn.ops[1].reg, 4)
+                    if reg1_name.lower() == "edx" and reg2_name.lower() == "edx":
+                        logger.debug("    Found 'xor edx, edx'")
+                        found_xor_edx = True
+                        continue  # Move to next instruction
+                # If we see add/div before xor edx,edx, the sequence is wrong
+                elif next_mnem == "add" or next_mnem == "div":
+                    logger.debug(
+                        "    Sequence mismatch: Found %s before 'xor edx, edx'",
+                        next_mnem,
+                    )
+                    sequence_ok = False
+                    break
+
+            # Check for 'add rax, imm' - must appear after xor edx, edx but before div ecx
+            elif not found_div_ecx:
+                if (
+                    next_mnem == "add"
+                    and next_insn.ops[0].type == ida_ua.o_reg
+                    and next_insn.ops[1].type == ida_ua.o_imm
+                ):
+                    reg_name = idaapi.get_reg_name(
+                        next_insn.ops[0].reg, 8
+                    )  # Check RAX (64-bit)
+                    if reg_name.lower() == "rax":
+                        logger.debug(
+                            "    Found 'add rax, imm' (%d)", found_add_rax_count + 1
+                        )
+                        found_add_rax_count += 1
+                        continue  # Move to next instruction
+                # If we see div before enough adds, sequence is wrong (allow intermediate instructions)
+                elif next_mnem == "div":
+                    # Check if it's the specific 'div ecx'
+                    ops = [op for op in next_insn.ops if op.type != ida_ua.o_void]
+                    op = ops[1] if len(ops) > 1 else ops[0]  # Divisor operand
+                    if op.type == ida_ua.o_reg:
+                        reg_name = idaapi.get_reg_name(op.reg, 4)  # Check ECX (32-bit)
+                        if reg_name.lower() == "ecx":
+                            logger.debug("    Found 'div ecx'")
+                            found_div_ecx = True
+                            # We found the final part, break lookahead
+                            break
+                        else:
+                            logger.debug(
+                                "    Sequence mismatch: Found 'div %s', expected 'div ecx'",
+                                reg_name,
+                            )
+                            sequence_ok = False
+                            break
+                    else:
+                        logger.debug(
+                            "    Sequence mismatch: Found 'div' with non-register operand"
+                        )
+                        sequence_ok = False
+                        break
+
+            # If we have already found div ecx, we can stop the lookahead.
+            if found_div_ecx:
+                break
+
+        # 3. Check if all required instructions were found in the correct order
+        #    (Implicitly handled by the state checks during lookahead)
+        if sequence_ok and found_xor_edx and found_add_rax_count >= 2 and found_div_ecx:
+            logger.info(
+                ">>> Valid anchor sequence confirmed starting at 0x%X <<<", insn.ea
+            )
+            return True  # This 'mov' instruction is the correct anchor
+
+        logger.debug(
+            "Anchor candidate at 0x%X rejected. Sequence requirements not met (xor:%s, add>=2:%s, div:%s)",
+            insn.ea,
+            found_xor_edx,
+            found_add_rax_count >= 2,
+            found_div_ecx,
+        )
+        return False  # The sequence after this 'mov' did not match
+
+    def traverse(self, ea: int):
+        """Creates Searcher instances to find the anchor."""
+        # Search backwards from the location found by the initial signature scan ('ea')
+        # The Searcher will call self.anchor for each instruction it finds.
+        return [
+            Searcher(
+                start_ea=ea,
+                direction=SearchDirection.BACKWARD,
+                processor=self,
+                max_distance=0x100,  # will always be within 256 bytes
+            ),
+        ]
+
+    def emulate(self, start_ea: int, debug: bool = False, max_steps: int = 30):
+        """Emulates from the found anchor ('start_ea') to 'div ecx'."""
+        # This part remains the same: find the 'div ecx' instruction *after* the anchor
+        # to determine the emulation end point.
+        if start_ea is None:
+            # This condition should ideally not be hit if anchor finding is robust
+            logger.error("Emulation called with start_ea=None. Anchor not found.")
+            return None
+
+        logger.info("Starting emulation analysis from anchor at 0x%X", start_ea)
+
+        # Now traverse downward from the anchor to find the "div ecx" instruction.
+        end_ea = None
+        current = start_ea
+        steps = 0
+        while (
+            current != idc.BADADDR and steps <= max_steps
+        ):  # Added steps <= max_steps check here
+            insn = ida_ua.insn_t()
+            insn_len = ida_ua.decode_insn(insn, current)
+            if insn_len <= 0:
+                logger.warning(
+                    "Failed to decode instruction at 0x%X during emulation scan.",
+                    current,
+                )
+                # Attempt to skip potentially bad bytes, could be risky
+                next_head = idc.next_head(current)
+                if (
+                    next_head == idc.BADADDR or next_head <= current
+                ):  # Prevent infinite loop
+                    logger.error(
+                        "Cannot advance past undecodable byte at 0x%X.", current
+                    )
+                    break
+                current = next_head
+                continue
+
+            steps += 1
+            logger.debug(
+                "decoded %s at 0x%X", idc.generate_disasm_line(current, 0), current
+            )
+            mnem = insn.get_canon_mnem().lower()
+
+            if mnem == "div":
+                ops = [op for op in insn.ops if op.type != ida_ua.o_void]
+                op = ops[1] if len(ops) > 1 else ops[0]  # Divisor operand
+
+                if op.type == ida_ua.o_reg:
+                    reg_name = idaapi.get_reg_name(op.reg, 4)  # 4 bytes for ECX
+                    if reg_name and reg_name.lower() == "ecx":
+                        # Valid 'div ecx' instruction found. End emulation *after* this instruction.
+                        end_ea = current + insn.size
+                        logger.info(
+                            "Found 'div ecx' target for emulation end at 0x%X", current
+                        )
+                        break  # Stop search
+
+            # Move to the next instruction's address
+            current += insn_len
+            # Check if we exceeded max_steps after processing the instruction
+            if steps > max_steps:
+                logger.warning(
+                    "Max steps (%d) reached during emulation scan before finding 'div ecx'. Stopping scan.",
+                    max_steps,
+                )
+                break
+
+        if end_ea is None:
+            logger.error(
+                "Failed to find 'div ecx' instruction within %d steps downward from anchor 0x%X.",
+                max_steps,
+                start_ea,
+            )
+            return None
+
+        logger.info("Emulating code from 0x%X to 0x%X", start_ea, end_ea)
+        mu = emulate_range_with_unicorn(start_ea, end_ea, debug)
+        if mu is None:
+            logger.error(
+                "Unicorn emulation failed for range 0x%X - 0x%X", start_ea, end_ea
+            )
+            return None
+
+        # The value we need is in RCX *before* the division, which Unicorn captures.
+        x = mu.reg_read(unicorn.x86_const.UC_X86_REG_RCX)
+        logger.info("Final RCX value after emulation: 0x%X (%d)", x, x)
+
+        if self.is_valid(x):
+            logger.info("RCX value 0x%X is valid.", x)
+            return x
+        else:
+            logger.warning("RCX value 0x%X is invalid.", x)
+            return None
+
+
+KEY_LENGTH_SIGNATURES = [b"8B C3 48 8B 4C 24 ? FF C3 F7 F1 ? ? ? ? ? ? ? ? ? ? ?"]
+KEY_LENGTH_VALIDATION = [
+    lambda x: isinstance(x, int),
+    lambda x: 0x100 <= x < 0x200,
+]
+
+NUM_KEYS_SIGNATURES = [
+    b"8B 84 24 ? ? ? ? F7 F1",
+    b"8B 44 ? ? F7 F1",
+]
+NUM_KEYS_VALIDATION = [
+    lambda x: isinstance(x, int),
+    lambda x: 0x1E <= x < 0x100,
+]
+
+KEY_OFFSET_SIGNATURES = [
+    b"48 C7 ? 24 ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
+    b"48 C7 ? 24 ? ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
+    b"48 C7 ? 24 ? ? ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
+    b"48 C7 ? 24 ? ? ? ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
+]
+KEY_OFFSET_VALIDATION = [
+    lambda x: isinstance(x, int),
+    lambda x: idaapi.get_segm_name(idaapi.getseg(x)) == ".rdata",
+]
+
+
 def emulate_range_with_unicorn(start_ea, end_ea, debug=False):
     """
     Emulate the code between start_ea and end_ea using Unicorn.
@@ -248,8 +721,25 @@ def emulate_range_with_unicorn(start_ea, end_ea, debug=False):
     logger.info(
         "Emulating code from 0x%X to 0x%X (size=0x%X)", start_ea, end_ea, code_size
     )
-    emulator = UnicornEmulator(debug=debug)
+    emulator = UnicornEmulator(debug=True)
     return emulator.emulate(start_ea, end_ea)
+
+
+def decode_anchor(ea: int) -> typing.Optional[int]:
+
+    def check_instruction(insn: ida_ua.insn_t) -> bool:
+        """Helper function to validate if instruction is our target anchor"""
+        mnem = insn.get_canon_mnem().lower()
+        if (
+            mnem == "mov"
+            and insn.ops[0].type in (ida_ua.o_mem, ida_ua.o_displ)
+            and insn.ops[1].type == ida_ua.o_imm
+        ):
+            logger.debug("Found mov constant, mem @ 0x%X", insn.ea)
+            return True
+        return False
+
+    return _search_range(ea, check_instruction)
 
 
 def find_anchor_and_emulate(ea: int):
@@ -310,86 +800,9 @@ def find_anchor_and_emulate(ea: int):
         return None
 
     mu = emulate_range_with_unicorn(anchor, end)
-    x = mu.reg_read(UC_X86_REG_RCX)
+    x = mu.reg_read(unicorn.x86_const.UC_X86_REG_RCX)
     logger.info("Final RCX: 0x%X (%d)", x, x)
     return x
-
-
-class SearchStrategy(Enum):
-    """
-    Enum defining different strategies for searching anchor instructions.
-
-    BACKWARD_SCAN: Scan byte-by-byte backwards from ea (memory efficient)
-    FORWARD_CHUNK: Read chunk of memory and scan forward (potentially faster)
-    """
-
-    BACKWARD_SCAN = auto()  # Original strategy: scan backwards byte by byte
-    FORWARD_CHUNK = auto()  # New strategy: read chunk and scan forward
-
-
-def _search_range(
-    ea: int,
-    check_instruction: typing.Callable[[ida_ua.insn_t], bool],
-    max_range: int = 0x200,
-    strategy: SearchStrategy = SearchStrategy.BACKWARD_SCAN,
-) -> typing.Optional[int]:
-    """
-    Searches for an instruction that matches the `check_instruction` function
-    using the specified search strategy.
-
-    Args:
-        ea (int): Starting effective address to search from
-        max_range (int): Maximum number of bytes to search (default: 0x200)
-        strategy (AnchorSearchStrategy): Search strategy to use (default: BACKWARD_SCAN)
-
-    Returns:
-        Optional[int]: The anchor address if found, None otherwise
-    """
-
-    if strategy == SearchStrategy.BACKWARD_SCAN:
-        # Original strategy: scan backwards byte by byte
-        start_addr = max(ea - max_range, 0)
-        current = ea
-        while current >= start_addr:
-            insn = ida_ua.insn_t()
-            if ida_ua.decode_insn(insn, current) > 0:
-                if check_instruction(insn):
-                    return current
-                current -= 1
-            else:
-                current -= 1
-
-    elif strategy == SearchStrategy.FORWARD_CHUNK:
-        # Scan forward through the chunk
-        current = ea
-        while current < ea + max_range:
-            insn = ida_ua.insn_t()
-            if ida_ua.decode_insn(insn, current) > 0:
-                if check_instruction(insn):
-                    return current
-                current += insn.size
-            else:
-                current += 1
-
-    logger.debug("No anchor found within %d bytes before 0x%X", max_range, ea)
-    return None
-
-
-def decode_anchor(ea: int) -> typing.Optional[int]:
-
-    def check_instruction(insn: ida_ua.insn_t) -> bool:
-        """Helper function to validate if instruction is our target anchor"""
-        mnem = insn.get_canon_mnem().lower()
-        if (
-            mnem == "mov"
-            and insn.ops[0].type in (ida_ua.o_mem, ida_ua.o_displ)
-            and insn.ops[1].type == ida_ua.o_imm
-        ):
-            logger.debug("Found mov constant, mem @ 0x%X", insn.ea)
-            return True
-        return False
-
-    return _search_range(ea, check_instruction)
 
 
 def process_signatures(segment, signatures, validators, param_name):
@@ -471,7 +884,7 @@ def emulate_until_lea_rdi(start_ea: int):
         idc.generate_disasm_line(idc.next_head(target_ea), 1),
     )
     mu = emulate_range_with_unicorn(start_ea, idc.next_head(target_ea))
-    x = mu.reg_read(UC_X86_REG_RDI)
+    x = mu.reg_read(unicorn.x86_const.UC_X86_REG_RDI)
     logger.info("Final RDI: 0x%X (%d)", x, x)
     return x
 
@@ -508,37 +921,61 @@ def apply_signature(ea, sig):
 
 def find_crypto_key():
     segment = ida_segment.get_segm_by_name(".text")
-    # Process key length signatures.
-    per_key_length, _ = process_signatures(
-        segment, KEY_LENGTH_SIGNATURES, KEY_LENGTH_VALIDATION, "key length"
-    )
-    # Optionally use key_length and key_ea as needed.
+    processor = KeyLengthProcessor()
 
-    # Process number of keys signatures.
-    num_keys, num_ea = process_signatures(
-        segment, NUM_KEYS_SIGNATURES, NUM_KEYS_VALIDATION, "num keys"
-    )
-    if not per_key_length or not num_keys:
-        logger.error("Failed to find key length or number of keys!")
-        return None, None, None
+    def _process_signatures(sig):
+        """
+        Iterates through the provided signatures to find and validate a parameter.
+        Returns a tuple (value, ea) if a valid parameter is found, or (None, None) otherwise.
+        """
+        for ea in find_byte_sequence(segment.start_ea, segment.end_ea, sig):
+            if not ea:
+                continue
+            yield ea
 
-    # Optionally use num_keys and num_ea as needed.
-    key_addr, _ = process_key_offset_signature(
-        segment, KEY_OFFSET_SIGNATURES, KEY_OFFSET_VALIDATION
-    )
-    type_str = f"unsigned __int8 g_bufCryptoKey[0x{num_keys:X}][0x{per_key_length:X}];"
-    logger.info(type_str)
-    if not key_addr:
-        logger.error("Failed to find key offset!")
-        return None, None, None
+    for ea in processor.find(_process_signatures):
+        logger.debug(f"Found at 0x{ea:X}")
+        for traverser in processor.traverse(ea):
+            if found := traverser.search():
+                result = processor.emulate(found)
+                logger.info("Valid %s: %s", processor, hex(result))
 
-    logger.info("g_bufCryptoKey address: 0x%X", key_addr)
-    result = set_type(key_addr, type_str, "g_bufCryptoKey")
-    if result:
-        logger.info("Type %s applied successfully.", type_str)
-    else:
-        logger.error("Failed to apply type: %s", type_str)
-    return key_addr, num_keys, per_key_length
+    return None, None, None
+
+
+# def find_crypto_key():
+#     segment = ida_segment.get_segm_by_name(".text")
+#     # Process key length signatures.
+#     per_key_length, _ = process_signatures(
+#         segment, KEY_LENGTH_SIGNATURES, KEY_LENGTH_VALIDATION, "key length"
+#     )
+#     # Optionally use key_length and key_ea as needed.
+
+#     # Process number of keys signatures.
+#     num_keys, num_ea = process_signatures(
+#         segment, NUM_KEYS_SIGNATURES, NUM_KEYS_VALIDATION, "num keys"
+#     )
+#     if not per_key_length or not num_keys:
+#         logger.error("Failed to find key length or number of keys!")
+#         return None, None, None
+
+#     # Optionally use num_keys and num_ea as needed.
+#     key_addr, _ = process_key_offset_signature(
+#         segment, KEY_OFFSET_SIGNATURES, KEY_OFFSET_VALIDATION
+#     )
+#     type_str = f"unsigned __int8 g_bufCryptoKey[0x{num_keys:X}][0x{per_key_length:X}];"
+#     logger.info(type_str)
+#     if not key_addr:
+#         logger.error("Failed to find key offset!")
+#         return None, None, None
+
+#     logger.info("g_bufCryptoKey address: 0x%X", key_addr)
+#     result = set_type(key_addr, type_str, "g_bufCryptoKey")
+#     if result:
+#         logger.info("Type %s applied successfully.", type_str)
+#     else:
+#         logger.error("Failed to apply type: %s", type_str)
+#     return key_addr, num_keys, per_key_length
 
 
 def get_garbage_blobs():
@@ -1109,6 +1546,8 @@ def re_analyze(decryption_results: dict):
 
 
 def execute(decrypt=False, dry_run=False, reanalyze=False):
+    print(find_crypto_key())
+    return
     key_addr, num_keys, per_key_length = find_crypto_key()
     if not key_addr:
         logger.error("[!] No key extracted")
@@ -1191,5 +1630,5 @@ def cli(args=sys.argv[1:]):
 
 if __name__ == "__main__":
     clear_output()
-    configure_logging(log=logger)
+    configure_logging(log=logger, level=logging.DEBUG)
     execute(decrypt=True, dry_run=False, reanalyze=True)
