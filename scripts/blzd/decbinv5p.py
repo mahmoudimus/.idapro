@@ -6,7 +6,6 @@ import pathlib
 import sys
 import typing
 import warnings
-from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
@@ -416,6 +415,232 @@ class Searcher:
 BytesData = typing.Union[list[int], bytes, bytearray]
 
 
+class ByteBuffer(abc.ABC):
+    """Abstract base class for byte access."""
+
+    @abc.abstractmethod
+    def get_byte(self, ea: int) -> int:
+        """
+        Gets a single byte at the specified effective address.
+        Raises IndexError if the byte cannot be read.
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_bytes(self, ea: int, size: int) -> bytes | None:
+        """
+        Gets a sequence of bytes. Returns None on failure.
+        """
+        pass
+
+    @abc.abstractmethod
+    def is_valid_address(self, ea: int) -> bool:
+        """Checks if the address is potentially readable."""
+        pass
+
+
+class IDBBackedBuffer(ByteBuffer):
+    """Directly accesses IDA database for bytes."""
+
+    def get_byte(self, ea: int) -> int:
+        """Gets a single byte directly from the IDB."""
+        # Check if address exists in the database segmentation
+        if not ida_bytes.is_loaded(ea):
+            raise IndexError(f"Address 0x{ea:X} is not loaded in IDB.")
+
+        b = ida_bytes.get_byte(ea)
+        # ida_bytes.get_byte returns -1 on error (e.g., outside defined range)
+        if b == -1:
+            # Verify if the address is *truly* invalid or just happens to contain 0xFF
+            # A simple check is to try and read 1 byte using get_bytes
+            if ida_bytes.get_bytes(ea, 1) is None:
+                raise IndexError(f"Failed to read byte at address 0x{ea:X} from IDB.")
+            else:
+                # If get_bytes works, the byte must be 0xFF
+                return 0xFF
+        return b
+
+    def get_bytes(self, ea: int, size: int) -> bytes | None:
+        """Gets bytes directly from the IDB. Returns None on failure."""
+        return ida_bytes.get_bytes(ea, size)
+
+    def is_valid_address(self, ea: int) -> bool:
+        """Checks if the address is loaded in the IDB."""
+        return ida_bytes.is_loaded(ea)
+
+
+class MemBackedBuffer(ByteBuffer):
+    """Buffers reads from the IDB for potentially faster sequential access."""
+
+    DEFAULT_BUFFER_SIZE = 96 * 1024  # 96KB default buffer
+
+    def __init__(
+        self, buffer_size: int = DEFAULT_BUFFER_SIZE, preload_ea: int | None = None
+    ):
+        if buffer_size <= 0:
+            raise ValueError("Buffer size must be positive.")
+        self.buffer_size = buffer_size
+        self.buffer = bytearray()
+        self.buffer_start_ea = idaapi.BADADDR
+        self.buffer_end_ea = idaapi.BADADDR  # Exclusive end address
+
+        # Basic stats
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._bytes_read_from_idb = 0
+
+        if preload_ea is not None:
+            try:
+                self._slide_window(preload_ea)
+            except IndexError:
+                logger.warning(f"Preload failed for address 0x{preload_ea:X}")
+
+    def _is_address_in_buffer(self, ea: int) -> bool:
+        """Checks if the address is within the current buffer's range."""
+        return self.buffer_start_ea <= ea < self.buffer_end_ea
+
+    def _slide_window(self, target_ea: int) -> None:
+        """Loads a chunk of memory centered around target_ea into the buffer."""
+        self._cache_misses += 1
+        # Calculate the ideal start address to center the buffer
+        # Ensure start_ea is not negative
+        new_start = max(0, target_ea - self.buffer_size // 2)
+
+        # Ensure read doesn't go past max_ea, adjust size if necessary
+        max_ea = idaapi.inf_get_max_ea()
+        read_size = min(self.buffer_size, max_ea - new_start)
+        if read_size <= 0:
+            logger.warning(
+                f"Cannot read at or beyond max EA (0x{max_ea:X}). Requested start 0x{new_start:X}"
+            )
+            self._invalidate_buffer()
+            raise IndexError(f"Cannot read memory at 0x{new_start:X} (beyond max EA)")
+
+        logger.debug(
+            f"Sliding window to cover 0x{target_ea:X}. Reading {read_size} bytes from 0x{new_start:X}"
+        )
+
+        actual_bytes = ida_bytes.get_bytes(new_start, read_size)
+
+        if actual_bytes:
+            self.buffer = bytearray(actual_bytes)
+            self.buffer_start_ea = new_start
+            self.buffer_end_ea = new_start + len(actual_bytes)
+            self._bytes_read_from_idb += len(actual_bytes)
+            logger.debug(
+                f"Loaded {len(actual_bytes)} bytes into buffer. Range: [0x{self.buffer_start_ea:X} - 0x{self.buffer_end_ea:X})"
+            )
+        else:
+            # Failed to read bytes - maybe invalid address or gap in memory?
+            logger.warning(
+                f"Failed to read {read_size} bytes starting at 0x{new_start:X}"
+            )
+            self._invalidate_buffer()
+            # Raise error to signal failure to the caller
+            raise IndexError(f"Failed to read memory for buffer at 0x{new_start:X}")
+
+    def _invalidate_buffer(self):
+        """Clears the buffer and resets its state."""
+        self.buffer = bytearray()
+        self.buffer_start_ea = idaapi.BADADDR
+        self.buffer_end_ea = idaapi.BADADDR
+
+    def get_byte(self, ea: int) -> int:
+        """Gets a single byte, loading from IDB if not buffered."""
+        if self._is_address_in_buffer(ea):
+            self._cache_hits += 1
+        else:
+            # This call raises IndexError on failure
+            self._slide_window(ea)
+            # Check again after sliding - must be in buffer now if _slide_window succeeded
+            if not self._is_address_in_buffer(ea):
+                # This should not happen if _slide_window doesn't error, but as a safeguard:
+                raise IndexError(f"Address 0x{ea:X} could not be loaded into buffer.")
+
+        offset = ea - self.buffer_start_ea
+        return self.buffer[offset]
+
+    def get_bytes(self, ea: int, size: int) -> bytes | None:
+        """Gets bytes, loading from IDB if needed. Returns None on failure."""
+        if size <= 0:
+            return b""
+
+        end_ea = ea + size  # Exclusive end
+        # Check if the *entire* range is currently buffered
+        if self._is_address_in_buffer(ea) and self._is_address_in_buffer(end_ea - 1):
+            self._cache_hits += 1
+            start_offset = ea - self.buffer_start_ea
+            end_offset = end_ea - self.buffer_start_ea
+            return bytes(self.buffer[start_offset:end_offset])  # Return copy
+        else:
+            # Range is not fully buffered. Can we serve it by sliding?
+            if size > self.buffer_size:
+                # Request is larger than the buffer capacity, fallback to direct read
+                logger.warning(
+                    f"Requested size {size} exceeds buffer size {self.buffer_size}. Falling back to direct IDB read for 0x{ea:X}."
+                )
+                self._cache_misses += 1  # Treat as miss
+                direct_bytes = ida_bytes.get_bytes(ea, size)
+                if direct_bytes:
+                    self._bytes_read_from_idb += len(direct_bytes)
+                return direct_bytes
+            else:
+                # Try sliding the window to cover the start address
+                try:
+                    self._slide_window(ea)  # Will increment miss counter
+                    # Check again if the range is now fully covered
+                    if self._is_address_in_buffer(ea) and self._is_address_in_buffer(
+                        end_ea - 1
+                    ):
+                        # Success after sliding
+                        start_offset = ea - self.buffer_start_ea
+                        end_offset = end_ea - self.buffer_start_ea
+                        return bytes(
+                            self.buffer[start_offset:end_offset]
+                        )  # Return copy
+                    else:
+                        # Still not covered after sliding (e.g., requested range crosses boundary IDA failed to read)
+                        logger.warning(
+                            f"Range 0x{ea:X}-0x{end_ea:X} still not in buffer after slide. Falling back to direct IDB read."
+                        )
+                        # Fallback to direct read
+                        direct_bytes = ida_bytes.get_bytes(ea, size)
+                        if direct_bytes:
+                            self._bytes_read_from_idb += len(direct_bytes)
+                        return direct_bytes
+                except IndexError as e:
+                    # _slide_window failed
+                    logger.error(
+                        f"Failed to load buffer for range 0x{ea:X}-0x{end_ea:X}: {e}"
+                    )
+                    return None
+
+    def is_valid_address(self, ea: int) -> bool:
+        """Checks if the address is within the buffer or potentially loadable."""
+        if self._is_address_in_buffer(ea):
+            return True
+        # Check IDA's idea of validity if not in buffer
+        return ida_bytes.is_loaded(ea)
+
+    def get_stats(self) -> dict:
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "bytes_read_from_idb": self._bytes_read_from_idb,
+            "current_buffer_range": (
+                f"[0x{self.buffer_start_ea:X} - 0x{self.buffer_end_ea:X})"
+                if self.buffer_start_ea != idaapi.BADADDR
+                else "Empty"
+            ),
+        }
+
+
+text_segment = ida_segment.get_segm_by_name(".text")
+text_buffer = MemBackedBuffer(
+    buffer_size=text_segment.size(), preload_ea=text_segment.start_ea
+)
+
+
 @dataclass(repr=False)
 class BytePattern:
     """
@@ -496,9 +721,6 @@ class BytePattern:
                 pattern_bytes.append(0x00)  # Dummy value; not used.
                 mask_bytes.append(0x00)
             elif high_char == "?" or low_char == "?":
-                logger.warning(
-                    f"Nibble wildcard detected: {high_char}{low_char}. It is very slow!"
-                )
                 # Nibble wildcard detected.
                 self.nibble_mode = True
                 if high_char == "?" and low_char != "?":
@@ -566,73 +788,275 @@ class BytePattern:
         )
 
 
+# class ByteSequenceFinder:
+#     """
+#     Encapsulates the logic for searching a byte sequence in IDA's address space.
+#     The pattern is parsed and cached in a BytePattern instance.
+
+#     >>> finder = ByteSequenceFinder("1? ?? 34", start=0x1000, end=0x2000)
+#     >>> for ea in finder.find_iter():
+#     >>>     logger.info("Match found at 0x%X", ea)
+#     """
+
+#     def __init__(
+#         self,
+#         # TODO: this should be updated to use a ByteMemSearcher as well as an IDBSearcher
+#         start: int | ida_range.range_t,
+#         pattern: typing.Union[str, BytesData] | BytePattern | None = None,
+#         end: int | None = idaapi.BADADDR,
+#         max_distance: typing.Union[int, None] = None,
+#         direction: int = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW,
+#     ) -> None:
+
+#         if isinstance(start, ida_range.range_t):
+#             start, end = start.start_ea, start.end_ea
+
+#         # IDA has a bug where basically BIN_SEARCH_BACKWARD does not work. we have to manually handle it
+#         # so we have to check for it and adjust the max_distance accordingly
+#         if (direction & ida_bytes.BIN_SEARCH_BACKWARD) == ida_bytes.BIN_SEARCH_BACKWARD:
+#             _direction = "backward"
+#             # if we did not set an end address
+#             #  and if max_distance is set, end address is start - max_distance
+#             #  otherwise we use the imagebase
+#             if not end or end == idaapi.BADADDR:
+#                 end = (
+#                     idaapi.get_imagebase() if not max_distance else start - max_distance
+#                 )
+#             # now IDA's bug is that it will not search backwards if the end address is before the start address
+#             # so we have to swap them if that's the case
+#             if end < start:
+#                 start, end = end, start
+#             _range = f"0x{start:X} - 0x{end:X}"
+#             # also, if max_distance is set, we have to set it to None since there's a bug in IDA
+#             # where it will set the end address to the start address + max_distance, which is not
+#             # what we want
+#             if max_distance:
+#                 max_distance = None
+#         else:
+#             direction |= ida_bytes.BIN_SEARCH_FORWARD
+#             _direction = "forward"
+#             if not end and max_distance:
+#                 end = start + max_distance
+#             _range = f"0x{start:X} - 0x{end:X}"
+
+#         # must set this after the above!
+#         self.direction = direction
+#         self.start = start
+#         self.end = end
+#         self.max_distance = max_distance
+#         self.byte_pattern = pattern
+#         logger.debug(
+#             "ByteSequenceFinder searching %s within range: %s %s",
+#             _direction,
+#             _range,
+#             f"for pattern: {self.byte_pattern.original}" if self.byte_pattern else "",
+#         )
+
+#     def with_pattern(
+#         self, pattern: typing.Union[str, BytesData] | BytePattern
+#     ) -> "ByteSequenceFinder":
+#         if isinstance(pattern, BytePattern):
+#             self._pattern = pattern
+#         else:
+#             self._pattern = BytePattern(pattern)
+#         return self
+
+#     @property
+#     def byte_pattern(self) -> BytePattern:
+#         return self._pattern
+
+#     @byte_pattern.setter
+#     def byte_pattern(self, pattern: typing.Union[str, BytesData] | BytePattern | None):
+#         if pattern:
+#             self.with_pattern(pattern)
+#         else:
+#             self._pattern = None
+
+#     def _matches_at(self, addr: int) -> bool:
+#         """
+#         Check whether the byte pattern matches at a given address using a nibble-level comparison.
+#         """
+#         pat_len = len(self.byte_pattern.pattern)
+#         for i in range(pat_len):
+#             actual_byte = ida_bytes.get_byte(addr + i)
+#             if (actual_byte & self.byte_pattern.mask[i]) != (
+#                 self.byte_pattern.pattern[i] & self.byte_pattern.mask[i]
+#             ):
+#                 return False
+#         return True
+
+#     def _find_next_manual(self, current: int) -> int:
+#         """
+#         Perform a nibble-level search by manually iterating the address range.
+#         """
+#         pat_len = len(self.byte_pattern.pattern)
+#         addr = current
+#         while addr <= self.end - pat_len:
+#             if self._matches_at(addr):
+#                 return addr
+#             addr += 1
+#         return idaapi.BADADDR
+
+#     def _find_next_optimized(self, current: int) -> int:
+#         """
+#         Perform an optimized search using IDA's ida_bytes.find_bytes function.
+#         This is used when the pattern does not require nibble-level matching.
+#         """
+#         ea = ida_bytes.find_bytes(
+#             bs=self.byte_pattern.pattern,
+#             range_start=current,
+#             range_size=self.max_distance,
+#             range_end=self.end,
+#             mask=self.byte_pattern.mask,
+#             flags=self.direction,
+#         )
+#         return ea
+
+#     def find_iter(self) -> typing.Iterator[int]:
+#         """
+#         Yield all effective addresses where the byte sequence is found.
+#         """
+#         current = self.start
+#         while True:
+#             if self.byte_pattern.nibble_mode:
+#                 ea = self._find_next_manual(current)
+#             else:
+#                 ea = self._find_next_optimized(current)
+#             if ea == idaapi.BADADDR:
+#                 break
+#             yield ea
+#             current = ea + 1
+
+
+#     __iter__ = find_iter
+
+
+# --- Updated ByteSequenceFinder ---
 class ByteSequenceFinder:
     """
     Encapsulates the logic for searching a byte sequence in IDA's address space.
-    The pattern is parsed and cached in a BytePattern instance.
-
-    >>> finder = ByteSequenceFinder("1? ?? 34", start=0x1000, end=0x2000)
-    >>> for ea in finder.find_iter():
-    >>>     logger.info("Match found at 0x%X", ea)
+    Uses a ByteBuffer for potentially optimized byte access during manual search.
     """
 
     def __init__(
         self,
-        # TODO: this should be updated to use a ByteMemSearcher as well as an IDBSearcher
         start: int | ida_range.range_t,
         pattern: typing.Union[str, BytesData] | BytePattern | None = None,
         end: int | None = idaapi.BADADDR,
         max_distance: typing.Union[int, None] = None,
         direction: int = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW,
+        byte_buffer: ByteBuffer | None = None,  # Accept a buffer instance
     ) -> None:
 
         if isinstance(start, ida_range.range_t):
-            start, end = start.start_ea, start.end_ea
-
-        # IDA has a bug where basically BIN_SEARCH_BACKWARD does not work. we have to manually handle it
-        # so we have to check for it and adjust the max_distance accordingly
-        if (direction & ida_bytes.BIN_SEARCH_BACKWARD) == ida_bytes.BIN_SEARCH_BACKWARD:
-            _direction = "backward"
-            # if we did not set an end address
-            #  and if max_distance is set, end address is start - max_distance
-            #  otherwise we use the imagebase
-            if not end or end == idaapi.BADADDR:
-                end = (
-                    idaapi.get_imagebase() if not max_distance else start - max_distance
-                )
-            # now IDA's bug is that it will not search backwards if the end address is before the start address
-            # so we have to swap them if that's the case
-            if end < start:
-                start, end = end, start
-            _range = f"0x{start:X} - 0x{end:X}"
-            # also, if max_distance is set, we have to set it to None since there's a bug in IDA
-            # where it will set the end address to the start address + max_distance, which is not
-            # what we want
-            if max_distance:
-                max_distance = None
+            _start, _end = start.start_ea, start.end_ea
         else:
-            direction |= ida_bytes.BIN_SEARCH_FORWARD
-            _direction = "forward"
-            if not end and max_distance:
-                end = start + max_distance
-            _range = f"0x{start:X} - 0x{end:X}"
+            _start = start
+            _end = end
 
-        # must set this after the above!
+        # --- Determine effective search range and direction string ---
+        is_backward = (
+            direction & ida_bytes.BIN_SEARCH_BACKWARD
+        ) == ida_bytes.BIN_SEARCH_BACKWARD
+        _direction_str = "backward" if is_backward else "forward"
+
+        if is_backward:
+            # Logic to determine the actual range [effective_start, effective_end) for backward search
+            self.manual_search_start = (
+                _start  # Where the user wants to start searching *from*
+            )
+            if max_distance is not None:
+                effective_start = max(idaapi.inf_get_min_ea(), _start - max_distance)
+            elif _end is not None and _end != idaapi.BADADDR and _end < _start:
+                effective_start = _end  # User specified a lower bound
+            else:
+                effective_start = idaapi.inf_get_min_ea()  # Default to min EA
+
+            effective_end = (
+                _start + 1
+            )  # Search up to and including the original start address
+            self.search_limit = effective_start  # The lowest address to check
+
+            # For ida_bytes.find_bytes (if used backward), IDA expects range_start < range_end
+            self.ida_find_range_start = effective_start
+            self.ida_find_range_end = effective_end
+
+        else:  # Forward search
+            direction |= ida_bytes.BIN_SEARCH_FORWARD
+            effective_start = _start
+            self.manual_search_start = (
+                _start  # Where the user wants to start searching *from*
+            )
+            if max_distance is not None:
+                effective_end = _start + max_distance
+            elif _end is not None and _end != idaapi.BADADDR:
+                effective_end = _end
+            else:
+                effective_end = idaapi.inf_get_max_ea()  # Default to max EA
+
+            self.search_limit = effective_end  # The address limit (exclusive)
+            self.ida_find_range_start = effective_start
+            self.ida_find_range_end = effective_end
+
+        _range_str = f"0x{effective_start:X} - 0x{effective_end:X}"  # Logical range
+
+        # --- Initialize buffer ---
+        if byte_buffer is None:
+            # Default to MemBackedBuffer, preload near the start of the search activity
+            preload_addr = self.manual_search_start
+            # Adjust preload hint for backward search to be near the end of the range
+            if is_backward:
+                # Preload somewhere within the range [search_limit, manual_search_start]
+                preload_addr = max(
+                    self.search_limit,
+                    self.manual_search_start - MemBackedBuffer.DEFAULT_BUFFER_SIZE // 4,
+                )
+
+            logger.debug(
+                f"Initializing default MemBackedBuffer, preloading near 0x{preload_addr:X}"
+            )
+            self.buffer = MemBackedBuffer(preload_ea=preload_addr)
+            self._owns_buffer = True  # Flag to indicate we should report stats
+        else:
+            logger.debug(f"Using provided {type(byte_buffer).__name__}.")
+            self.buffer = byte_buffer
+            self._owns_buffer = False
+
+        # --- Set other members ---
         self.direction = direction
-        self.start = start
-        self.end = end
-        self.max_distance = max_distance
-        self.byte_pattern = pattern
+        # Note: self.start/end/max_distance might be less relevant now range is calculated above
+        # Keep them for reference or potential other uses if needed.
+        self.orig_start = _start
+        self.orig_end = _end
+        self.orig_max_distance = max_distance
+
+        self.byte_pattern = pattern  # Property setter handles parsing
+
         logger.debug(
-            "ByteSequenceFinder searching %s within range: %s %s",
-            _direction,
-            _range,
+            f"ByteSequenceFinder searching %s within logical range: %s %s",
+            _direction_str,
+            _range_str,
             f"for pattern: {self.byte_pattern.original}" if self.byte_pattern else "",
         )
+        # Log buffer type only if it's the default one we created
+        if self._owns_buffer and isinstance(self.buffer, MemBackedBuffer):
+            logger.debug(f"MemBackedBuffer stats: {self.buffer.get_stats()}")
+
+    def __del__(self):
+        # Print stats when the finder is destroyed if we created the buffer
+        if (
+            self._owns_buffer
+            and isinstance(self.buffer, MemBackedBuffer)
+            and hasattr(self, "buffer")
+        ):
+            logger.debug(
+                f"Final MemBackedBuffer stats for finder starting at 0x{self.orig_start:X}: {self.buffer.get_stats()}"
+            )
 
     def with_pattern(
         self, pattern: typing.Union[str, BytesData] | BytePattern
     ) -> "ByteSequenceFinder":
+        """Sets or updates the search pattern."""
         if isinstance(pattern, BytePattern):
             self._pattern = pattern
         else:
@@ -641,10 +1065,14 @@ class ByteSequenceFinder:
 
     @property
     def byte_pattern(self) -> BytePattern:
+        """Gets the current BytePattern."""
+        if not hasattr(self, "_pattern"):
+            self._pattern = None
         return self._pattern
 
     @byte_pattern.setter
     def byte_pattern(self, pattern: typing.Union[str, BytesData] | BytePattern | None):
+        """Sets the search pattern."""
         if pattern:
             self.with_pattern(pattern)
         else:
@@ -652,58 +1080,209 @@ class ByteSequenceFinder:
 
     def _matches_at(self, addr: int) -> bool:
         """
-        Check whether the byte pattern matches at a given address using a nibble-level comparison.
+        Check if the byte pattern matches at a given address using the buffer.
+        Prefers reading the whole chunk needed for the match at once.
         """
-        pat_len = len(self.byte_pattern.pattern)
-        for i in range(pat_len):
-            actual_byte = ida_bytes.get_byte(addr + i)
-            if (actual_byte & self.byte_pattern.mask[i]) != (
-                self.byte_pattern.pattern[i] & self.byte_pattern.mask[i]
-            ):
-                return False
-        return True
+        if not self.byte_pattern:
+            return False  # Should not happen if called from find_iter
 
-    def _find_next_manual(self, current: int) -> int:
-        """
-        Perform a nibble-level search by manually iterating the address range.
-        """
         pat_len = len(self.byte_pattern.pattern)
+        if pat_len == 0:
+            return True  # Empty pattern matches anywhere? Or False? Let's say False.
+
+        try:
+            # Optimization: read the whole chunk needed using the buffer
+            chunk = self.buffer.get_bytes(addr, pat_len)
+            if (
+                chunk is None or len(chunk) != pat_len
+            ):  # Buffer couldn't provide the full bytes
+                # logger.debug(f"Buffer failed to provide {pat_len} bytes at 0x{addr:X} for matching.")
+                return False  # Cannot match if we can't get the bytes
+
+            # Compare using the retrieved chunk
+            pattern_p = self.byte_pattern.pattern
+            pattern_m = self.byte_pattern.mask
+            for i in range(pat_len):
+                # Byte-wise comparison using the mask
+                if (chunk[i] & pattern_m[i]) != (pattern_p[i] & pattern_m[i]):
+                    return False  # Mismatch found
+            # If loop completes, all bytes match
+            return True
+
+        except IndexError:
+            # This implies addr or addr+pat_len is outside readable/buffered range
+            # logger.debug(f"IndexError during match check at 0x{addr:X} (length {pat_len})")
+            return False  # Cannot match if bytes are out of bounds
+
+    def _find_next_manual_forward(self, current: int) -> int:
+        """Perform a manual byte-by-byte search FORWARD using the buffer."""
+        pat_len = len(self.byte_pattern.pattern)
+        if pat_len == 0:
+            return idaapi.BADADDR
+
         addr = current
-        while addr <= self.end - pat_len:
+        # Search up to the limit, ensuring the pattern *starts* before the limit
+        # The last possible start address is self.search_limit - pat_len
+        while addr <= self.search_limit - pat_len:
             if self._matches_at(addr):
                 return addr
             addr += 1
         return idaapi.BADADDR
 
+    def _find_next_manual_backward(self, current: int) -> int:
+        """Perform a manual byte-by-byte search BACKWARD using the buffer."""
+        pat_len = len(self.byte_pattern.pattern)
+        if pat_len == 0:
+            return idaapi.BADADDR
+
+        # `current` is the address to start searching *from* (inclusive).
+        # Search down to `self.search_limit` (inclusive).
+        addr = current
+        while addr >= self.search_limit:
+            # Check if the pattern starting at 'addr' fits within memory bounds conceptually
+            # (The buffer access in _matches_at handles actual read boundaries)
+            if self._matches_at(addr):
+                return addr
+            addr -= 1
+        return idaapi.BADADDR
+
     def _find_next_optimized(self, current: int) -> int:
-        """
-        Perform an optimized search using IDA's ida_bytes.find_bytes function.
-        This is used when the pattern does not require nibble-level matching.
-        """
+        """Perform optimized search using ida_bytes.find_bytes."""
+        # Optimized search uses IDA's backend, doesn't directly benefit from our Python buffer
+        # `current` acts as the resume hint for forward search, but its effect on
+        # backward search in ida_bytes is less clear/reliable for iteration.
+
+        is_backward = self.direction & ida_bytes.BIN_SEARCH_BACKWARD
+
+        if is_backward:
+            # WARNING: Iterating backward with ida_bytes.find_bytes might not work as expected.
+            # It typically finds the *last* occurrence in the *entire* range on the first call.
+            # Subsequent calls are not guaranteed to find the next one down.
+            # We'll only call it once reliably for backward search in find_iter.
+            if current != self.manual_search_start:
+                logger.warning(
+                    "Iterative optimized backward search requested but likely unreliable. Stopping."
+                )
+                return idaapi.BADADDR
+            # For the first call, use the full calculated range
+            start_range = self.ida_find_range_start
+            end_range = self.ida_find_range_end
+        else:  # Forward
+            # Start searching from 'current' within the overall range
+            start_range = current
+            end_range = self.ida_find_range_end
+
+        # Ensure start_range is not beyond end_range
+        if start_range >= end_range:
+            return idaapi.BADADDR  # Invalid range
+
         ea = ida_bytes.find_bytes(
             bs=self.byte_pattern.pattern,
-            range_start=current,
-            range_size=self.max_distance,
-            range_end=self.end,
+            range_start=start_range,
+            range_end=end_range,
             mask=self.byte_pattern.mask,
             flags=self.direction,
         )
+
         return ea
 
     def find_iter(self) -> typing.Iterator[int]:
-        """
-        Yield all effective addresses where the byte sequence is found.
-        """
-        current = self.start
+        """Yield all effective addresses where the byte sequence is found."""
+        if not self.byte_pattern:
+            logger.error("No byte pattern set for search.")
+            return
+
+        is_backward = self.direction & ida_bytes.BIN_SEARCH_BACKWARD
+        # Use manual search if nibble mode is enabled
+        use_manual_search = self.byte_pattern.nibble_mode
+
+        # Start searching from the logical start point for the direction
+        current = self.manual_search_start
+
+        logger.debug(
+            f"Starting find_iter: manual_start=0x{self.manual_search_start:X}, limit=0x{self.search_limit:X}, backward={is_backward}, manual={use_manual_search}"
+        )
+
         while True:
-            if self.byte_pattern.nibble_mode:
-                ea = self._find_next_manual(current)
-            else:
-                ea = self._find_next_optimized(current)
+            ea = idaapi.BADADDR
+            if use_manual_search:
+                if is_backward:
+                    # Check if current is still within valid search range before calling
+                    if current < self.search_limit:
+                        break
+                    ea = self._find_next_manual_backward(current)
+                else:
+                    # Check if current is still within valid search range before calling
+                    if current >= self.search_limit:
+                        break
+                    ea = self._find_next_manual_forward(current)
+            else:  # Optimized search
+                if is_backward:
+                    # Only perform optimized backward search *once*
+                    if current == self.manual_search_start:
+                        ea = self._find_next_optimized(current)
+                        # Prevent further optimized backward loops
+                        current = (
+                            self.search_limit - 1
+                        )  # Effectively stops next iteration check
+                    else:
+                        ea = idaapi.BADADDR  # Stop iteration
+                else:  # Forward optimized search
+                    # Check if current is still within valid search range
+                    if current >= self.search_limit:
+                        break
+                    ea = self._find_next_optimized(current)
+
             if ea == idaapi.BADADDR:
-                break
+                logger.debug("Search ended by find function returning BADADDR.")
+                break  # No match found or end of search range reached by find function
+
+            # --- Validate the found address against the search limits ---
+            # This is an extra safeguard, the find functions should respect limits.
+            if is_backward:
+                if ea < self.search_limit:
+                    logger.debug(
+                        f"Backward search found 0x{ea:X} below limit 0x{self.search_limit:X}. Stopping."
+                    )
+                    break
+                # Ensure it's not above the initial starting point (shouldn't happen)
+                if ea > self.manual_search_start:
+                    logger.warning(
+                        f"Backward search found 0x{ea:X} > start 0x{self.manual_search_start:X}. Stopping."
+                    )
+                    break
+            else:  # Forward
+                if ea >= self.search_limit:
+                    logger.debug(
+                        f"Forward search found 0x{ea:X} at/beyond limit 0x{self.search_limit:X}. Stopping."
+                    )
+                    break
+
+            logger.debug(f"Match found at 0x{ea:X}")
             yield ea
-            current = ea + 1
+
+            # --- Update current position for the next iteration ---
+            if is_backward:
+                # Move to the byte *before* the current find to continue searching downward
+                current = ea - 1
+                # Check if we have gone past the limit
+                if current < self.search_limit:
+                    logger.debug(
+                        "Reached search limit during backward iteration update."
+                    )
+                    break
+            else:
+                # Move to the byte *after* the start of the current find
+                # If using manual search, advance by 1.
+                # If using optimized search, it should find the *next* occurrence >= current+1.
+                current = ea + 1  # Advance by at least 1 byte
+
+                # Check if we have gone past the limit
+                if current >= self.search_limit:
+                    logger.debug(
+                        "Reached search limit during forward iteration update."
+                    )
+                    break
 
     __iter__ = find_iter
 
@@ -718,8 +1297,8 @@ class KeyLengthProcessor:
             # look for:
             # btr [rcx], eax
             # jnb short xx
-            BytePattern("48 ? 44 24 ? 0F B3 ? 73 ?"),
-            BytePattern("48 ? 44 24 ? 0F B3 ? 89 ? ? ? ? ? 73 ?"),
+            BytePattern("48 ? 44 24 20 0F B3 ? 73 ?"),
+            BytePattern("48 ? 44 24 20 0F B3 ? 89 ? ? ? 00 00 73 ?"),
         ]
 
     def is_valid(self, x: int) -> bool:
@@ -867,7 +1446,7 @@ class KeyLengthProcessor:
         )
         return False  # The sequence after this 'mov' did not match
 
-    def traverse(self, ea: int, max_distance: int = 0x150):
+    def traverse(self, ea: int, max_distance: int = 0x100):
         """Creates Searcher instances to find the anchor."""
 
         # Search backwards from the location found by the initial signature scan ('ea')
@@ -876,6 +1455,7 @@ class KeyLengthProcessor:
             pattern="48 C7 44 24 ? ? ? ? ? 33 D2 48 8B 44 24 ? FF C6 48",
             max_distance=max_distance,
             direction=ida_bytes.BIN_SEARCH_BACKWARD,
+            byte_buffer=text_buffer,
         )
 
         def search():
@@ -1003,12 +1583,15 @@ class NumLengthProcessor:
         for signature in self.signatures():
             yield from finder(signature)
 
-    def traverse(self, ea: int, max_distance: int = 0x75):
+    def traverse(self, ea: int, max_distance: int = 0x50):
         """Creates Searcher instances to find the anchor."""
 
         # Search forward from the location found by the initial signature scan ('ea')
         finder = ByteSequenceFinder(
-            ea, pattern="F7 F1 48 C7", max_distance=max_distance
+            ea,
+            pattern="F7 F1 48 C7",
+            max_distance=max_distance,
+            byte_buffer=text_buffer,
         )
 
         def search():
@@ -1078,7 +1661,9 @@ class KeyOffsetProcessor:
     def traverse(self, ea: int, max_distance: int = 0x30):
         """Creates Searcher instances to find the anchor."""
 
-        finder = ByteSequenceFinder(ea, pattern="49 8D ??", max_distance=max_distance)
+        finder = ByteSequenceFinder(
+            ea, pattern="49 8D ??", max_distance=max_distance, byte_buffer=text_buffer
+        )
 
         def search():
             for anchor_ea in finder.find_iter():
@@ -1145,8 +1730,172 @@ def emulate_range_with_unicorn(start_ea, end_ea, debug=False):
     logger.info(
         "Emulating code from 0x%X to 0x%X (size=0x%X)", start_ea, end_ea, code_size
     )
-    emulator = UnicornEmulator(debug=debug)
+    emulator = UnicornEmulator(debug=True)
     return emulator.emulate(start_ea, end_ea)
+
+
+def decode_anchor(ea: int) -> typing.Optional[int]:
+
+    def check_instruction(insn: ida_ua.insn_t) -> bool:
+        """Helper function to validate if instruction is our target anchor"""
+        mnem = insn.get_canon_mnem().lower()
+        if (
+            mnem == "mov"
+            and insn.ops[0].type in (ida_ua.o_mem, ida_ua.o_displ)
+            and insn.ops[1].type == ida_ua.o_imm
+        ):
+            logger.debug("Found mov constant, mem @ 0x%X", insn.ea)
+            return True
+        return False
+
+    return _search_range(ea, check_instruction)
+
+
+def find_anchor_and_emulate(ea: int):
+    # First, locate the anchor instruction using your preferred method.
+    # Here we assume that the anchor has been located (e.g. by a previous decoding loop)
+    # and is stored in the variable "anchor". If not found, we print an error and return.
+    anchor = decode_anchor(ea)  # Assume decode_anchor() implements your upward search
+    if anchor is None:
+        logger.info("No anchor (xor reg, reg) found upward from 0x%X" % ea)
+        return None
+
+    # Now traverse downward from the anchor to find the "div ecx" instruction.
+    end = None
+    current = anchor
+    while current != idc.BADADDR:
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, current) <= 0:
+            current = idc.next_head(current)
+            continue  # Skip if the instruction cannot be decoded
+        logger.debug(
+            "decoded %s at 0x%X", idc.generate_disasm_line(current, 0), current
+        )
+        mnem = insn.get_canon_mnem().lower()
+        if mnem != "div":
+            current = idc.next_head(current)
+            continue  # Not a 'div' instruction, skip to next
+
+        # Use a list comprehension to filter out unused operands.
+        ops = [op for op in insn.ops if op.type != ida_ua.o_void]
+        # For a DIV instruction, the explicit divisor is typically in operand index 1,
+        # but if there's only one operand, fall back to operand index 0.
+        op = ops[1] if len(ops) > 1 else ops[0]
+
+        if op.type != ida_ua.o_reg:
+            current = idc.next_head(current)
+            continue  # Operand is not a register
+
+        logger.debug("register: %s", op.reg)
+        reg_name = idaapi.get_reg_name(op.reg, 4)  # 4 bytes for a 32-bit register
+        logger.debug("reg_name: %s", reg_name)
+        if reg_name.lower() != "ecx":
+            current = idc.next_head(current)
+            continue  # Register is not ECX
+
+        # Valid 'div ecx' instruction found.
+        end = (
+            current + insn.size
+        )  # Use insn.size (or idc.get_item_size(current) if needed)
+        logger.debug(
+            "Found 'div ecx' at 0x%X: %s",
+            current,
+            idc.generate_disasm_line(current, 0),
+        )
+        break
+
+    if end is None:
+        logger.info("No 'div ecx' instruction found downward from anchor.")
+        return None
+
+    mu = emulate_range_with_unicorn(anchor, end)
+    x = mu.reg_read(unicorn.x86_const.UC_X86_REG_RCX)
+    logger.info("Final RCX: 0x%X (%d)", x, x)
+    return x
+
+
+def process_signatures(segment, signatures, validators, param_name):
+    """
+    Iterates through the provided signatures to find and validate a parameter.
+    Returns a tuple (value, ea) if a valid parameter is found, or (None, None) otherwise.
+    """
+    for signature in signatures:
+        for ea in find_byte_sequence(segment.start_ea, segment.end_ea, signature):
+            logger.debug(f"Found at 0x{ea:X}")
+            value = find_anchor_and_emulate(ea)
+            logger.debug(f"{param_name} value: %s", hex(value))
+            if all(validation(value) for validation in validators):
+                logger.info("Valid %s: %s", param_name, hex(value))
+                return value, ea
+    return None, None
+
+
+def process_key_offset_signature(segment, signatures, validators):
+    """
+    Iterates through the provided signatures to find and validate a key offset.
+    Returns a tuple (value, ea) if a valid key offset is found, or (None, None) otherwise.
+    """
+    for signature in signatures:
+        for ea in find_byte_sequence(segment.start_ea, segment.end_ea, signature):
+            logger.debug(f"Found at 0x{ea:X}")
+            value = emulate_until_lea_rdi(ea)
+            logger.debug(f"key offset value: %s", hex(value))
+            if all(validation(value) for validation in validators):
+                logger.info("Key address: 0x%s", hex(value))
+                return value, ea
+    return None, None
+
+
+def emulate_until_lea_rdi(start_ea: int):
+    """
+    Emulates code starting at start_ea until a 'lea rdi' instruction is encountered.
+    It then executes that 'lea rdi' instruction and returns the value of RDI after execution.
+
+    The emulation is done in two phases:
+      1. From start_ea up to (but not including) the target instruction.
+      2. Then emulates the target instruction alone.
+
+    Returns:
+        The value in RDI after executing the 'lea rdi' instruction, or None on error.
+    """
+
+    # --- Phase 1: Locate the target instruction ---
+    def _predicate(insn: ida_ua.insn_t) -> bool:
+        """Helper function to validate if instruction is our target anchor"""
+        mnem = insn.get_canon_mnem().lower()
+        if mnem == "lea" and insn.ops[0].type == ida_ua.o_reg:
+            dest_reg = idaapi.get_reg_name(insn.ops[0].reg, 8)
+            if dest_reg.lower() == "rdi":
+                logger.debug("Found lea rdi @ 0x%X", insn.ea)
+                return True
+        return False
+
+    target_ea = _search_range(
+        start_ea, _predicate, strategy=SearchStrategy.FORWARD_CHUNK
+    )
+
+    if target_ea is None:
+        logger.info("No 'lea rdi' instruction found starting from 0x%X", start_ea)
+        return None
+
+    logger.debug("Found target 'lea rdi' at 0x%X", target_ea)
+    logger.debug("0x%X: %s", target_ea, idc.generate_disasm_line(target_ea, 1))
+    rva = idc.get_operand_value(target_ea, 1)
+    addr = idaapi.get_imagebase() + rva
+    if idaapi.get_segm_name(idaapi.getseg(addr)) == ".rdata":
+        return addr
+
+    logger.debug(
+        "Emulating from:\n\t0x%X: %s\n\t0x%X: %s",
+        start_ea,
+        idc.generate_disasm_line(start_ea, 1),
+        idc.next_head(target_ea),
+        idc.generate_disasm_line(idc.next_head(target_ea), 1),
+    )
+    mu = emulate_range_with_unicorn(start_ea, idc.next_head(target_ea))
+    x = mu.reg_read(unicorn.x86_const.UC_X86_REG_RDI)
+    logger.info("Final RDI: 0x%X (%d)", x, x)
+    return x
 
 
 def set_type(ea, type_str, name):
@@ -1181,39 +1930,63 @@ def apply_signature(ea, sig):
 
 def find_crypto_key():
     segment = ida_segment.get_segm_by_name(".text")
-    crypto_key_info = [0, 0, 0]  # key_addr, num_keys, per_key_length
-    for idx, processor in enumerate(
-        [KeyOffsetProcessor(), NumLengthProcessor(), KeyLengthProcessor()]
-    ):
-        for ea in processor.find(ByteSequenceFinder(segment).with_pattern):
-            found = None
+
+    # def _process_signatures(sig):
+    #     """
+    #     Iterates through the provided signatures to find and validate a parameter.
+    #     Returns a tuple (value, ea) if a valid parameter is found, or (None, None) otherwise.
+    #     """
+    #     for ea in find_byte_sequence(segment.start_ea, segment.end_ea, sig):
+    #         if not ea:
+    #             continue
+    #         yield ea
+    for processor in [KeyLengthProcessor(), NumLengthProcessor(), KeyOffsetProcessor()]:
+        for ea in processor.find(
+            ByteSequenceFinder(segment, byte_buffer=text_buffer).with_pattern
+        ):
             logger.debug(f"Found at 0x{ea:X}")
             for traverser in processor.traverse(ea):
                 if found := traverser():
                     max_steps = abs(found - ea)
                     result = processor.emulate(ea, found, max_steps=max_steps)
-                    if result:
-                        logger.info("Valid %s: %s", processor, hex(result))
-                        crypto_key_info[idx] = result
-                        break
-                    else:
-                        found = None
-            if found:
-                break
+                    logger.info("Valid %s: %s", processor, hex(result))
 
-    type_str = f"unsigned __int8 g_bufCryptoKey[0x{crypto_key_info[1]:X}][0x{crypto_key_info[2]:X}];"
-    logger.info(type_str)
-    if not crypto_key_info[0]:
-        logger.error("Failed to find key offset!")
-        return None, None, None
+    return None, None, None
 
-    logger.info("g_bufCryptoKey address: 0x%X", crypto_key_info[0])
-    result = set_type(crypto_key_info[0], type_str, "g_bufCryptoKey")
-    if result:
-        logger.info("Type %s applied successfully.", type_str)
-    else:
-        logger.error("Failed to apply type: %s", type_str)
-    return crypto_key_info
+
+# def find_crypto_key():
+#     segment = ida_segment.get_segm_by_name(".text")
+#     # Process key length signatures.
+#     per_key_length, _ = process_signatures(
+#         segment, KEY_LENGTH_SIGNATURES, KEY_LENGTH_VALIDATION, "key length"
+#     )
+#     # Optionally use key_length and key_ea as needed.
+
+#     # Process number of keys signatures.
+#     num_keys, num_ea = process_signatures(
+#         segment, NUM_KEYS_SIGNATURES, NUM_KEYS_VALIDATION, "num keys"
+#     )
+#     if not per_key_length or not num_keys:
+#         logger.error("Failed to find key length or number of keys!")
+#         return None, None, None
+
+#     # Optionally use num_keys and num_ea as needed.
+#     key_addr, _ = process_key_offset_signature(
+#         segment, KEY_OFFSET_SIGNATURES, KEY_OFFSET_VALIDATION
+#     )
+#     type_str = f"unsigned __int8 g_bufCryptoKey[0x{num_keys:X}][0x{per_key_length:X}];"
+#     logger.info(type_str)
+#     if not key_addr:
+#         logger.error("Failed to find key offset!")
+#         return None, None, None
+
+#     logger.info("g_bufCryptoKey address: 0x%X", key_addr)
+#     result = set_type(key_addr, type_str, "g_bufCryptoKey")
+#     if result:
+#         logger.info("Type %s applied successfully.", type_str)
+#     else:
+#         logger.error("Failed to apply type: %s", type_str)
+#     return key_addr, num_keys, per_key_length
 
 
 def get_garbage_blobs():
@@ -1784,6 +2557,8 @@ def re_analyze(decryption_results: dict):
 
 
 def execute(decrypt=False, dry_run=False, reanalyze=False):
+    print(find_crypto_key())
+    return
     key_addr, num_keys, per_key_length = find_crypto_key()
     if not key_addr:
         logger.error("[!] No key extracted")
@@ -1792,6 +2567,7 @@ def execute(decrypt=False, dry_run=False, reanalyze=False):
     if not tls_data:
         logger.error("[!] tls data offset not found")
         return -1
+
     decryption_results = None
     if decrypt:
         decryption_results = decrypt_pe_file(

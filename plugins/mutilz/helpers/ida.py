@@ -1,15 +1,25 @@
 import inspect
+import logging
 import time
 import types
 import typing
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
+from typing import Iterator, List, Union
 
 import ida_bytes
 import ida_ida
+import ida_idaapi
 import ida_kernwin
 import ida_nalt
+import ida_range
 import ida_ua
 import idaapi
+
+logger = logging.getLogger(__name__)
+
+# Type alias for bytes-like data.
+BytesData = Union[List[int], bytes, bytearray]
 
 
 def clear_window(window):
@@ -349,10 +359,12 @@ def find_signature(ida_signature: str) -> list:
     return results
 
 
-# TODO (mr): use find_bytes
-# https://github.com/mandiant/capa/issues/2339
 def find_byte_sequence(
-    start: int, end: int, seq: list[int] | bytes
+    start: int,
+    end: int,
+    seq: list[int] | bytes,
+    direction: ida_bytes.BIN_SEARCH_DIRECTION = ida_bytes.BIN_SEARCH_FORWARD
+    | ida_bytes.BIN_SEARCH_NOSHOW,
 ) -> typing.Iterator[int]:
     """yield all ea of a given byte sequence
 
@@ -382,7 +394,17 @@ def find_byte_sequence(
         return
 
     while True:
-        ea = ida_bytes.bin_search(start, end, patterns, ida_bytes.BIN_SEARCH_FORWARD)
+        # ea = ida_bytes.find_bytes(
+        #     bs=seqstr,
+        #     range_start=start,
+        #     range_size=max_distance,
+        #     range_end=end,
+        #     mask=None,
+        #     flags=direction,
+        #     radix=16,
+        #     strlit_encoding=ida_nalt.PBSENC_DEF1BPU,
+        # )
+        ea = ida_bytes.bin_search(start, end, patterns, direction)
         # "drc_t" in IDA 9
         ea = ea[0]
         if ea == idaapi.BADADDR:
@@ -418,3 +440,224 @@ def sig_bytes_to_ida_pattern(
     if isinstance(sig, str):
         sig = [int(b, 16) for b in sig.split(sep)]
     return " ".join([f"{b:02x}" if b not in wildcards else b for b in sig])
+
+
+@dataclass
+class BytePattern:
+    """
+    Encapsulates a parsed byte pattern and its associated mask.
+    Supports wildcards:
+      - For string input:
+          "??" indicates a full byte wildcard.
+          "1?" or "?F" indicates a nibble wildcard (which enables nibble-level matching).
+          Spaces are ignored.
+      - For bytes-like input, the value -1 represents any byte.
+        However, if the user passes in a bytes object that looks textual
+        (i.e. contains spaces or "?" characters), then it is decoded and processed
+        as a string pattern.
+    The conversion is done once and cached.
+    """
+
+    original: Union[str, BytesData]
+    pattern: bytes = field(init=False)
+    mask: bytes = field(init=False)
+    nibble_mode: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        # If the input is a string, parse directly as string.
+        if isinstance(self.original, str):
+            self._parse_str_pattern(self.original)
+        # For bytes, check if it decodes as text and appears to be a pattern.
+        elif isinstance(self.original, bytes):
+            try:
+                decoded = self.original.decode("ascii")
+                # If decoded string contains spaces or '?' then treat it as a string pattern.
+                if "?" in decoded or " " in decoded:
+                    warnings.warn(
+                        "Bytes input appears to be a textual representation; decoding and processing as string pattern."
+                    )
+                    self._parse_str_pattern(decoded)
+                else:
+                    self._parse_bytes_pattern(self.original)
+            except Exception:
+                # If decoding fails, fall back to bytes parsing.
+                self._parse_bytes_pattern(self.original)
+        else:
+            self._parse_bytes_pattern(self.original)
+
+        logger.debug(
+            "Parsed BytePattern: pattern=%s, mask=%s, nibble_mode=%s",
+            self.pattern.hex().upper(),
+            self.mask.hex().upper(),
+            self.nibble_mode,
+        )
+
+    def _parse_str_pattern(self, s: str) -> None:
+        """
+        Parse a hex string pattern with wildcards.
+        Acceptable wildcards:
+          - "??": full byte wildcard.
+          - A hex pair with one unknown nibble (e.g., "1?" or "?F") for nibble-level wildcard.
+        Spaces in the input are ignored.
+        """
+        clean_seq = s.replace(" ", "")
+        if len(clean_seq) % 2 != 0:
+            raise ValueError(
+                "Hex pattern length must be even (each byte consists of two hex digits)."
+            )
+
+        pattern_bytes = bytearray()
+        mask_bytes = bytearray()
+        self.nibble_mode = False
+
+        for i in range(0, len(clean_seq), 2):
+            high_char = clean_seq[i]
+            low_char = clean_seq[i + 1]
+            if high_char == "?" and low_char == "?":
+                # Full byte wildcard.
+                pattern_bytes.append(0x00)  # Dummy value; not used.
+                mask_bytes.append(0x00)
+            elif high_char == "?" or low_char == "?":
+                # Nibble wildcard detected.
+                self.nibble_mode = True
+                if high_char == "?" and low_char != "?":
+                    try:
+                        low_nibble = int(low_char, 16)
+                    except ValueError:
+                        raise ValueError(f"Invalid hex digit: {low_char}")
+                    pattern_bytes.append(low_nibble)
+                    mask_bytes.append(0x0F)  # Only the low nibble is significant.
+                elif low_char == "?" and high_char != "?":
+                    try:
+                        high_nibble = int(high_char, 16)
+                    except ValueError:
+                        raise ValueError(f"Invalid hex digit: {high_char}")
+                    pattern_bytes.append(high_nibble << 4)
+                    mask_bytes.append(0xF0)  # Only the high nibble is significant.
+                else:
+                    raise ValueError("Invalid pattern with nibble wildcard.")
+            else:
+                try:
+                    byte_val = int(high_char + low_char, 16)
+                except ValueError:
+                    raise ValueError(f"Invalid hex digits: {high_char}{low_char}")
+                pattern_bytes.append(byte_val)
+                mask_bytes.append(0xFF)
+
+        self.pattern = bytes(pattern_bytes)
+        self.mask = bytes(mask_bytes)
+
+    def _parse_bytes_pattern(self, data: BytesData) -> None:
+        """
+        Parse a bytes-like or list-based pattern.
+        Acceptable wildcard:
+          - -1 represents any byte.
+        """
+        if isinstance(data, (bytes, bytearray)):
+            byte_list = list(data)
+        else:
+            byte_list = data
+
+        pattern_bytes = bytearray()
+        mask_bytes = bytearray()
+        for b in byte_list:
+            if b == -1:
+                pattern_bytes.append(0x00)  # Dummy value.
+                mask_bytes.append(0x00)
+            else:
+                pattern_bytes.append(b)
+                mask_bytes.append(0xFF)
+        self.pattern = bytes(pattern_bytes)
+        self.mask = bytes(mask_bytes)
+        self.nibble_mode = (
+            False  # For pure bytes input we don't expect partial wildcards.
+        )
+
+
+class ByteSequenceFinder:
+    """
+    Encapsulates the logic for searching a byte sequence in IDA's address space.
+    The pattern is parsed and cached in a BytePattern instance.
+
+    >>> finder = ByteSequenceFinder("1? ?? 34", start=0x1000, end=0x2000)
+    >>> for ea in finder.find_iter():
+    >>>     logger.info("Match found at 0x%X", ea)
+    """
+
+    def __init__(
+        self,
+        pattern: Union[str, BytesData] | BytePattern,
+        # TODO: this should be updated to use a ByteMemSearcher as well as an IDBSearcher
+        start: int | ida_range.range_t,
+        end: int | None = ida_idaapi.BADADDR,
+        max_distance: Union[int, None] = None,
+        direction: int = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW,
+    ) -> None:
+
+        if isinstance(start, ida_range.range_t):
+            start, end = start.start_ea, start.end_ea
+
+        self.start = start
+        self.end = end
+        self.max_distance = max_distance
+        self.direction = direction
+        if isinstance(pattern, BytePattern):
+            self.byte_pattern = pattern
+        else:
+            self.byte_pattern = BytePattern(pattern)
+        logger.debug("ByteSequenceFinder initialized with range: 0x%X-0x%X", start, end)
+
+    def _matches_at(self, addr: int) -> bool:
+        """
+        Check whether the byte pattern matches at a given address using a nibble-level comparison.
+        """
+        pat_len = len(self.byte_pattern.pattern)
+        for i in range(pat_len):
+            actual_byte = ida_bytes.get_byte(addr + i)
+            if (actual_byte & self.byte_pattern.mask[i]) != (
+                self.byte_pattern.pattern[i] & self.byte_pattern.mask[i]
+            ):
+                return False
+        return True
+
+    def _find_next_manual(self, current: int) -> int:
+        """
+        Perform a nibble-level search by manually iterating the address range.
+        """
+        pat_len = len(self.byte_pattern.pattern)
+        addr = current
+        while addr <= self.end - pat_len:
+            if self._matches_at(addr):
+                return addr
+            addr += 1
+        return ida_idaapi.BADADDR
+
+    def _find_next_optimized(self, current: int) -> int:
+        """
+        Perform an optimized search using IDA's ida_bytes.find_bytes function.
+        This is used when the pattern does not require nibble-level matching.
+        """
+        ea = ida_bytes.find_bytes(
+            bs=self.byte_pattern.pattern,
+            range_start=current,
+            range_size=self.max_distance,
+            range_end=self.end,
+            mask=self.byte_pattern.mask,
+            flags=self.direction,
+        )
+        return ea
+
+    def find_iter(self) -> Iterator[int]:
+        """
+        Yield all effective addresses where the byte sequence is found.
+        """
+        current = self.start
+        while True:
+            if self.byte_pattern.nibble_mode:
+                ea = self._find_next_manual(current)
+            else:
+                ea = self._find_next_optimized(current)
+            if ea == idaapi.BADADDR:
+                break
+            yield ea
+            current = ea + 1

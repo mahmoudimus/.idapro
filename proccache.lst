@@ -65,6 +65,3 @@ xa.dylib:1734427659:Philips 51XA Series:1:Philips 51XA G3:51XA-G3
 xtensa.dylib:1734427659:Tensilica Xtensa series:2:Tensilica Xtensa MCU (default) little endian:XTENSA:Tensilica Xtensa MCU big endian:XTENSAB
 z8.dylib:1734427660:Zilog Z8 series:1:Zilog Z8 MCU:Z8
 z80.dylib:1734427660:Z80 processors:6:Intel 8085:8085:Zilog 80:z80:Hitachi HD64180:64180:Zilog Z180:z180:Zilog Z380:z380:GameBoy:gb
-ebc.py:1734427660:EFI:1:EFI Byte code:ebc
-msp430.py:1734427660:Texas Instruments:1:Texas Instruments MSP430:msp430
-spu.py:1734427660:SPU:1:SPU:spu

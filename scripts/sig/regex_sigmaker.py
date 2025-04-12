@@ -1,5 +1,12 @@
 import binascii
 import re
+from typing import Annotated, Literal
+
+UnsignedByte = Annotated[int, "0 <= x < 256"]
+ByteElement = Annotated[
+    list[Literal[-1] | UnsignedByte], "list of bytes or -1 for wildcard"
+]
+BytesData = ByteElement | bytes | bytearray
 
 
 def process_hex_pair(pair: str) -> bytes:
@@ -67,6 +74,7 @@ def hex_pattern_to_regex(hex_pattern: str) -> bytes:
 
     Acceptable wildcards:
       - "??" matches any byte.
+      - A single "?" surrounded by spaces is equivalent to "??"
       - A single "?" in a hex pair (e.g., "1?" or "?F") matches any nibble in that position.
 
     Spaces in the input are ignored.
@@ -85,6 +93,36 @@ def hex_pattern_to_regex(hex_pattern: str) -> bytes:
         pair = hex_pattern[i : i + 2]
         pattern_parts.append(process_hex_pair(pair))
     return b"".join(pattern_parts)
+
+
+def bytes_to_hex_pattern(bytes_data: BytesData) -> str:
+    """
+    Convert a `BytesData` type to a hex string with wildcards.
+
+    Acceptable wildcards:
+      - `-1` represents any byte.
+
+    This function enforces that bytes_data is either a list of ints (each either -1 or an unsigned byte),
+    a bytes object, or a bytearray. In the case of a list, each -1 is converted to "??" (a wildcard)
+    and each valid byte is formatted as a two-digit uppercase hex value.
+
+    The constructed hex string is then processed by `hex_pattern_to_regex`
+    and the result is returned as a string.
+    """
+    if not (
+        isinstance(bytes_data, (bytes, bytearray))
+        or (
+            isinstance(bytes_data, list)
+            and all(isinstance(b, int) and -1 <= b < 256 for b in bytes_data)
+        )
+    ):
+        raise TypeError(
+            "bytes_data must be a list of ints (-1 or 0-255), bytes, or bytearray"
+        )
+
+    # Convert each byte to a two-digit uppercase hex string, but for -1, use "??".
+    hex_str = " ".join("??" if b == -1 else f"{b:02X}" for b in bytes_data)
+    return hex_str
 
 
 def find_all_hex_pattern_offsets(data: bytes, hex_pattern: str) -> list:
@@ -349,3 +387,9 @@ print((pos := find_all_hex_pattern_offsets(data, sig1.decode("utf-8"))))
 assert pos == [0]
 print((pos := find_all_hex_pattern_offsets(data, sig2.decode("utf-8"))))
 assert pos == []
+
+
+sig_as_bytes = [int(x, 16) for x in signature.replace("?", "-1").split(" ")]
+print(sig_as_bytes)
+print((pos := find_all_hex_pattern_offsets(data, bytes_to_hex_pattern(sig_as_bytes))))
+assert pos == [0]

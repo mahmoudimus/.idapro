@@ -4,53 +4,29 @@ import logging
 import pathlib
 import sys
 import typing
+import warnings
+from collections import namedtuple
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 import ida_auto
 import ida_bytes
 import ida_kernwin
 import ida_problems
+import ida_range
 import ida_segment
+import ida_typeinf
 import ida_ua
 import idaapi
 import idautils
 import idc
+
 import unicorn
 from unicorn.x86_const import *
 
-logger = logging.getLogger("decrypt_binary_v4")
+logger = logging.getLogger("aegis_decrypt_section")
 
 PAGE_SIZE = 0x1000  # 4 KB pages
-
-
-KEY_LENGTH_SIGNATURES = [b"8B C3 48 8B 4C 24 ? FF C3 F7 F1 ? ? ? ? ? ? ? ? ? ? ?"]
-NUM_KEYS_SIGNATURES = [
-    b"8B 84 24 ? ? ? ? F7 F1",
-    b"8B 44 ? ? F7 F1",
-]
-
-KEY_OFFSET_SIGNATURES = [
-    b"48 C7 ? 24 ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
-    b"48 C7 ? 24 ? ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
-    b"48 C7 ? 24 ? ? ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
-    b"48 C7 ? 24 ? ? ? ? ? ? ? ? ? 8D ? ? ? F4 FF 48 8B ? 24 ? ? ? ? ? 8D ?",
-]
-
-KEY_LENGTH_VALIDATION = [
-    lambda x: isinstance(x, int),
-    lambda x: 0x100 <= x < 0x200,
-]
-
-NUM_KEYS_VALIDATION = [
-    lambda x: isinstance(x, int),
-    lambda x: 0x1E <= x < 0x100,
-]
-
-
-KEY_OFFSET_VALIDATION = [
-    lambda x: isinstance(x, int),
-    lambda x: idaapi.get_segm_name(idaapi.getseg(x)) == ".rdata",
-]
 
 
 def configure_logging(
@@ -77,46 +53,6 @@ def configure_logging(
 
     if not log.handlers:
         log.addHandler(handler)
-
-
-def find_byte_sequence(
-    start: int, end: int, seq: list[int] | bytes
-) -> typing.Iterator[int]:
-    """yield all ea of a given byte sequence
-
-    args:
-        start: min virtual address
-        end: max virtual address
-        seq: bytes to search e.g. b"\x01\x03"
-    """
-    patterns = ida_bytes.compiled_binpat_vec_t()
-
-    if isinstance(seq, list):
-        seqstr = " ".join([f"{b:02x}" if b != -1 else "?" for b in seq])
-    else:
-        seqstr = seq.decode("utf-8")
-
-    err = ida_bytes.parse_binpat_str(
-        patterns,
-        start,
-        seqstr,
-        16,
-        ida_nalt.get_default_encoding_idx(  # use one byte-per-character encoding
-            ida_nalt.BPU_1B
-        ),
-    )
-
-    if err:
-        return
-
-    while True:
-        ea = ida_bytes.bin_search(start, end, patterns, ida_bytes.BIN_SEARCH_FORWARD)
-        # "drc_t" in IDA 9
-        ea = ea[0]
-        if ea == idaapi.BADADDR:
-            break
-        start = ea + 1
-        yield ea
 
 
 class UnicornEmulator:
@@ -171,14 +107,16 @@ class UnicornEmulator:
 
     def _init_registers(self):
         # Initialize registers—all set to 0.
-        self.mu.reg_write(UC_X86_REG_RIP, self.stack_base)
-        self.mu.reg_write(UC_X86_REG_RAX, 0)
-        self.mu.reg_write(UC_X86_REG_RBX, 0)
-        self.mu.reg_write(UC_X86_REG_RCX, 0)
-        self.mu.reg_write(UC_X86_REG_RDX, 0)
-        self.mu.reg_write(UC_X86_REG_RSI, 0)
-        self.mu.reg_write(UC_X86_REG_RDI, 0)
-        self.mu.reg_write(UC_X86_REG_RSP, self.stack_base + self.stack_size - 0x1000)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RIP, self.stack_base)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RAX, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RBX, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RCX, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RDX, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RSI, 0)
+        self.mu.reg_write(unicorn.x86_const.UC_X86_REG_RDI, 0)
+        self.mu.reg_write(
+            unicorn.x86_const.UC_X86_REG_RSP, self.stack_base + self.stack_size - 0x1000
+        )
 
     def _dump_registers(self, uc=None):
         """Dump all x86_64 registers in a formatted output."""
@@ -241,9 +179,9 @@ class UnicornEmulator:
         It prints the current instruction address, the disassembled line (from IDA),
         and some register values.
         """
+        self._dump_registers()
         disasm_line = idc.generate_disasm_line(address, 0)
         logger.info("Executing 0x%X: %s", address, disasm_line)
-        self._dump_registers()
 
     def _map_combined_segments(
         self, seg_name, prot, PAGE_SIZE=0x1000, copy_content=True
@@ -284,307 +222,681 @@ class UnicornEmulator:
                     self.mu.mem_write(seg_start, seg_bytes)
         return aligned_start, size
 
-    def emulate(self, start_ea, end_ea) -> unicorn.Uc:
+    def emulate(
+        self, start_ea: int, end_ea: int, verify_code_range: bool = False
+    ) -> unicorn.Uc:
+        """
+        Emulate the code between start_ea and end_ea using Unicorn.
+        All registers are initialized to zero.
+        A hook is installed to print each instruction as it executes.
+        """
         code_size = end_ea - start_ea
+        if verify_code_range:
+            code = ida_bytes.get_bytes(start_ea, code_size)
+            if code is None:
+                logger.error(
+                    "Could not retrieve code bytes from 0x%X to 0x%X", start_ea, end_ea
+                )
+                return None
+
+        logger.info(
+            "Emulating code from 0x%X to 0x%X (size=0x%X)", start_ea, end_ea, code_size
+        )
         try:
             self.mu.emu_start(start_ea, start_ea + code_size)
         except unicorn.UcError as e:
-            print("Emulation error: %s" % e)
+            logger.error("Emulation error: %s" % e, exc_info=True)
+            return None
 
         return self.mu
 
 
-def emulate_range_with_unicorn(start_ea, end_ea, debug=False):
+BytesData = typing.Union[list[int], bytes, bytearray]
+
+
+@dataclass(repr=False)
+class BytePattern:
     """
-    Emulate the code between start_ea and end_ea using Unicorn.
-    All registers are initialized to zero.
-    A hook is installed to print each instruction as it executes.
-    Returns the final value in EAX.
+    Encapsulates a parsed byte pattern and its associated mask.
+    Supports wildcards:
+      - For string input:
+          "??" indicates a full byte wildcard.
+          "1?" or "?F" indicates a nibble wildcard (which enables nibble-level matching).
+          Spaces are ignored.
+      - For bytes-like input, the value -1 represents any byte.
+        However, if the user passes in a bytes object that looks textual
+        (i.e. contains spaces or "?" characters), then it is decoded and processed
+        as a string pattern.
+    The conversion is done once and cached.
     """
-    code_size = end_ea - start_ea
-    code = ida_bytes.get_bytes(start_ea, code_size)
-    if code is None:
-        logger.error(
-            "Could not retrieve code bytes from 0x%X to 0x%X", start_ea, end_ea
+
+    original: typing.Union[str, BytesData]
+    pattern: bytes = field(init=False)
+    mask: bytes = field(init=False)
+    nibble_mode: bool = field(init=False, default=False)
+
+    def __repr__(self):
+        return (
+            f"BytePattern(original='{self.original}', "
+            f"pattern={self.pattern.hex().upper()}, "
+            f"mask={self.mask.hex().upper()}, "
+            f"nibble_mode={self.nibble_mode})"
         )
-        return None
 
-    logger.info(
-        "Emulating code from 0x%X to 0x%X (size=0x%X)", start_ea, end_ea, code_size
-    )
-    emulator = UnicornEmulator(debug=debug)
-    return emulator.emulate(start_ea, end_ea)
+    def __post_init__(self) -> None:
+        # If the input is a string, parse directly as string.
+        if isinstance(self.original, str):
+            self._parse_str_pattern(self.original)
+        # For bytes, check if it decodes as text and appears to be a pattern.
+        elif isinstance(self.original, bytes):
+            try:
+                decoded = self.original.decode("ascii")
+                # If decoded string contains spaces or '?' then treat it as a string pattern.
+                if "?" in decoded or " " in decoded:
+                    warnings.warn(
+                        "Bytes input appears to be a textual representation; decoding and processing as string pattern."
+                    )
+                    self._parse_str_pattern(decoded)
+                else:
+                    self._parse_bytes_pattern(self.original)
+            except Exception:
+                # If decoding fails, fall back to bytes parsing.
+                self._parse_bytes_pattern(self.original)
+        else:
+            self._parse_bytes_pattern(self.original)
 
+        # logger.debug("Parsed %r", self)
 
-def find_anchor_and_emulate(ea: int):
-    # First, locate the anchor instruction using your preferred method.
-    # Here we assume that the anchor has been located (e.g. by a previous decoding loop)
-    # and is stored in the variable "anchor". If not found, we print an error and return.
-    anchor = decode_anchor(ea)  # Assume decode_anchor() implements your upward search
-    if anchor is None:
-        logger.info("No anchor (xor reg, reg) found upward from 0x%X" % ea)
-        return None
+    def _parse_str_pattern(self, s: str) -> None:
+        """
+        Parse a hex string pattern with wildcards.
+        Acceptable wildcards:
+          - "??": full byte wildcard.
+          - A hex pair with one unknown nibble (e.g., "1?" or "?F") for nibble-level wildcard.
+        Spaces in the input are ignored.
+        """
+        # Remove spaces and ensure even number of characters.
+        clean_seq = "".join(["??" if p == "?" else p for p in s.split(" ") if p])
+        if len(clean_seq) % 2 != 0:
+            raise ValueError(
+                f"Hex pattern ({s}) when spaces are removed ({clean_seq}) length must be even (each byte consists of two hex digits)."
+            )
 
-    # Now traverse downward from the anchor to find the "div ecx" instruction.
-    end = None
-    current = anchor
-    while current != idc.BADADDR:
-        insn = ida_ua.insn_t()
-        if ida_ua.decode_insn(insn, current) <= 0:
-            current = idc.next_head(current)
-            continue  # Skip if the instruction cannot be decoded
-        logger.debug(
-            "decoded %s at 0x%X", idc.generate_disasm_line(current, 0), current
-        )
-        mnem = insn.get_canon_mnem().lower()
-        if mnem != "div":
-            current = idc.next_head(current)
-            continue  # Not a 'div' instruction, skip to next
+        pattern_bytes = bytearray()
+        mask_bytes = bytearray()
+        self.nibble_mode = False
 
-        # Use a list comprehension to filter out unused operands.
-        ops = [op for op in insn.ops if op.type != ida_ua.o_void]
-        # For a DIV instruction, the explicit divisor is typically in operand index 1,
-        # but if there's only one operand, fall back to operand index 0.
-        op = ops[1] if len(ops) > 1 else ops[0]
-
-        if op.type != ida_ua.o_reg:
-            current = idc.next_head(current)
-            continue  # Operand is not a register
-
-        logger.debug("register: %s", op.reg)
-        reg_name = idaapi.get_reg_name(op.reg, 4)  # 4 bytes for a 32-bit register
-        logger.debug("reg_name: %s", reg_name)
-        if reg_name.lower() != "ecx":
-            current = idc.next_head(current)
-            continue  # Register is not ECX
-
-        # Valid 'div ecx' instruction found.
-        end = (
-            current + insn.size
-        )  # Use insn.size (or idc.get_item_size(current) if needed)
-        logger.debug(
-            "Found 'div ecx' at 0x%X: %s",
-            current,
-            idc.generate_disasm_line(current, 0),
-        )
-        break
-
-    if end is None:
-        logger.info("No 'div ecx' instruction found downward from anchor.")
-        return None
-
-    mu = emulate_range_with_unicorn(anchor, end)
-    x = mu.reg_read(UC_X86_REG_RCX)
-    logger.info("Final RCX: 0x%X (%d)", x, x)
-    return x
-
-
-class SearchStrategy(Enum):
-    """
-    Enum defining different strategies for searching anchor instructions.
-
-    BACKWARD_SCAN: Scan byte-by-byte backwards from ea (memory efficient)
-    FORWARD_CHUNK: Read chunk of memory and scan forward (potentially faster)
-    """
-
-    BACKWARD_SCAN = auto()  # Original strategy: scan backwards byte by byte
-    FORWARD_CHUNK = auto()  # New strategy: read chunk and scan forward
-
-
-def _search_range(
-    ea: int,
-    check_instruction: typing.Callable[[ida_ua.insn_t], bool],
-    max_range: int = 0x200,
-    strategy: SearchStrategy = SearchStrategy.BACKWARD_SCAN,
-) -> typing.Optional[int]:
-    """
-    Searches for an instruction that matches the `check_instruction` function
-    using the specified search strategy.
-
-    Args:
-        ea (int): Starting effective address to search from
-        max_range (int): Maximum number of bytes to search (default: 0x200)
-        strategy (AnchorSearchStrategy): Search strategy to use (default: BACKWARD_SCAN)
-
-    Returns:
-        Optional[int]: The anchor address if found, None otherwise
-    """
-
-    if strategy == SearchStrategy.BACKWARD_SCAN:
-        # Original strategy: scan backwards byte by byte
-        start_addr = max(ea - max_range, 0)
-        current = ea
-        while current >= start_addr:
-            insn = ida_ua.insn_t()
-            if ida_ua.decode_insn(insn, current) > 0:
-                if check_instruction(insn):
-                    return current
-                current -= 1
+        for i in range(0, len(clean_seq), 2):
+            high_char = clean_seq[i]
+            low_char = clean_seq[i + 1]
+            if high_char == "?" and low_char == "?":
+                # Full byte wildcard.
+                pattern_bytes.append(0x00)  # Dummy value; not used.
+                mask_bytes.append(0x00)
+            elif high_char == "?" or low_char == "?":
+                logger.warning(
+                    f"Nibble wildcard detected: {high_char}{low_char}. It is very slow!"
+                )
+                # Nibble wildcard detected.
+                self.nibble_mode = True
+                if high_char == "?" and low_char != "?":
+                    try:
+                        low_nibble = int(low_char, 16)
+                    except ValueError:
+                        raise ValueError(f"Invalid hex digit: {low_char}")
+                    pattern_bytes.append(low_nibble)
+                    mask_bytes.append(0x0F)  # Only the low nibble is significant.
+                elif low_char == "?" and high_char != "?":
+                    try:
+                        high_nibble = int(high_char, 16)
+                    except ValueError:
+                        raise ValueError(f"Invalid hex digit: {high_char}")
+                    pattern_bytes.append(high_nibble << 4)
+                    mask_bytes.append(0xF0)  # Only the high nibble is significant.
+                else:
+                    raise ValueError("Invalid pattern with nibble wildcard.")
             else:
-                current -= 1
+                try:
+                    byte_val = int(high_char + low_char, 16)
+                except ValueError:
+                    raise ValueError(f"Invalid hex digits: {high_char}{low_char}")
+                pattern_bytes.append(byte_val)
+                mask_bytes.append(0xFF)
 
-    elif strategy == SearchStrategy.FORWARD_CHUNK:
-        # Scan forward through the chunk
-        current = ea
-        while current < ea + max_range:
-            insn = ida_ua.insn_t()
-            if ida_ua.decode_insn(insn, current) > 0:
-                if check_instruction(insn):
-                    return current
-                current += insn.size
-            else:
-                current += 1
+        self.pattern = bytes(pattern_bytes)
+        self.mask = bytes(mask_bytes)
 
-    logger.debug("No anchor found within %d bytes before 0x%X", max_range, ea)
-    return None
-
-
-def decode_anchor(ea: int) -> typing.Optional[int]:
-
-    def check_instruction(insn: ida_ua.insn_t) -> bool:
-        """Helper function to validate if instruction is our target anchor"""
-        mnem = insn.get_canon_mnem().lower()
-        if (
-            mnem == "mov"
-            and insn.ops[0].type in (ida_ua.o_mem, ida_ua.o_displ)
-            and insn.ops[1].type == ida_ua.o_imm
+    def _parse_bytes_pattern(self, data: BytesData) -> None:
+        """
+        Parse a bytes-like or list-based pattern.
+        Acceptable wildcard:
+          - -1 represents any byte.
+        """
+        if not (
+            isinstance(data, (bytes, bytearray))
+            or (
+                isinstance(data, list)
+                and all(isinstance(b, int) and -1 <= b < 256 for b in data)
+            )
         ):
-            logger.debug("Found mov constant, mem @ 0x%X", insn.ea)
-            return True
+            raise TypeError(
+                "byte pattern must be a list of ints (-1 or 0-255), bytes, or bytearray"
+            )
+
+        if isinstance(data, (bytes, bytearray)):
+            byte_list = list(data)
+        else:
+            byte_list = data
+
+        pattern_bytes = bytearray()
+        mask_bytes = bytearray()
+        for b in byte_list:
+            if b == -1:
+                pattern_bytes.append(0x00)  # Dummy value.
+                mask_bytes.append(0x00)
+            else:
+                pattern_bytes.append(b)
+                mask_bytes.append(0xFF)
+        self.pattern = bytes(pattern_bytes)
+        self.mask = bytes(mask_bytes)
+        self.nibble_mode = (
+            False  # For pure bytes input we don't expect partial wildcards.
+        )
+
+
+class ByteSequenceFinder:
+    """
+    Encapsulates the logic for searching a byte sequence in IDA's address space.
+    The pattern is parsed and cached in a BytePattern instance.
+
+    >>> finder = ByteSequenceFinder("1? ?? 34", start=0x1000, end=0x2000)
+    >>> for ea in finder.find_iter():
+    >>>     logger.info("Match found at 0x%X", ea)
+    """
+
+    def __init__(
+        self,
+        # TODO: this should be updated to use a ByteMemSearcher as well as an IDBSearcher
+        start: int | ida_range.range_t,
+        pattern: typing.Union[str, BytesData] | BytePattern | None = None,
+        end: int | None = idaapi.BADADDR,
+        max_distance: typing.Union[int, None] = None,
+        direction: int = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW,
+    ) -> None:
+
+        if isinstance(start, ida_range.range_t):
+            start, end = start.start_ea, start.end_ea
+
+        # IDA has a bug where basically BIN_SEARCH_BACKWARD does not work. we have to manually handle it
+        # so we have to check for it and adjust the max_distance accordingly
+        if (direction & ida_bytes.BIN_SEARCH_BACKWARD) == ida_bytes.BIN_SEARCH_BACKWARD:
+            _direction = "backward"
+            # if we did not set an end address
+            #  and if max_distance is set, end address is start - max_distance
+            #  otherwise we use the imagebase
+            if not end or end == idaapi.BADADDR:
+                end = (
+                    idaapi.get_imagebase() if not max_distance else start - max_distance
+                )
+            # now IDA's bug is that it will not search backwards if the end address is before the start address
+            # so we have to swap them if that's the case
+            if end < start:
+                start, end = end, start
+            _range = f"0x{start:X} - 0x{end:X}"
+            # also, if max_distance is set, we have to set it to None since there's a bug in IDA
+            # where it will set the end address to the start address + max_distance, which is not
+            # what we want
+            if max_distance:
+                max_distance = None
+        else:
+            direction |= ida_bytes.BIN_SEARCH_FORWARD
+            _direction = "forward"
+            if not end and max_distance:
+                end = start + max_distance
+            _range = f"0x{start:X} - 0x{end:X}"
+
+        # must set this after the above!
+        self.direction = direction
+        self.start = start
+        self.end = end
+        self.max_distance = max_distance
+        self.byte_pattern = pattern
+        logger.debug(
+            "ByteSequenceFinder searching %s within range: %s %s",
+            _direction,
+            _range,
+            f"for pattern: {self.byte_pattern.original}" if self.byte_pattern else "",
+        )
+
+    def with_pattern(
+        self, pattern: typing.Union[str, BytesData] | BytePattern
+    ) -> "ByteSequenceFinder":
+        if isinstance(pattern, BytePattern):
+            self._pattern = pattern
+        else:
+            self._pattern = BytePattern(pattern)
+        return self
+
+    @property
+    def byte_pattern(self) -> BytePattern:
+        return self._pattern
+
+    @byte_pattern.setter
+    def byte_pattern(self, pattern: typing.Union[str, BytesData] | BytePattern | None):
+        if pattern:
+            self.with_pattern(pattern)
+        else:
+            self._pattern = None
+
+    def _matches_at(self, addr: int) -> bool:
+        """
+        Check whether the byte pattern matches at a given address using a nibble-level comparison.
+        """
+        pat_len = len(self.byte_pattern.pattern)
+        for i in range(pat_len):
+            actual_byte = ida_bytes.get_byte(addr + i)
+            if (actual_byte & self.byte_pattern.mask[i]) != (
+                self.byte_pattern.pattern[i] & self.byte_pattern.mask[i]
+            ):
+                return False
+        return True
+
+    def _find_next_manual(self, current: int) -> int:
+        """
+        Perform a nibble-level search by manually iterating the address range.
+        """
+        pat_len = len(self.byte_pattern.pattern)
+        addr = current
+        while addr <= self.end - pat_len:
+            if self._matches_at(addr):
+                return addr
+            addr += 1
+        return idaapi.BADADDR
+
+    def _find_next_optimized(self, current: int) -> int:
+        """
+        Perform an optimized search using IDA's ida_bytes.find_bytes function.
+        This is used when the pattern does not require nibble-level matching.
+        """
+        ea = ida_bytes.find_bytes(
+            bs=self.byte_pattern.pattern,
+            range_start=current,
+            range_size=self.max_distance,
+            range_end=self.end,
+            mask=self.byte_pattern.mask,
+            flags=self.direction,
+        )
+        return ea
+
+    def find_iter(self) -> typing.Iterator[int]:
+        """
+        Yield all effective addresses where the byte sequence is found.
+        """
+        current = self.start
+        while True:
+            if self.byte_pattern.nibble_mode:
+                ea = self._find_next_manual(current)
+            else:
+                ea = self._find_next_optimized(current)
+            if ea == idaapi.BADADDR:
+                break
+            yield ea
+            current = ea + 1
+
+    __iter__ = find_iter
+
+
+class KeyLengthProcessor:
+    name = "KeyLengthProcessor"
+
+    def signatures(self) -> list[bytes]:
+        """List of byte signatures (IDA format with wildcards) to search for."""
+        return [
+            # look for:
+            # btr [rcx], eax
+            # jnb short xx
+            BytePattern("48 ? 44 24 ? 0F B3 ? 73 ?"),
+            BytePattern("48 ? 44 24 ? 0F B3 ? 89 ? ? ? ? ? 73 ?"),
+        ]
+
+    def is_valid(self, x: int) -> bool:
+        """Checks if the final emulated value (from RCX after div) is valid."""
+        return isinstance(x, int) and 0x100 <= x < 0x200
+
+    def find(self, finder):
+        """Finds potential locations using signatures."""
+        for signature in self.signatures():
+            yield from finder(signature)
+
+    def traverse(self, ea: int, max_distance: int = 0x150):
+        """Creates Searcher instances to find the anchor."""
+
+        # Search backwards from the location found by the initial signature scan ('ea')
+        finder = ByteSequenceFinder(
+            ea,
+            pattern="48 C7 44 24 ? ? ? ? ? 33 D2 48 8B 44 24 ? FF C6 48",
+            max_distance=max_distance,
+            direction=ida_bytes.BIN_SEARCH_BACKWARD,
+        )
+
+        def search():
+            for anchor_ea in finder.find_iter():
+                if abs(anchor_ea - ea) > max_distance:
+                    continue
+                logger.debug("Found possible anchor at 0x%X", anchor_ea)
+                insn = ida_ua.insn_t()
+                if ida_ua.decode_insn(insn, anchor_ea) > 0 and self.anchor(
+                    insn, max_lookahead=20
+                ):
+                    return anchor_ea
+
+        return [search]
+
+    def emulate(
+        self, sig_start_ea: int, found_ea: int, debug: bool = False, max_steps: int = 30
+    ):
+        """Emulates from the found anchor ('start_ea') to 'div ecx'."""
+        # This part remains the same: find the 'div ecx' instruction *after* the anchor
+        # to determine the emulation end point.
+        if found_ea is None:
+            # This condition should ideally not be hit if anchor finding is robust
+            logger.error(
+                "Emulation called with found_ea=None. Anchor not found from 0x%X",
+                sig_start_ea,
+            )
+            return None
+
+        logger.info("Starting emulation analysis from anchor at 0x%X", found_ea)
+
+        # Now traverse downward from the anchor to find the "div ecx" instruction.
+        end_ea = None
+        current = found_ea
+        steps = 0
+        while (
+            current != idc.BADADDR and steps <= max_steps
+        ):  # Added steps <= max_steps check here
+            insn = ida_ua.insn_t()
+            insn_len = ida_ua.decode_insn(insn, current)
+            if insn_len <= 0:
+                logger.warning(
+                    "Failed to decode instruction at 0x%X during emulation scan.",
+                    current,
+                )
+                # Attempt to skip potentially bad bytes, could be risky
+                next_head = idc.next_head(current)
+                if (
+                    next_head == idc.BADADDR or next_head <= current
+                ):  # Prevent infinite loop
+                    logger.error(
+                        "Cannot advance past undecodable byte at 0x%X.", current
+                    )
+                    break
+                current = next_head
+                continue
+
+            steps += 1
+            logger.debug(
+                "decoded %s at 0x%X", idc.generate_disasm_line(current, 0), current
+            )
+            mnem = insn.get_canon_mnem().lower()
+
+            if mnem == "div":
+                ops = [op for op in insn.ops if op.type != ida_ua.o_void]
+                op = ops[1] if len(ops) > 1 else ops[0]  # Divisor operand
+
+                if op.type == ida_ua.o_reg:
+                    reg_name = idaapi.get_reg_name(op.reg, 4)  # 4 bytes for ECX
+                    if reg_name and reg_name.lower() == "ecx":
+                        # Valid 'div ecx' instruction found. End emulation *after* this instruction.
+                        end_ea = current + insn.size
+                        logger.info(
+                            "Found 'div ecx' target for emulation end at 0x%X", current
+                        )
+                        break  # Stop search
+
+            # Move to the next instruction's address
+            current += insn_len
+            # Check if we exceeded max_steps after processing the instruction
+            if steps > max_steps:
+                logger.warning(
+                    "Max steps (%d) reached during emulation scan before finding 'div ecx'. Stopping scan.",
+                    max_steps,
+                )
+                break
+
+        if end_ea is None:
+            logger.error(
+                "Failed to find 'div ecx' instruction within %d steps downward from anchor 0x%X.",
+                max_steps,
+                found_ea,
+            )
+            return None
+
+        logger.info("Emulating code from 0x%X to 0x%X", found_ea, end_ea)
+        mu = UnicornEmulator().emulate(found_ea, end_ea, debug)
+        if mu is None:
+            logger.error(
+                "Unicorn emulation failed for range 0x%X - 0x%X", found_ea, end_ea
+            )
+            return None
+
+        # The value we need is in RCX *before* the division, which Unicorn captures.
+        x = mu.reg_read(unicorn.x86_const.UC_X86_REG_RCX)
+        logger.info("Final RCX value after emulation: 0x%X (%d)", x, x)
+
+        if self.is_valid(x):
+            logger.info("RCX value 0x%X is valid.", x)
+            return x
+        else:
+            logger.warning("RCX value 0x%X is invalid.", x)
+            return None
+
+
+class NumLengthProcessor:
+    name = "NumLengthProcessor"
+
+    def signatures(self):
+        return [BytePattern("33 D2 48 8B 5C 24")]
+
+    def is_valid(self, x):
+        return isinstance(x, int) and 0x1E <= x < 0x100
+
+    def find(self, finder):
+        for signature in self.signatures():
+            yield from finder(signature)
+
+    def traverse(self, ea: int, max_distance: int = 0x75):
+        """Creates Searcher instances to find the anchor."""
+
+        # Search forward from the location found by the initial signature scan ('ea')
+        finder = ByteSequenceFinder(
+            ea, pattern="F7 F1 48 C7", max_distance=max_distance
+        )
+
+        def search():
+            for anchor_ea in finder.find_iter():
+                if abs(anchor_ea - ea) > max_distance:
+                    continue
+                logger.debug("Found possible anchor at 0x%X", anchor_ea)
+                insn = ida_ua.insn_t()
+                if ida_ua.decode_insn(insn, anchor_ea) > 0:
+                    return anchor_ea
+
+        return [search]
+
+    def emulate(
+        self, sig_start_ea: int, found_ea: int, debug: bool = False, max_steps: int = 30
+    ):
+        """Emulates from the found anchor ('start_ea') to 'div ecx'."""
+        # This part remains the same: find the 'div ecx' instruction *after* the anchor
+        # to determine the emulation end point.
+        if sig_start_ea is None:
+            # This condition should ideally not be hit if anchor finding is robust
+            logger.error(
+                "Emulation called with start_ea=None. Anchor not found @ 0x%X", found_ea
+            )
+            return None
+
+        logger.info("Starting emulation analysis from anchor at 0x%X", sig_start_ea)
+        end_ea = sig_start_ea + max_steps
+        logger.info("Emulating code from 0x%X to 0x%X", sig_start_ea, end_ea)
+        mu = UnicornEmulator().emulate(sig_start_ea, end_ea, debug)
+        if mu is None:
+            logger.error(
+                "Unicorn emulation failed for range 0x%X - 0x%X", sig_start_ea, end_ea
+            )
+            return None
+
+        x = mu.reg_read(unicorn.x86_const.UC_X86_REG_RCX)
+        logger.info("Final RCX value after emulation: 0x%X (%d)", x, x)
+
+        if self.is_valid(x):
+            logger.info("RCX value 0x%X is valid.", x)
+            return x
+        else:
+            logger.warning("RCX value 0x%X is invalid.", x)
+            return None
+
+
+class KeyOffsetProcessor:
+    name = "KeyOffsetProcessor"
+
+    def signatures(self):
+        return [
+            BytePattern(
+                "48 C7 ?? 24 ?? ?? ?? ?? ?? ?? ?? ?? 4C 8D ?? ?? ?? F4 FF 48 8B ?? 24 ?? ?? ?? ?? 49 8D"
+            ),
+            BytePattern(
+                "48 C7 ?? 24 ?? ?? ?? ?? ?? 4C 8D ?? ?? ?? F4 FF 48 8B ?? 24 ?? 49 8D"
+            ),
+        ]
+
+    def is_valid(self, x):
+        return isinstance(x, int) and idaapi.get_segm_name(idaapi.getseg(x)) == ".rdata"
+
+    def find(self, finder):
+        for signature in self.signatures():
+            yield from finder(signature)
+
+    def traverse(self, ea: int, max_distance: int = 0x30):
+        """Creates Searcher instances to find the anchor."""
+
+        finder = ByteSequenceFinder(ea, pattern="49 8D ??", max_distance=max_distance)
+
+        def search():
+            for anchor_ea in finder.find_iter():
+                if abs(anchor_ea - ea) > max_distance:
+                    continue
+                logger.debug("Found possible anchor at 0x%X", anchor_ea)
+                insn = ida_ua.insn_t()
+                if ida_ua.decode_insn(insn, anchor_ea) < 0:
+                    continue
+                mnem = insn.get_canon_mnem().lower()
+                if mnem != "lea" or insn.ops[0].type != ida_ua.o_reg:
+                    continue
+                dest_reg = idaapi.get_reg_name(insn.ops[0].reg, 8)
+                if dest_reg.lower() == "rdi":
+                    logger.debug("Found lea rdi @ 0x%X", insn.ea)
+                    return anchor_ea
+
+        return [search]
+
+    def emulate(
+        self, sig_start_ea: int, found_ea: int, debug: bool = False, max_steps: int = 30
+    ):
+        if found_ea is None:
+            logger.info(
+                "No 'lea rdi' instruction found starting from 0x%X", sig_start_ea
+            )
+            return None
+
+        logger.debug("Found target 'lea rdi' at 0x%X", found_ea)
+        logger.debug("0x%X: %s", found_ea, idc.generate_disasm_line(found_ea, 1))
+        rva = idc.get_operand_value(found_ea, 1)
+        addr = idaapi.get_imagebase() + rva
+        if idaapi.get_segm_name(idaapi.getseg(addr)) == ".rdata":
+            return addr
+
+        logger.debug(
+            "Emulating from:\n\t0x%X: %s\n\t0x%X: %s",
+            sig_start_ea,
+            idc.generate_disasm_line(sig_start_ea, 1),
+            idc.next_head(found_ea),
+            idc.generate_disasm_line(idc.next_head(found_ea), 1),
+        )
+        mu = UnicornEmulator().emulate(sig_start_ea, idc.next_head(found_ea))
+        x = mu.reg_read(unicorn.x86_const.UC_X86_REG_RDI)
+        logger.info("Final RDI: 0x%X (%d)", x, x)
+        return x
+
+
+def set_type(ea, type_str, name):
+    # Parse the declaration into a tinfo_t structure.
+    tinfo = idc.parse_decl(type_str, idc.PT_SILENT)
+    if not tinfo:
+        logger.error("Error parsing type declaration")
         return False
-
-    return _search_range(ea, check_instruction)
-
-
-def process_signatures(segment, signatures, validators, param_name):
-    """
-    Iterates through the provided signatures to find and validate a parameter.
-    Returns a tuple (value, ea) if a valid parameter is found, or (None, None) otherwise.
-    """
-    for signature in signatures:
-        for ea in find_byte_sequence(segment.start_ea, segment.end_ea, signature):
-            logger.debug(f"Found at 0x{ea:X}")
-            value = find_anchor_and_emulate(ea)
-            logger.debug(f"{param_name} value: %s", hex(value))
-            if all(validation(value) for validation in validators):
-                logger.info("Valid %s: %s", param_name, hex(value))
-                return value, ea
-    return None, None
-
-
-def process_key_offset_signature(segment, signatures, validators):
-    """
-    Iterates through the provided signatures to find and validate a key offset.
-    Returns a tuple (value, ea) if a valid key offset is found, or (None, None) otherwise.
-    """
-    for signature in signatures:
-        for ea in find_byte_sequence(segment.start_ea, segment.end_ea, signature):
-            logger.debug(f"Found at 0x{ea:X}")
-            value = emulate_until_lea_rdi(ea)
-            logger.debug(f"key offset value: %s", hex(value))
-            if all(validation(value) for validation in validators):
-                logger.info("Key address: 0x%s", hex(value))
-                return value, ea
-    return None, None
-
-
-def emulate_until_lea_rdi(start_ea: int):
-    """
-    Emulates code starting at start_ea until a 'lea rdi' instruction is encountered.
-    It then executes that 'lea rdi' instruction and returns the value of RDI after execution.
-
-    The emulation is done in two phases:
-      1. From start_ea up to (but not including) the target instruction.
-      2. Then emulates the target instruction alone.
-
-    Returns:
-        The value in RDI after executing the 'lea rdi' instruction, or None on error.
-    """
-
-    # --- Phase 1: Locate the target instruction ---
-    def _predicate(insn: ida_ua.insn_t) -> bool:
-        """Helper function to validate if instruction is our target anchor"""
-        mnem = insn.get_canon_mnem().lower()
-        if mnem == "lea" and insn.ops[0].type == ida_ua.o_reg:
-            dest_reg = idaapi.get_reg_name(insn.ops[0].reg, 8)
-            if dest_reg.lower() == "rdi":
-                logger.debug("Found lea rdi @ 0x%X", insn.ea)
-                return True
+    # Apply the type to the address.
+    if idc.apply_type(ea, tinfo, ida_typeinf.TINFO_DEFINITE):
+        # Explicitly set the name.
+        if idc.set_name(ea, name, idc.SN_NOWARN):
+            logger.info("Type and name applied successfully.")
+        else:
+            logger.info("Type applied but failed to rename.")
+        return True
+    else:
+        logger.error("Failed to apply type.")
         return False
-
-    target_ea = _search_range(
-        start_ea, _predicate, strategy=SearchStrategy.FORWARD_CHUNK
-    )
-
-    if target_ea is None:
-        logger.info("No 'lea rdi' instruction found starting from 0x%X", start_ea)
-        return None
-
-    logger.debug("Found target 'lea rdi' at 0x%X", target_ea)
-    logger.debug("0x%X: %s", target_ea, idc.generate_disasm_line(target_ea, 1))
-    rva = idc.get_operand_value(target_ea, 1)
-    addr = idaapi.get_imagebase() + rva
-    if idaapi.get_segm_name(idaapi.getseg(addr)) == ".rdata":
-        return addr
-
-    logger.debug(
-        "Emulating from:\n\t0x%X: %s\n\t0x%X: %s",
-        start_ea,
-        idc.generate_disasm_line(start_ea, 1),
-        idc.next_head(target_ea),
-        idc.generate_disasm_line(idc.next_head(target_ea), 1),
-    )
-    mu = emulate_range_with_unicorn(start_ea, idc.next_head(target_ea))
-    x = mu.reg_read(UC_X86_REG_RDI)
-    logger.info("Final RDI: 0x%X (%d)", x, x)
-    return x
 
 
 def find_crypto_key():
     segment = ida_segment.get_segm_by_name(".text")
-    # Process key length signatures.
-    per_key_length, _ = process_signatures(
-        segment, KEY_LENGTH_SIGNATURES, KEY_LENGTH_VALIDATION, "key length"
-    )
-    # Optionally use key_length and key_ea as needed.
+    crypto_key_info = [0, 0, 0]  # key_addr, num_keys, per_key_length
+    for idx, processor in enumerate(
+        [KeyOffsetProcessor(), NumLengthProcessor(), KeyLengthProcessor()]
+    ):
+        logger.info("Starting processor: %s", processor.name)
+        for ea in processor.find(ByteSequenceFinder(segment).with_pattern):
+            found = None
+            logger.info("Found signature for %s at 0x%X", processor.name, ea)
+            for traverser in processor.traverse(ea):
+                if found := traverser():
+                    logger.info("Found anchor for %s at 0x%X", processor.name, found)
+                    max_steps = abs(found - ea)
+                    result = processor.emulate(ea, found, max_steps=max_steps)
+                    if result:
+                        logger.info(
+                            "Valid result %s for %s found starting at 0x%X",
+                            hex(result),
+                            processor.name,
+                            ea,
+                        )
+                        crypto_key_info[idx] = result
+                        break
+                    else:
+                        found = None
+            if found:
+                break
 
-    # Process number of keys signatures.
-    num_keys, num_ea = process_signatures(
-        segment, NUM_KEYS_SIGNATURES, NUM_KEYS_VALIDATION, "num keys"
-    )
-    if not per_key_length or not num_keys:
-        logger.error("Failed to find key length or number of keys!")
-        return None, None, None
-
-    # Optionally use num_keys and num_ea as needed.
-    key_addr, _ = process_key_offset_signature(
-        segment, KEY_OFFSET_SIGNATURES, KEY_OFFSET_VALIDATION
-    )
-
-    logger.info("unsigned __int8 g_bufCryptoKey[0x%X][0x%X];", num_keys, per_key_length)
-    if not key_addr:
+    type_str = f"unsigned __int8 g_bufCryptoKey[0x{crypto_key_info[1]:X}][0x{crypto_key_info[2]:X}];"
+    logger.info(type_str)
+    if not crypto_key_info[0]:
         logger.error("Failed to find key offset!")
         return None, None, None
 
-    logger.info("g_bufCryptoKey address: 0x%X", key_addr)
-    # TODO: set name for key_addr
-    return key_addr, num_keys, per_key_length
+    logger.info("g_bufCryptoKey address: 0x%X", crypto_key_info[0])
+    result = set_type(crypto_key_info[0], type_str, "g_bufCryptoKey")
+    if result:
+        logger.info("Type %s applied successfully.", type_str)
+    else:
+        logger.error("Failed to apply type: %s", type_str)
+    return crypto_key_info
 
 
 def get_garbage_blobs():
     """
     Yields pairs of (garbage_blog_ea, aligned)
     """
-
-    def _check(insn: ida_ua.insn_t) -> bool:
-        """Finds the lea rdi, xxxxx or lea rdx, xxxxx before or after"""
-        mnem = insn.get_canon_mnem().lower()
-        if mnem == "lea" and insn.ops[0].type == ida_ua.o_reg:
-            dest_reg = idaapi.get_reg_name(insn.ops[0].reg, 8)
-            if dest_reg.lower() == "rdi" or dest_reg.lower() == "rdx":
-                logger.debug("Found lea rdi @ 0x%X", insn.ea)
-                return True
-        return False
 
     text_seg = idaapi.get_segm_by_name(".text")
     if not text_seg:
@@ -614,14 +926,7 @@ def get_garbage_blobs():
         if gb12 >= ea:
             yield next(idautils.XrefsTo(gb12))
     else:
-        for strategy in SearchStrategy:
-            found = _search_range(prev_addr, _check, max_range=0x30, strategy=strategy)
-
-            if found:
-                gb12 = idc.get_operand_value(found, 1)
-                if gb12 >= ea:
-                    yield next(idautils.XrefsTo(gb12))
-                    break
+        raise ValueError("No lea rdi or lea rdx instruction found")
 
 
 def get_tls_region():
@@ -1221,4 +1526,4 @@ def cli(args=sys.argv[1:]):
 
 if __name__ == "__main__":
     configure_logging(log=logger)
-    execute(decrypt=True, dry_run=False, reanalyze=True)
+    execute(decrypt=True, dry_run=True, reanalyze=True)
