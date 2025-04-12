@@ -8,3 +8,4 @@ extras/
 *.pydpackages
 
 packages/
+tmp/boombox.exe.i64
