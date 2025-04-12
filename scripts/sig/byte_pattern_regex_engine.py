@@ -66,10 +66,12 @@ def _makecodes(names):
         if not line:
             continue
         name, _, _ = line.partition("#")
-        _names.append(name.strip().split()[0])
+        name = name.strip()
+        if name:
+            _names.extend(name.split())
 
-    names = _names
-    items = [_NamedIntConstant(i, name) for i, name in enumerate(names)]
+    # 'names' parameter is effectively replaced by _names now
+    items = [_NamedIntConstant(i, name) for i, name in enumerate(_names)]
     _opcodes = {item.name: item for item in items}
     globals().update(_opcodes)
     return _opcodes
@@ -123,10 +125,8 @@ SRE_INFO_CHARSET = 4  # Pattern starts with byte from given set (IN_BYTESET)
 # =============================================================================
 
 HEXDIGITS = frozenset("0123456789abcdefABCDEF")
-WILDCARD = frozenset("?")
-# Define special characters for byte patterns
-SPECIAL_CHARS = "\\[{()*+?^$|"  # Removed '.'
-REPEAT_CHARS = "*+?{"
+SPECIAL_CHARS = "\\[{()*+^$|"  # Removed '?', '.' was already removed
+REPEAT_CHARS = "*+?{"  # Keep '?' here for quantifiers
 WHITESPACE = frozenset(" \t\n\r\v\f")
 
 _REPEATCODES = frozenset(
@@ -318,16 +318,18 @@ class Tokenizer:
         start_index = self.index
         self.index += 1
 
-        # Handle standard regex chars
+        # Handle standard regex chars (excluding '?')
         if char in SPECIAL_CHARS or char in REPEAT_CHARS or char == ")":
             self.next = char
             return
 
         # Handle potential byte tokens (HH, ??, ?H, H?)
         token = char
+        # Check for '?' specifically for byte tokens
         if char in HEXDIGITS or char == "?":
             if self.index < len(self.string):
                 next_char = self.string[self.index]
+                # Check for '?' specifically for byte tokens
                 if next_char in HEXDIGITS or next_char == "?":
                     token += next_char
                     # Validate HH, ??, ?H, H? format
@@ -412,10 +414,23 @@ class Tokenizer:
                 # Treat as literal backslash followed by the char? Or error?
                 raise self.error(f"bad escape \\{next_char}")
 
-        # If it wasn't a special char, byte token, or escape, it's an error
-        # Restore index for error message
-        self.index = start_index + len(token)
-        raise self.error(f"unexpected character or invalid token '{token}'")
+        # Handle '?' that wasn't part of a byte token or escape
+        if char == "?":
+            self.next = "?"
+            return
+
+        # If it wasn't a special char, byte token, or escape,
+        # treat it as a single character token for the parser.
+        # This allows characters like 'P' needed for extensions like (?P...).
+        # The parser will validate if the character is allowed in the context.
+        self.next = char  # Corrected: Return the character as a token
+        return  # Corrected: Return the character as a token
+
+        # REMOVED OLD ERROR BLOCK:
+        # # If it wasn't a special char, byte token, or escape, it's an error
+        # # Restore index for error message
+        # self.index = start_index + len(token)
+        # raise self.error(f"unexpected character or invalid token '{token}'")
 
     def match(self, char):
         if char == self.next:
@@ -512,12 +527,27 @@ def _escape(source, escape, state):
     # Handle escaped special chars \\, \[, \( etc.
     if escape.startswith("\\") and len(escape) == 2:
         char = escape[1]
-        if char in SPECIAL_CHARS or char in REPEAT_CHARS or char == "\\":
+        if char in SPECIAL_CHARS or char in REPEAT_CHARS or char == "\\" or char == "?":
             # Treat escaped special chars as their literal byte values
             return OPCODES["LITERAL_MASK"], (ord(char), 0xFF)
 
     # Remove other character escapes (\n, \t, \d, \w, \s etc.)
     raise source.error(f"bad escape {escape}", len(escape))
+
+
+# --- Need a new helper function _simple_tuple ---
+def _simple_tuple(item_tuple):
+    """Check if an item tuple represents a simple single-byte match."""
+    op, av = item_tuple
+    if op is OPCODES["SUBPATTERN"]:
+        # Check non-capturing group with no flag changes containing a simple item
+        group, add_flags, del_flags, sub_p = av
+        # We need to check the *content* of sub_p (which is a SubPattern)
+        return (
+            group is None and not add_flags and not del_flags and _simple(sub_p)
+        )  # Use original _simple here
+    # Check if the *single* opcode is a basic unit
+    return op in (OPCODES["LITERAL_MASK"], OPCODES["ANY_BYTE"], OPCODES["IN_BYTESET"])
 
 
 def _parse_sub(source, state, verbose, nested):
@@ -649,62 +679,119 @@ def _parse(source, state, verbose, nested):
                 raise AssertionError(f"unsupported quantifier {this!r}")
 
             # Figure out which item to repeat
+            # if not subpattern:
+            #     raise source.error(
+            #         "nothing to repeat", source.tell() - here + len(this)
+            #     )
+
+            # # Get the actual last subpattern item (tuple: opcode, args)
+            # last_item_tuple = subpattern[-1]
+            # op, av_last = last_item_tuple  # op code of the item to repeat
+
+            # # Check if the item to be repeated is itself a repeat code
+            # if op in _REPEATCODES:
+            #     raise source.error("multiple repeat", source.tell() - here + len(this))
+
+            # # Check if the item's opcode is allowed to be repeated
+            # allowed_repeat_ops = (
+            #     OPCODES["SUBPATTERN"],
+            #     OPCODES["LITERAL_MASK"],
+            #     OPCODES["ANY_BYTE"],
+            #     OPCODES["IN_BYTESET"],
+            #     OPCODES["GROUPREF"],
+            # )
+            # if op not in allowed_repeat_ops:
+            #     # Pass the correct length for error calculation
+            #     raise source.error(
+            #         "nothing to repeat", source.tell() - here + len(this)
+            #     )
+
+            # # *** Corrected: Create a SubPattern object representing the single item to be repeated ***
+            # # This ensures the compiler receives the expected structure.
+            # item_to_repeat_subpattern = SubPattern(state, [last_item_tuple])
+
+            # # Handle non-greedy/possessive (possessive not implemented in engine yet)
+            # if sourcematch("?"):  # Non-Greedy Match
+            #     if op in (
+            #         OPCODES["LITERAL_MASK"],
+            #         OPCODES["ANY_BYTE"],
+            #         OPCODES["IN_BYTESET"],
+            #     ):  # Simple cases
+            #         # Replace the last item tuple with the new repeat opcode tuple
+            #         subpattern[-1] = (
+            #             OPCODES["MIN_REPEAT_ONE_BYTE"],
+            #             (min, max, item_to_repeat_subpattern),
+            #         )
+            #     else:  # General case (SUBPATTERN, GROUPREF)
+            #         subpattern[-1] = (
+            #             OPCODES["REPEAT"],
+            #             (min, max, item_to_repeat_subpattern),
+            #         )  # Mark for engine?
+            #         logger.warning(
+            #             "Non-greedy general repeat '??' may behave greedily."
+            #         )
+            # # elif sourcematch("+"): # Possessive Match (NYI)
+            # #     subpattern[-1] = (POSSESSIVE_REPEAT, (min, max, item_to_repeat_subpattern))
+            # else:  # Greedy Match
+            #     if op in (
+            #         OPCODES["LITERAL_MASK"],
+            #         OPCODES["ANY_BYTE"],
+            #         OPCODES["IN_BYTESET"],
+            #     ):  # Simple cases
+            #         # Replace the last item tuple with the new repeat opcode tuple
+            #         subpattern[-1] = (
+            #             OPCODES["REPEAT_ONE_BYTE"],
+            #             (min, max, item_to_repeat_subpattern),
+            #         )
+            #     else:  # General case (SUBPATTERN, GROUPREF)
+            #         subpattern[-1] = (
+            #             OPCODES["REPEAT"],
+            #             (min, max, item_to_repeat_subpattern),
+            #         )
+            # Figure out which item to repeat
             if not subpattern:
-                item = None
-            else:
-                item = subpattern[-1:]  # Get last item as a SubPattern
-
-            if not item:
                 raise source.error(
                     "nothing to repeat", source.tell() - here + len(this)
                 )
 
-            op, av = item[0]
-            if op in _REPEATCODES:
+            # Get the actual last item added (opcode, args tuple)
+            last_item_tuple = subpattern[-1]
+            last_opcode, last_av = last_item_tuple
+
+            # Check if the *opcode* of the last item is already a repeat instruction
+            if last_opcode in _REPEATCODES:
                 raise source.error("multiple repeat", source.tell() - here + len(this))
-            # Allow repeating groups, literals, any_byte, sets, grouprefs
-            allowed_repeat_ops = (
-                OPCODES["SUBPATTERN"],
-                OPCODES["LITERAL_MASK"],
-                OPCODES["ANY_BYTE"],
-                OPCODES["IN_BYTESET"],
-                OPCODES["GROUPREF"],
-            )
-            if op not in allowed_repeat_ops:
+
+            # Check if the item is something that cannot be repeated
+            if last_opcode in (ASSERT, ASSERT_NOT):  # Add AT if implemented
                 raise source.error(
                     "nothing to repeat", source.tell() - here + len(this)
                 )
 
-            # Handle non-greedy/possessive (possessive not implemented in engine yet)
+            # *** Store the raw item tuple directly ***
+            item_to_repeat_tuple = last_item_tuple
+
+            # Handle non-greedy/possessive
             if sourcematch("?"):  # Non-Greedy Match
-                # Use MIN_ versions if available, otherwise need engine support
-                if op in (
-                    OPCODES["LITERAL_MASK"],
-                    OPCODES["ANY_BYTE"],
-                    OPCODES["IN_BYTESET"],
-                ):  # Simple cases
-                    subpattern[-1] = (OPCODES["MIN_REPEAT_ONE_BYTE"], (min, max, item))
-                else:  # General case (SUBPATTERN, GROUPREF)
-                    # Requires MIN_UNTIL in engine
-                    subpattern[-1] = (
-                        OPCODES["REPEAT"],
-                        (min, max, item),
-                    )  # Mark for engine?
+                # *** We need _simple to check the raw tuple now ***
+                if _simple_tuple(item_to_repeat_tuple):
+                    repeat_opcode = MIN_REPEAT_ONE_BYTE
+                else:
+                    repeat_opcode = REPEAT
                     logger.warning(
                         "Non-greedy general repeat '??' may behave greedily."
                     )
             # elif sourcematch("+"): # Possessive Match (NYI)
-            #     subpattern[-1] = (POSSESSIVE_REPEAT, (min, max, item))
+            #     repeat_opcode = POSSESSIVE_REPEAT
             else:  # Greedy Match
-                if op in (
-                    OPCODES["LITERAL_MASK"],
-                    OPCODES["ANY_BYTE"],
-                    OPCODES["IN_BYTESET"],
-                ):  # Simple cases
-                    subpattern[-1] = (OPCODES["REPEAT_ONE_BYTE"], (min, max, item))
-                else:  # General case (SUBPATTERN, GROUPREF)
-                    subpattern[-1] = (OPCODES["REPEAT"], (min, max, item))
+                if _simple_tuple(item_to_repeat_tuple):
+                    repeat_opcode = REPEAT_ONE_BYTE
+                else:
+                    repeat_opcode = REPEAT
 
+            # *** Replace the last item with the new repeat structure containing the raw tuple ***
+            # The compiler will need to handle this raw tuple now.
+            subpattern[-1] = (repeat_opcode, (min, max, item_to_repeat_tuple))
         elif this == "??":
             subpatternappend((OPCODES["ANY_BYTE"], None))
         elif (
@@ -726,81 +813,99 @@ def _parse(source, state, verbose, nested):
             here = source.tell() - 1
             set_content = []
             setappend = set_content.append
-            negate = sourcematch("^")
+            negate = sourcematch("^")  # Consume ^ if present
+
+            # *** Start: New internal loop for set parsing ***
             while True:
-                item_token = sourceget()
+                # Manually peek and consume tokens for set elements
+                item_token = source.next
                 if item_token is None:
                     raise source.error("unterminated byte set", source.tell() - here)
-                if item_token == "]" and set_content:
-                    break  # Allow empty set? No.
+                if item_token == "]":
+                    if not set_content:  # Prevent empty set like [] or [^]
+                        raise source.error("empty byte set", source.tell() - here)
+                    source.get()  # Consume the ']'
+                    break  # End of set
+
+                source.get()  # Consume the token for the set item
 
                 # Parse items inside set: HH, \xHH, range HH-HH
                 if item_token[0] == "\\":
+                    # Use _class_escape, which expects the escape sequence token
                     code1 = _class_escape(source, item_token)  # Returns (LITERAL, val)
                 elif (
                     len(item_token) == 2
                     and item_token[0] in HEXDIGITS
                     and item_token[1] in HEXDIGITS
                 ):
-                    code1 = OPCODES["LITERAL"], int(item_token, 16)
-                elif (
-                    len(item_token) == 1 and item_token in "-^]"
-                ):  # Allow literal hyphen, caret, closing bracket?
-                    # Let's require hex bytes or \x escapes for clarity
-                    raise source.error(
-                        f"invalid element in byte set: '{item_token}'", len(item_token)
-                    )
+                    code1 = LITERAL, int(item_token, 16)
+                # Allow escaping of '-'? e.g. [\-] ?
+                # elif item_token == '\\-'?
                 else:
-                    raise source.error(
-                        f"invalid element in byte set: '{item_token}'", len(item_token)
+                    # Allow literal hyphen only if it's the first char (after optional ^) or last char
+                    is_literal_hyphen = item_token == "-" and (
+                        not set_content or source.next == "]"
                     )
+                    if is_literal_hyphen:
+                        code1 = LITERAL, ord("-")
+                    else:
+                        raise source.error(
+                            f"invalid element in byte set: '{item_token}'",
+                            len(item_token),
+                        )
 
-                if sourcematch("-"):  # Check for range
-                    range_end_token = sourceget()
+                # Check for range following the element
+                if sourcematch("-"):  # Check if the *next* token is '-'
+                    # Potential range HH-HH
+                    range_end_token = source.next
                     if range_end_token is None:
                         raise source.error(
                             "unterminated byte set", source.tell() - here
                         )
-                    if range_end_token == "]":  # Literal hyphen at end
+                    if range_end_token == "]":  # Literal hyphen at end: [A-]
                         setappend(code1)
-                        setappend(
-                            (OPCODES["LITERAL"], ord("-"))
-                        )  # Add literal hyphen byte value
-                        break  # End of set
-
-                    if range_end_token[0] == "\\":
-                        code2 = _class_escape(source, range_end_token)
-                    elif (
-                        len(range_end_token) == 2
-                        and range_end_token[0] in HEXDIGITS
-                        and range_end_token[1] in HEXDIGITS
-                    ):
-                        code2 = OPCODES["LITERAL"], int(range_end_token, 16)
+                        setappend((LITERAL, ord("-")))
+                        # Don't break yet, let the main loop consume ']'
                     else:
-                        raise source.error(
-                            f"invalid range end in byte set: '{range_end_token}'",
-                            len(range_end_token),
-                        )
+                        # Consume the range end token
+                        source.get()
+                        if range_end_token[0] == "\\":
+                            code2 = _class_escape(source, range_end_token)
+                        elif (
+                            len(range_end_token) == 2
+                            and range_end_token[0] in HEXDIGITS
+                            and range_end_token[1] in HEXDIGITS
+                        ):
+                            code2 = LITERAL, int(range_end_token, 16)
+                        else:
+                            raise source.error(
+                                f"invalid range end in byte set: '{range_end_token}'",
+                                len(range_end_token),
+                            )
 
-                    if code1[0] != OPCODES["LITERAL"] or code2[0] != OPCODES["LITERAL"]:
-                        raise source.error(
-                            "ranges must be bytes",
-                            len(item_token) + 1 + len(range_end_token),
-                        )
+                        if code1[0] != LITERAL or code2[0] != LITERAL:
+                            # Should have been caught earlier if escapes were invalid
+                            raise source.error(
+                                "ranges must be bytes",
+                                len(item_token) + 1 + len(range_end_token),
+                            )
 
-                    lo, hi = code1[1], code2[1]
-                    if hi < lo:
-                        raise source.error(
-                            "bad byte range", len(item_token) + 1 + len(range_end_token)
-                        )
-                    setappend((OPCODES["RANGE"], (lo, hi)))
+                        lo, hi = code1[1], code2[1]
+                        if hi < lo:
+                            raise source.error(
+                                "bad byte range",
+                                len(item_token) + 1 + len(range_end_token),
+                            )
+                        setappend((RANGE, (lo, hi)))
                 else:
-                    setappend(code1)  # Append (LITERAL, val)
+                    # Not a range, just append the literal element
+                    setappend(code1)
+            # *** End: New internal loop for set parsing ***
 
             # Finished parsing set
             if negate:
-                set_content.insert(0, (OPCODES["NEGATE"], None))
-            subpatternappend((OPCODES["IN_BYTESET"], set_content))
+                set_content.insert(0, (NEGATE, None))
+            subpatternappend((IN_BYTESET, set_content))
 
         elif this == "(":
             # Handle groups '()', '(?:...)', '(?P<name>...)', '(?(group)...|...)'
@@ -1006,49 +1111,45 @@ def _compile(code, pattern, flags):
             OPCODES["REPEAT_ONE_BYTE"],
             OPCODES["MIN_REPEAT_ONE_BYTE"],
         ):
+            # av is (min_count, max_count, item_tuple)
+            min_count, max_count, item_tuple = av
             # Determine specific opcode based on greediness (inferred from op)
-            # and simplicity of the item
-            min_count, max_count, item = av
-            is_simple = _simple(item)
-            is_min_one = op == OPCODES["MIN_REPEAT_ONE_BYTE"]
-            is_repeat_one = op == OPCODES["REPEAT_ONE_BYTE"]
+            # and simplicity of the item tuple
+            is_simple = _simple_tuple(item_tuple) # Use _simple_tuple
+            is_min_one = (op == OPCODES["MIN_REPEAT_ONE_BYTE"])
+            is_repeat_one = (op == OPCODES["REPEAT_ONE_BYTE"])
+
+            # *** Wrap the item_tuple in a SubPattern *before* compiling it ***
+            item_subpattern = SubPattern(pattern.state, [item_tuple]) # pattern is the parent SubPattern
 
             if is_simple and (is_repeat_one or is_min_one):
-                # Use optimized REPEAT_ONE_BYTE / MIN_REPEAT_ONE_BYTE
                 emit(
                     OPCODES["MIN_REPEAT_ONE_BYTE"]
                     if is_min_one
                     else OPCODES["REPEAT_ONE_BYTE"]
                 )
-                skip = _len(code)
-                emit(0)
+                skip = _len(code); emit(0)
                 emit(min_count)
                 emit(max_count)
-                _compile(code, item, flags)  # Compile the single item
-                emit(OPCODES["SUCCESS"])  # Mark end of item for engine
+                # *** Compile the wrapped item_subpattern ***
+                _compile(code, item_subpattern, flags)
+                emit(OPCODES["SUCCESS"]) # Mark end of item for engine
                 code[skip] = _len(code) - skip
             else:
                 # Use general REPEAT / MAX_UNTIL / MIN_UNTIL
-                # Need to determine greediness for UNTIL opcodes
-                # Assume REPEAT implies greedy MAX_UNTIL for now
-                # Non-greedy general repeat needs more parser/engine support
-                until_op = OPCODES["MAX_UNTIL"]  # Default to greedy
-                if (
-                    op == OPCODES["MIN_REPEAT_ONE_BYTE"]
-                ):  # Check if non-greedy was requested
-                    # until_op = OPCODES["MIN_UNTIL"] # Requires engine support
-                    logger.warning(
-                        "Non-greedy general repeat '??' may behave greedily."
-                    )
+                until_op = OPCODES["MAX_UNTIL"] # Default to greedy
+                if op == OPCODES["MIN_REPEAT_ONE_BYTE"]:
+                     # until_op = OPCODES["MIN_UNTIL"] # Requires engine support
+                     logger.warning("Non-greedy general repeat '??' may behave greedily.")
 
                 emit(OPCODES["REPEAT"])
-                skip = _len(code)
-                emit(0)
+                skip = _len(code); emit(0)
                 emit(min_count)
                 emit(max_count)
-                _compile(code, item, flags)  # Compile the subpattern to repeat
+                # *** Compile the wrapped item_subpattern ***
+                _compile(code, item_subpattern, flags)
                 code[skip] = _len(code) - skip
-                emit(until_op)  # Emit MAX_UNTIL or MIN_UNTIL
+                emit(until_op) # Emit MAX_UNTIL or MIN_UNTIL
 
         elif op is OPCODES["SUBPATTERN"]:
             group, add_flags, del_flags, p = av
@@ -1256,7 +1357,9 @@ def compile(pattern_string, flags=0):
     # Compile the parsed pattern into byte opcodes
     code = []
     _compile_info(code, p, flags)  # Add INFO block
-    _compile(code, p.data, flags)  # Compile main pattern
+    _compile(
+        code, p, flags
+    )  # Compile main pattern # Corrected: Pass 'p' instead of 'p.data'
     code.append(OPCODES["SUCCESS"])  # Terminate with SUCCESS
 
     if flags & SRE_FLAG_DEBUG:
@@ -1557,20 +1660,24 @@ class _ByteOpcodeDispatcher:
         self, state: _ByteState, pattern_codes: typing.Sequence[int]
     ) -> bool:
         """Main loop to drive the matching process."""
-        # Skip INFO block if present
         start_code_ea = 0
         if pattern_codes and pattern_codes[0] == OPCODES["INFO"]:
-            start_code_ea = pattern_codes[1] + 1  # Start after INFO block
+            info_skip = pattern_codes[1]
+            start_code_ea = info_skip + 1  # Start execution *after* the INFO block
 
-        state.context_stack.append(
-            _ByteMatchContext(state, pattern_codes, start_code_ea, state.current_ea)
+        # Push the initial context
+        initial_context = _ByteMatchContext(
+            state, pattern_codes, start_code_ea, state.current_ea
         )
-        has_matched = None
+        state.context_stack.append(initial_context)
+        # Overall result, determined *only* by the initial context's final state
+        overall_match_result: typing.Optional[bool] = None
 
         while state.context_stack:
             context = state.context_stack[-1]
             context_id = id(context)
 
+            # --- Resume generator if one exists ---
             generator = self.executing_generators.get(context_id)
             if generator:
                 try:
@@ -1584,51 +1691,70 @@ class _ByteOpcodeDispatcher:
                     logger.exception(
                         f"Error resuming generator for context {context_id}: {e}"
                     )
-                    context.has_matched = False
+                    context.has_matched = False  # Mark as failed on error
                     if context_id in self.executing_generators:
                         del self.executing_generators[context_id]
 
+            # --- Execute next opcode if context is still running ---
             if context.has_matched is None:
-                if context.remaining_codes() <= 0:
+                # Check if context ran out of codes unexpectedly (should end with SUCCESS/FAILURE)
+                if context.code_ea >= len(pattern_codes):  # Check against total length
                     logger.error(
-                        f"Context {context_id} ran out of codes without SUCCESS/FAILURE"
+                        f"Context {context_id} ran past end of codes without SUCCESS/FAILURE"
                     )
-                    context.has_matched = False
+                    context.has_matched = False  # Treat as failure
 
-                opcode = context.peek_code()
-                method = self.dispatch_table.get(opcode, self.unknown_opcode)
-                # logger.debug(f"Ctx {context_id} EA=0x{context.current_ea:X} CodeEA={context.code_ea} Op={OPCODES[opcode]}")
+                if context.has_matched is None:  # Re-check after boundary check
+                    opcode = context.peek_code()
+                    method = self.dispatch_table.get(opcode, self.unknown_opcode)
+                    # logger.debug(f"Ctx {context_id} EA=0x{context.current_ea:X} CodeEA={context.code_ea} Op={OPCODES[opcode]}")
 
-                result = method(self, context)
+                    result = method(context)  # Execute the opcode handler
 
-                if hasattr(result, "__next__"):  # It's a generator
-                    try:
-                        finished = next(result)
-                        if not finished:
-                            self.executing_generators[context_id] = result
-                            continue  # Loop to process new context
-                    except StopIteration:
-                        pass  # Generator finished immediately
-                    except Exception as e:
-                        logger.exception(
-                            f"Error starting generator for context {context_id}: {e}"
-                        )
-                        context.has_matched = False
-                        if context_id in self.executing_generators:
-                            del self.executing_generators[context_id]
+                    # --- Handle generators returned by handlers ---
+                    if hasattr(result, "__next__"):
+                        try:
+                            finished = next(result)
+                            if not finished:
+                                self.executing_generators[context_id] = result
+                                continue  # Loop to process new context pushed by generator
+                        except StopIteration:
+                            pass  # Generator finished immediately
+                        except Exception as e:
+                            logger.exception(
+                                f"Error starting generator for context {context_id}: {e}"
+                            )
+                            context.has_matched = False
+                            if context_id in self.executing_generators:
+                                del self.executing_generators[context_id]
+                    # --- End generator handling ---
+                # --- End opcode execution ---
 
-            # --- Context finished processing ---
+            # --- Context finished processing (has_matched is True or False) ---
             if context.has_matched is not None:
                 finished_context = state.context_stack.pop()
-                has_matched = finished_context.has_matched
 
-                if state.context_stack:
+                # *** Crucial Change: Only update overall result if it's the initial context finishing ***
+                if finished_context is initial_context:
+                    overall_match_result = finished_context.has_matched
+                    # Don't break here yet, allow stack to unwind if needed (though it should be empty)
+
+                # Propagate results (EA) to parent if successful
+                elif state.context_stack:  # If there's a parent
                     parent_context = state.context_stack[-1]
                     if finished_context.has_matched:
+                        # Update parent's EA to where the successful child finished
                         parent_context.current_ea = finished_context.current_ea
-                    # Parent context will resume or handle failure on next loop
+                    else:
+                        # If child failed, parent's state doesn't change EA,
+                        # but the parent's opcode handler (e.g., BRANCH, REPEAT)
+                        # will now see the failure when it resumes.
+                        pass
+            # --- End context finished processing ---
+        # --- End while state.context_stack ---
 
-        return has_matched is True
+        # Return the final result determined by the initial context
+        return overall_match_result is True
 
     # --- Opcode Implementations ---
     def op_success(self, ctx: _ByteMatchContext) -> bool:
@@ -2326,97 +2452,196 @@ def disassemble(code):
         line = f"{label_str}{addr_str}: "
 
         op = code[i]
-        op_enum = OPCODES[op] if op < len(OPCODES) else None
-        op_name = str(op_enum) if op_enum else f"OP({op})"
+        # Handle potential unknown opcodes gracefully
+        try:
+            op_enum = OPCODES[op]
+            op_name = str(op_enum)
+        except (IndexError, KeyError):
+            op_enum = None
+            op_name = f"OP({op})"
+
         line += f"{op_name:<18}"
         i_start = i
-        i += 1
+        i += 1  # Consume opcode
 
         args = []
-        if op_enum is None:
-            pass  # Unknown opcode
-        elif op_enum in (
-            OPCODES["SUCCESS"],
-            OPCODES["FAILURE"],
-            OPCODES["ANY_BYTE"],
-            OPCODES["NEGATE"],
-            OPCODES["MAX_UNTIL"],
-            OPCODES["MIN_UNTIL"],
-        ):
-            pass
-        elif op_enum is OPCODES["LITERAL_MASK"]:
-            val, mask = code[i : i + 2]
-            i += 2
-            args.append(f"Val=0x{val:02X} Mask=0x{mask:02X}")
-        elif op_enum is OPCODES["MARK"]:
-            mark_id = code[i]
-            i += 1
-            args.append(f"MarkID={mark_id}")
-        elif op_enum is OPCODES["GROUPREF"]:
-            group_idx = code[i]
-            i += 1
-            args.append(f"Group={group_idx+1}")  # Display 1-based
-        elif op_enum is OPCODES["RANGE"]:
-            lo, hi = code[i : i + 2]
-            i += 2
-            args.append(f"Low=0x{lo:02X} High=0x{hi:02X}")
-        elif op_enum is OPCODES["JUMP"]:
-            skip = code[i]
-            i += 1
-            target = i_start + skip + 1
-            args.append(f"Skip={skip} (Target={target})")
-        elif op_enum in (OPCODES["ASSERT"], OPCODES["ASSERT_NOT"]):
-            skip, lookbehind = code[i : i + 2]
-            i += 1  # Skip arg only for now
-            target = i_start + skip + 1
-            args.append(f"Skip={skip} Lookbehind={lookbehind} (Target={target})")
-        elif op_enum in (
-            OPCODES["REPEAT"],
-            OPCODES["REPEAT_ONE_BYTE"],
-            OPCODES["MIN_REPEAT_ONE_BYTE"],
-        ):
-            skip, min_r, max_r = code[i : i + 3]
-            i += 1  # Skip arg only for now
-            target = i_start + skip + 1
-            max_str = "MAX" if max_r == MAXREPEAT else str(max_r)
-            args.append(f"Skip={skip} Min={min_r} Max={max_str} (Target={target})")
-        elif op_enum is OPCODES["GROUPREF_EXISTS"]:
-            group_idx, skip = code[i : i + 2]
-            i += 2
-            target = i_start + skip + 1
-            args.append(f"Group={group_idx+1} Skip={skip} (Target={target})")
-        elif op_enum is OPCODES["INFO"]:
-            skip = code[i]
-            i += 1
-            target = i_start + skip + 1
-            args.append(f"Skip={skip} (Target={target})")
-            # Could parse flags, min/max, prefix/charset here
-        elif op_enum is OPCODES["IN_BYTESET"]:
-            skip = code[i]
-            i += 1
-            target = i_start + skip + 1
-            args.append(f"Skip={skip} (Target={target})")
-            # Could disassemble the set definition here
-        elif op_enum is OPCODES["BRANCH"]:
-            skip = code[i]
-            i += 1
-            target = i_start + skip + 1
-            args.append(f"Skip={skip} (Target={target})")
-            # Could show subsequent branches here
+        # --- Add try-except block for safety when reading args ---
+        try:
+            if op_enum is None:
+                pass
+            elif op_enum in (SUCCESS, FAILURE, ANY_BYTE, NEGATE, MAX_UNTIL, MIN_UNTIL):
+                pass
+            elif op_enum is LITERAL_MASK:
+                val, mask = code[i : i + 2]
+                i += 2
+                args.append(f"Val=0x{val:02X} Mask=0x{mask:02X}")
+            elif op_enum is MARK:
+                mark_id = code[i]
+                i += 1
+                args.append(f"MarkID={mark_id}")
+            elif op_enum is GROUPREF:
+                group_idx = code[i]
+                i += 1
+                args.append(f"Group={group_idx+1}")  # Display 1-based
+            elif op_enum is RANGE:
+                lo, hi = code[i : i + 2]
+                i += 2
+                args.append(f"Low=0x{lo:02X} High=0x{hi:02X}")
+            elif op_enum is JUMP:
+                skip = code[i]
+                i += 1
+                target = i_start + skip + 1  # Target relative to start of JUMP instr
+                args.append(f"Skip={skip} (Target={target})")
+            elif op_enum in (ASSERT, ASSERT_NOT):
+                skip, lookbehind = code[i : i + 2]
+                i += 2  # Consume skip and lookbehind
+                target = i_start + skip + 1  # Target relative to start of ASSERT instr
+                args.append(f"Skip={skip} Lookbehind={lookbehind} (Target={target})")
+            elif op_enum in (REPEAT, REPEAT_ONE_BYTE, MIN_REPEAT_ONE_BYTE):
+                skip, min_r, max_r = code[i : i + 3]
+                i += 3  # Consume skip, min, max
+                target = i_start + skip + 1  # Target relative to start of REPEAT instr
+                max_str = "MAX" if max_r == MAXREPEAT else str(max_r)
+                args.append(f"Skip={skip} Min={min_r} Max={max_str} (Target={target})")
+            elif op_enum is GROUPREF_EXISTS:
+                group_idx, skip = code[i : i + 2]
+                i += 2
+                target = (
+                    i_start + skip + 1
+                )  # Target relative to start of GROUPREF_EXISTS instr
+                args.append(f"Group={group_idx+1} Skip={skip} (Target={target})")
+            elif op_enum is INFO:
+                # Read static part: skip, flags, min, max
+                skip = code[i]
+                i_skip_arg = i
+                i += 1  # Save index of skip arg
+                # --- Boundary check before reading static args ---
+                if i + 2 >= len(code):
+                    args.append("(Error reading INFO args!)")
+                    i = i_start + skip + 1  # Try to jump to expected end
+                else:
+                    info_flags, min_w, max_w = code[i : i + 3]
+                    i += 3
+                    target = (
+                        i_start + skip + 1
+                    )  # Target relative to start of INFO instr
+                    max_w_str = "MAX" if max_w == MAXREPEAT else str(max_w)
+                    args.append(
+                        f"Skip={skip} Flags={info_flags} MinW={min_w} MaxW={max_w_str} (Target={target})"
+                    )
+
+                    # --- Correctly parse variable part based on flags ---
+                    info_data_start = i  # Where variable data starts
+                    try:  # Add try-except around variable part parsing
+                        if info_flags & SRE_INFO_PREFIX:
+                            if i + 1 < len(
+                                code
+                            ):  # Check bounds before reading prefix_len/skip
+                                prefix_len, prefix_skip_info = code[i : i + 2]
+                                i += 2
+                                # Check bounds before reading prefix + overlap
+                                if i + (prefix_len * 2) <= len(code):
+                                    # Skip prefix bytes + overlap table bytes
+                                    i += prefix_len * 2
+                                else:
+                                    args.append("(Error reading prefix data!)")
+                                    i = i_start + skip + 1  # Jump to expected end
+                            else:
+                                args.append("(Error reading prefix info!)")
+                                i = i_start + skip + 1  # Jump to expected end
+                        elif info_flags & SRE_INFO_CHARSET:
+                            # Parse the charset definition to find its end (marked by FAILURE)
+                            set_i = i
+                            while set_i < len(code):
+                                set_op = code[set_i]
+                                set_i += 1
+                                if set_op == LITERAL:
+                                    if set_i >= len(code):
+                                        raise IndexError  # Check bound
+                                    set_i += 1
+                                elif set_op == RANGE:
+                                    if set_i + 1 >= len(code):
+                                        raise IndexError  # Check bound
+                                    set_i += 2
+                                elif set_op == FAILURE:
+                                    break
+                                elif set_op == NEGATE:
+                                    pass  # Just skip
+                                else:  # Unexpected opcode in set
+                                    args.append(f"(Error parsing charset op {set_op}!)")
+                                    set_i = i_start + skip + 1  # Jump to expected end
+                                    break
+                            else:  # Loop finished without finding FAILURE
+                                args.append("(Error: Unterminated charset in INFO!)")
+                                set_i = i_start + skip + 1  # Jump to expected end
+                            i = set_i  # Advance 'i' past the charset definition
+                    except IndexError:
+                        args.append("(Error reading INFO variable data!)")
+                        i = i_start + skip + 1  # Jump to expected end
+
+                # --- Verification and Force Alignment ---
+                expected_end = i_start + skip + 1
+                if i != expected_end:
+                    logger.warning(
+                        f"Disassembler INFO parsing mismatch: calculated end {i}, expected {expected_end}. Forcing alignment."
+                    )
+                    i = expected_end  # Force 'i' to the expected end
+
+            elif op_enum is IN_BYTESET:
+                skip = code[i]
+                i += 1
+                target = (
+                    i_start + skip + 1
+                )  # Target relative to start of IN_BYTESET instr
+                args.append(f"Skip={skip} (Target={target})")
+                # Advance 'i' past the set definition
+                set_i = i
+                while set_i < len(code):
+                    set_op = code[set_i]
+                    set_i += 1
+                    if set_op == LITERAL:
+                        set_i += 1
+                    elif set_op == RANGE:
+                        set_i += 2
+                    elif set_op == FAILURE:
+                        break
+                    # Ignore NEGATE
+                i = set_i  # Advance 'i' past the set definition
+                expected_end = i_start + skip + 1
+                if i != expected_end:
+                    logger.warning(
+                        f"Disassembler IN_BYTESET parsing mismatch: calculated end {i}, expected {expected_end}"
+                    )
+                    i = expected_end  # Force 'i' to the expected end
+
+            elif op_enum is BRANCH:
+                # The first skip tells us the length of the *first* branch only
+                skip1 = code[i]
+                i += 1
+                target1 = i_start + skip1 + 1
+                args.append(f"Branch1 Skip={skip1} (Target={target1})")
+                # The main loop will continue processing subsequent branches/FAILURE
+
+            else:  # Default case if arguments weren't handled
+                pass
+
+        except IndexError:
+            line += " (Error reading arguments!)"
+            i = i_start + 1  # Advance by at least 1 to avoid infinite loop
 
         line += ", ".join(args)
         logger.debug(line)
 
-        # Special handling to advance past complex blocks like BRANCH, INFO, IN_BYTESET body
-        if op_enum in (OPCODES["INFO"], OPCODES["IN_BYTESET"]):
-            i = i_start + code[i_start + 1] + 1  # Jump past the block
-        elif op_enum is OPCODES["BRANCH"]:
-            # Need to skip over all branches defined by the first skip
-            current = i_start + 1 + 1  # After BRANCH and first skip
-            while code[current - 1] != 0:  # While skip != 0
-                branch_len = code[current - 1]
-                current += branch_len
-            i = current  # Position after the final FAILURE of the branch
+        # # Special handling to advance past complex blocks like BRANCH, INFO, IN_BYTESET body
+        # if op_enum in (OPCODES["INFO"], OPCODES["IN_BYTESET"]):
+        #     i = i_start + code[i_start + 1] + 1  # Jump past the block
+        # elif op_enum is OPCODES["BRANCH"]:
+        #     # Need to skip over all branches defined by the first skip
+        #     current = i_start + 1 + 1  # After BRANCH and first skip
+        #     while code[current - 1] != 0:  # While skip != 0
+        #         branch_len = code[current - 1]
+        #         current += branch_len
+        #     i = current  # Position after the final FAILURE of the branch
 
 
 # =============================================================================
@@ -2426,8 +2651,9 @@ def disassemble(code):
 
 @contextlib.contextmanager
 def idapro_context(
-    file_path: pathlib.Path, run_auto_analysis: bool = False, compress_db: bool = True
+    file_path: pathlib.Path, run_auto_analysis: bool = True, compress_db: bool = True
 ):
+    idapro.enable_console_messages(True)
     idapro.open_database(str(file_path), run_auto_analysis)
     if run_auto_analysis:
         idaapi.auto_wait()
@@ -2492,7 +2718,7 @@ def _example():
         # Pattern: ([E8 E9]) ?? ?? ?? ?? (90){0,3} C3
         # Note: Capturing the offset bytes requires GROUPREF, not implemented here yet for extraction
         # Let's capture the E8/E9 byte and the C3 byte
-        pattern_str = r"([E8 E9]) \x?? \x?? \x?? \x?? (?: 90 ){0,3} ( C3 )"  # Use \x for clarity, non-capturing group for NOPs
+        pattern_str = r"([E8 E9]) ?? ?? ?? ?? (?: 90 ){0,3} ( C3 )"  # Corrected: Replaced \x?? with ??
         print(f"\n--- Example 2: Searching for '{pattern_str}' ---")
 
         bp = ByteRegexPattern(pattern_str, SRE_FLAG_DEBUG)
@@ -2575,5 +2801,12 @@ def _example():
 
 
 if __name__ == "__main__":
+    print(OPCODES)
+    with idapro_context(pathlib.Path(".").parent / "tmp/boombox.exe.i64"):
+        _example()
+
+
+if __name__ == "__main__":
+    print(OPCODES)
     with idapro_context(pathlib.Path(".").parent / "tmp/boombox.exe.i64"):
         _example()

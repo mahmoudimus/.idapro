@@ -584,11 +584,7 @@ class KeyLengthProcessor:
                 if abs(anchor_ea - ea) > max_distance:
                     continue
                 logger.debug("Found possible anchor at 0x%X", anchor_ea)
-                insn = ida_ua.insn_t()
-                if ida_ua.decode_insn(insn, anchor_ea) > 0 and self.anchor(
-                    insn, max_lookahead=20
-                ):
-                    return anchor_ea
+                return anchor_ea
 
         return [search]
 
@@ -898,17 +894,51 @@ def get_garbage_blobs():
     Yields pairs of (garbage_blog_ea, aligned)
     """
 
+    # 48 8D 3D A1 DD FE FF 48 C7 84 24 30 03 00 00 33 F0 FF FF 48 8D 15 42 7D 0A 00
+    # 48 8D 15 AD D3 FE FF 48 C7 84 24 78 03 00 00 44 00 00 00 4C 8D 2D DE 6B 0A 00
+    # 48 8D 15 EA CF FE FF 48 8B 84 24 50 03 00 00             4C 8D 2D C7 65 0A 00
+
+    # 48 8D 15 AD D3 FE FF:
+    # Match @ 140013C4C
+
     text_seg = idaapi.get_segm_by_name(".text")
     if not text_seg:
         logger.error("Error: .text section not found.")
         return
+
+    blob_stage1 = [
+        BytePattern("48 8D ? ? ? FE FF 48 ? 84 24 ? 03 00 00"),
+        BytePattern("48 8D ? ? ? FE FF 48"),
+    ]
+    blob_stage2 = [
+        BytePattern("48 8D ? ? ? 0A 00"),
+        BytePattern("4C 8D ? ? ? 0A 00"),
+    ]
+
+    found = False
+    for sig in blob_stage1:
+        for ea in ByteSequenceFinder(text_seg, pattern=sig):
+            yield idc.get_operand_value(ea, 1)
+            for followup_sig in blob_stage2:
+                # these sigs should be *very* close, less than 0x30 bytes apart
+                for followup_ea in ByteSequenceFinder(
+                    ea, max_distance=0x30, pattern=followup_sig
+                ):
+                    yield idc.get_operand_value(followup_ea, 1)
+                    found = True
+                    break
+            if found:
+                break
+    if found:
+        return
+
     for xref in idautils.XrefsTo(text_seg.start_ea):
         ea = xref.frm
         if idc.get_segm_name(ea) != ".text":
             continue
 
         if idaapi.print_insn_mnem(ea) == "lea":
-            yield xref
+            yield xref.to
 
     if not xref:
         raise StopIteration
@@ -919,12 +949,12 @@ def get_garbage_blobs():
     if idaapi.print_insn_mnem(prev_addr) == "lea":
         gb12 = idc.get_operand_value(prev_addr, 1)
         if gb12 >= ea:
-            yield next(idautils.XrefsTo(gb12))
+            yield next(idautils.XrefsTo(gb12)).to
 
     elif idaapi.print_insn_mnem(next_addr) == "lea":
         gb12 = idc.get_operand_value(next_addr, 1)
         if gb12 >= ea:
-            yield next(idautils.XrefsTo(gb12))
+            yield next(idautils.XrefsTo(gb12)).to
     else:
         raise ValueError("No lea rdi or lea rdx instruction found")
 
@@ -936,7 +966,7 @@ def get_tls_region():
         # maximum 0x2000 (hardcoded!)
         # so we align the garbage blog ea to the nearest multiple of 0x1000
         # aligned = get_aligned_offset(xref.to)
-        blobs.append(xref.to)
+        blobs.append(xref)
     blobs.sort()
     return blobs
 
@@ -1464,7 +1494,13 @@ def execute(decrypt=False, dry_run=False, reanalyze=False):
             patch_mode="put",
             max_pages=None,
         )
-        if decryption_results:
+        if not decryption_results:
+            logger.error("[!] Decryption did not succeed.")
+            return
+
+        for result in decryption_results[".text"]:
+            if not validate_decrypted_data(result["decrypted"]):
+                continue
             logger.info("[+] Decryption succeeded!")
             dump_key(
                 key_addr=key_addr,
@@ -1474,7 +1510,7 @@ def execute(decrypt=False, dry_run=False, reanalyze=False):
             )
             if reanalyze:
                 re_analyze(decryption_results)
-
+            return
         else:
             logger.error("[!] Decryption did not succeed.")
 
