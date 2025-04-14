@@ -889,6 +889,23 @@ def find_crypto_key():
     return crypto_key_info
 
 
+def extract_2d_array(address, num_keys, per_key_length):
+    # Get the raw bytes from the specified address
+    raw_bytes = ida_bytes.get_bytes(address, num_keys * per_key_length)
+
+    # Convert the raw bytes into a 2D array
+    array_2d = []
+    for i in range(num_keys):
+        # Calculate the starting position for each key
+        start_pos = i * per_key_length
+        # Extract the bytes for the current key
+        key_bytes = raw_bytes[start_pos : start_pos + per_key_length]
+        # Add the key bytes to the 2D array
+        array_2d.append(key_bytes)
+
+    return array_2d, raw_bytes
+
+
 def get_garbage_blobs():
     """
     Yields pairs of (garbage_blog_ea, aligned)
@@ -976,6 +993,53 @@ def validate_decrypted_data(data: bytes) -> bool:
     Validates the decrypted data by checking if the first qword is zero.
     """
     return data.find(b"\xb9\xf1\xd8\x27\x98") != -1  # adler32 constant
+
+
+# There's a bug in IDA's API.
+# If you undefine and redefine a function's data, the operands are marked as a disassembly problem.
+# This resets each problem in the reanalyzed functions.
+def reset_problems_in_function(func_start: int, func_end: int):
+    current_address: int = func_start
+    while current_address != func_end:
+        ida_problems.forget_problem(ida_problems.PR_DISASM, current_address)
+        current_address = current_address + 1
+
+
+def re_analyze(
+    decryption_results: dict,
+    delete_items=False,
+    plan_and_wait=False,
+    auto_wait_range=True,
+    reset=False,
+):
+    text_section = decryption_results[".text"]
+    section_start = text_section[0]["address"]
+    section_end = text_section[-1]["address"] + text_section[-1]["size"]
+
+    if delete_items:
+        ida_bytes.del_items(
+            section_start,
+            ida_bytes.DELIT_SIMPLE | ida_bytes.DELIT_EXPAND,
+            section_end - section_start,
+        )
+
+    ida_auto.auto_mark_range(section_start, section_end, ida_auto.AU_USED)
+
+    if plan_and_wait:
+        # attempt to re-analyze the reverted region
+        ida_auto.plan_and_wait(section_start, section_end, True)
+
+    if auto_wait_range:
+        auto_analysis_steps = ida_auto.auto_wait_range(section_start, section_end)
+        logger.info(f"Re-analysis steps: {auto_analysis_steps}")
+
+    if reset:
+        reset_problems_in_function(section_start, section_end)
+
+    # ida_auto.plan_range(section_start, section_end)
+    # ida_auto.auto_wait()
+    ida_kernwin.request_refresh(ida_kernwin.IWID_DISASMS)
+    ida_kernwin.refresh_idaview_anyway()
 
 
 def fnv1a_hash(data: bytes) -> int:
@@ -1076,15 +1140,112 @@ def rc4_serial_decrypt(
     return decrypted_plaintext, next_iv
 
 
+class PatchManager:
+    """Manages deferred patch operations."""
+
+    class Mode(Enum):
+        PATCH = auto()  # Use ida_bytes.patch_bytes
+        PUT = auto()  # Use ida_bytes.put_bytes
+
+    def __init__(self, patch_mode: Mode = Mode.PATCH, dry_run: bool = False):
+        self.dry_run = dry_run
+        self.patch_mode = patch_mode
+        self.pending_patches: list[DeferredPatchOp] = []
+        logger.info(
+            f"PatchManager initialized (dry_run={self.dry_run}, mode={self.patch_mode.name})"
+        )
+
+    def add_patch(self, address: int, byte_values: bytes):
+        """Creates and queues a DeferredPatchOp."""
+        op = DeferredPatchOp(address, byte_values, self.patch_mode)
+        self.pending_patches.append(op)
+        logger.debug(f"Queued patch operation: {op}")
+
+    def apply_all(self, dry_run_override: bool | None = None) -> bool:
+        """Applies all queued patch operations."""
+        logger.info(f"Applying {len(self)} queued patches...")
+        success_count = 0
+        fail_count = 0
+
+        if dry_run_override is None:
+            # None is a sentinel value here that represents "use the default"
+            dry_run_override = self.dry_run
+
+        for op in self.pending_patches:
+            if op.apply(dry_run_override):
+                success_count += 1
+            else:
+                fail_count += 1
+
+        logger.info(
+            f"Patch application complete. Success: {success_count}, Failed: {fail_count}"
+        )
+        self.pending_patches.clear()  # Clear the list after applying
+        return fail_count == 0  # Return True if all patches were applied successfully
+
+    def __len__(self) -> int:
+        return len(self.pending_patches)
+
+
+@dataclass(repr=False)
+class DeferredPatchOp:
+    """Class to store patch operations that will be applied later."""
+
+    address: int
+    byte_values: bytes
+    mode: PatchManager.Mode
+    dry_run: bool = False
+
+    @classmethod
+    def patch(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PATCH, dry_run)
+
+    @classmethod
+    def put(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PUT, dry_run)
+
+    def apply(self, dry_run_override: bool = False) -> bool:
+        """Apply the patch operation using either patch_bytes or put_bytes based on mode."""
+        is_dry_run = dry_run_override or self.dry_run
+        logger.info(
+            "[*] %sPatching decrypted chunk %s at 0x%X (size: %d)",
+            "(Dry Run) " if is_dry_run else "",
+            "revertably" if self.mode == PatchManager.Mode.PATCH else "destructively",
+            self.address,
+            len(self.byte_values),
+        )
+        success = True
+        if is_dry_run:
+            return success
+
+        func = (
+            idaapi.put_bytes
+            if self.mode == PatchManager.Mode.PUT
+            else idaapi.patch_bytes
+        )
+        try:
+            func(self.address, self.byte_values)
+        except Exception as e:
+            logger.error(f"Failed to apply patch {self}: {e}")
+            success = False
+        return success
+
+    def __str__(self):
+        """String representation with hex formatting."""
+        dry_run_str = " (dry run)" if self.dry_run else ""
+        return f"{self.__class__.__name__}({len(self.byte_values)} bytes, mode={self.mode.name}{dry_run_str} @ address=0x{self.address:X})"
+
+    __repr__ = __str__
+
+
 class RC4PEDecryptor:
     def __init__(
         self,
         crypto_matrix,
+        patch_manager: PatchManager,
         sections_to_decrypt,
         tls_region=None,
         multipage_relocs=None,
-        dryrun=False,
-        patch_mode="patch",
         max_pages=None,
         page_size=PAGE_SIZE,
     ):
@@ -1092,32 +1253,26 @@ class RC4PEDecryptor:
         Initialize the RC4 PE decryptor
 
         Args:
+            patch_manager: Instance of PatchManager to handle patching.
             crypto_matrix: n-by-m matrix of crypto keys
             sections_to_decrypt: List of section names to decrypt
             tls_region: Dictionary with 'start' and 'end' addresses for TLS region to skip
             multipage_relocs: List of dictionaries with 'rva' and 'size' keys
-            dryrun: If True, perform decryption without patching IDA database
-            patch_mode: "patch" (allows undo) or "put" (destructive)
             max_pages: Maximum number of pages to decrypt (None = all pages)
         """
         self.crypto_matrix = crypto_matrix
+        self.patch_manager = patch_manager
         self.num_keys = len(crypto_matrix)
         self.per_key_size = len(crypto_matrix[0])
         self.sections_to_decrypt = sections_to_decrypt
-        self.dryrun = dryrun
-        self.patch_mode = patch_mode.lower()
         self.max_pages = max_pages
         self.page_size = page_size
-
-        if self.patch_mode not in ["patch", "put"]:
-            logger.warning("Invalid patch_mode. Using 'patch' mode by default.")
-            self.patch_mode = "patch"
 
         # Default values for optional parameters
         self.tls_region = tls_region or {"start": 0, "end": 0}
         self.multipage_relocs = multipage_relocs or []
 
-        # Store decryption results when in dryrun mode
+        # Store decryption results
         self.decryption_results = {}
 
         # Running hash for serial encryption
@@ -1158,13 +1313,6 @@ class RC4PEDecryptor:
                 f"{addr+i:08X}: {hex_values.ljust(bytes_per_line*3)} {ascii_values}"
             )
         return "\n".join(result) if joined else result
-
-    def apply_patch(self, addr, data):
-        """Apply the patch using the selected method"""
-        if self.patch_mode == "patch":
-            return ida_bytes.patch_bytes(addr, data)
-        else:  # "put" mode
-            return ida_bytes.put_bytes(addr, data)
 
     def adjust_decryption_for_multipage_relocs(
         self, decrypt_addr, decrypt_size, start_rva
@@ -1211,13 +1359,6 @@ class RC4PEDecryptor:
         # Get all PE sections
         pe_sections = self.get_pe_sections()
         logger.debug(f"[+] Found {len(pe_sections)} sections in the PE file")
-
-        if self.dryrun:
-            logger.info("[!] Running in DRYRUN mode - no bytes will be patched")
-        else:
-            logger.info(
-                f"[!] Patching mode: {self.patch_mode.upper()} ({'allows undo' if self.patch_mode == 'patch' else 'destructive'})"
-            )
 
         # Track the total number of pages processed
         total_pages_processed = 0
@@ -1286,11 +1427,14 @@ class RC4PEDecryptor:
                         )
                     )
                     if decrypt_addr != original_addr or (decrypt_size != original_size):
-                        print(
-                            f"[DEBUG] Adjusted for relocations: {original_addr:X}->{decrypt_addr:X}, {original_size}->{decrypt_size}"
+                        logger.debug(  # Changed print to logger.debug
+                            f"Adjusted for relocations: {original_addr:X}->{decrypt_addr:X}, {original_size}->{decrypt_size}"
                         )
 
                     if decrypt_size <= 0:
+                        logger.debug(
+                            f"Skipping zero-size chunk after relocation adjustment at original address 0x{original_addr:X}"
+                        )
                         continue
                 else:
                     decrypt_size = chunk_size
@@ -1298,6 +1442,12 @@ class RC4PEDecryptor:
                 try:
                     # Read the encrypted data from IDA database
                     encrypted_data = idc.get_bytes(decrypt_addr, decrypt_size)
+                    if encrypted_data is None:
+                        logger.error(
+                            f"[!] Failed to read {decrypt_size} bytes at 0x{decrypt_addr:X}"
+                        )
+                        continue  # Skip this chunk if read failed
+
                     # Decrypt the chunk
                     success, decrypted_data = self.decrypt_page(
                         binary=encrypted_data,
@@ -1310,7 +1460,7 @@ class RC4PEDecryptor:
                         )
                         continue
 
-                    # In dryrun mode, store the results for inspection
+                    # Store the results for potential analysis later
                     chunk_info = {
                         "address": decrypt_addr,
                         "size": decrypt_size,
@@ -1323,36 +1473,26 @@ class RC4PEDecryptor:
                     }
                     self.decryption_results[section["name"]].append(chunk_info)
 
-                    if self.dryrun:
-                        # Print sample of decrypted data
-                        logger.info(
-                            "[*] Decrypted chunk at 0x%X (size: %d) with key index %d",
-                            decrypt_addr,
-                            decrypt_size,
-                            key_index,
-                        )
-                        results = self.hexdump(
-                            (
-                                decrypted_data[:32]
-                                if decrypt_size > 32
-                                else decrypted_data
-                            ),
-                            decrypt_addr,
-                            joined=False,
-                        )
-                        for r in results:
-                            logger.info(r)
+                    # Always log the decrypted data sample (caller decides patching)
+                    logger.info(
+                        "[*] Decrypted chunk at 0x%X (size: %d) with key index %d",
+                        decrypt_addr,
+                        decrypt_size,
+                        key_index,
+                    )
+                    results = self.hexdump(
+                        (decrypted_data[:32] if decrypt_size > 32 else decrypted_data),
+                        decrypt_addr,
+                        joined=False,
+                    )
+                    for r in results:
+                        logger.info(r)
 
-                        if decrypt_size > 32:
-                            logger.info("... (truncated) ...")
-                    else:
-                        # Write back the decrypted data to IDA database
-                        self.apply_patch(decrypt_addr, bytes(decrypted_data))
-                        logger.info(
-                            "[*] Patched decrypted chunk at 0x%X (size: %d)",
-                            decrypt_addr,
-                            decrypt_size,
-                        )
+                    if decrypt_size > 32:
+                        logger.info("... (truncated) ...")
+
+                    # Queue the patch operation using the PatchManager
+                    self.patch_manager.add_patch(decrypt_addr, bytes(decrypted_data))
 
                     # Increment page counters
                     section_pages_processed += 1
@@ -1360,13 +1500,14 @@ class RC4PEDecryptor:
 
                 except Exception as e:
                     logger.error(
-                        "[!] Error decrypting chunk at 0x%X: %s",
+                        "[!] Error processing chunk at 0x%X: %s",
                         decrypt_addr,
                         e,
+                        exc_info=True,  # Add traceback for debugging
                     )
 
             logger.info(
-                f"[+] {'Analyzed' if self.dryrun else 'Decrypted'} {section_pages_processed} pages in '{section['name']}' section using RC4",
+                f"[+] Finished processing {section_pages_processed} pages in '{section['name']}' section. Queued {len(self.patch_manager)} patches so far.",
             )
 
             # If we've reached the maximum, exit the loop early
@@ -1377,142 +1518,102 @@ class RC4PEDecryptor:
         return self.decryption_results
 
 
-def extract_2d_array(address, num_keys, per_key_length):
-    # Get the raw bytes from the specified address
-    raw_bytes = ida_bytes.get_bytes(address, num_keys * per_key_length)
-
-    # Convert the raw bytes into a 2D array
-    array_2d = []
-    for i in range(num_keys):
-        # Calculate the starting position for each key
-        start_pos = i * per_key_length
-        # Extract the bytes for the current key
-        key_bytes = raw_bytes[start_pos : start_pos + per_key_length]
-        # Add the key bytes to the 2D array
-        array_2d.append(key_bytes)
-
-    return array_2d, raw_bytes
-
-
 def decrypt_pe_file(
     key_addr,
     num_keys,
     per_key_length,
     tls_offsets,
-    dryrun=False,
-    patch_mode="patch",
+    patch_manager: PatchManager,
     max_pages=None,
 ):
-    """Helper function to set up and run the decryptor
-
-    Args:
-        dryrun: If True, perform decryption without patching IDA database
-        patch_mode: "patch" (allows undo) or "put" (destructive)
-    """
+    """Helper function to set up and run the decryptor and apply patches."""
 
     g_bufCryptoKey, raw_bytes = extract_2d_array(key_addr, num_keys, per_key_length)
-    # Define sections to decrypt - replace with actual section names
-    sections_to_decrypt = [".text"]  # Example section names
+    if not g_bufCryptoKey:
+        logger.error("Failed to extract crypto key matrix.")
+        return
+
+    sections_to_decrypt = [".text"]
 
     # Define TLS region to skip (if any)
     tls_region = {
-        "start": tls_offsets[0],  # Replace with actual TLS start address if needed
-        "end": tls_offsets[1],  # Replace with actual TLS end address if needed
+        "start": tls_offsets[0],
+        "end": tls_offsets[1],
     }
 
-    # Define multipage relocs (if any)
-    multipage_relocs = []  # List of dicts with 'rva' and 'size' keys
-
-    # Create and run the decryptor
+    multipage_relocs = []
     decryptor = RC4PEDecryptor(
         g_bufCryptoKey,
+        patch_manager=patch_manager,
         sections_to_decrypt=sections_to_decrypt,
         tls_region=tls_region,
         multipage_relocs=multipage_relocs,
-        dryrun=dryrun,
-        patch_mode=patch_mode,
         max_pages=max_pages,
     )
-
     results = decryptor.decrypt()
     return results
 
 
-class DecryptException(Exception):
-    pass
-
-
-# There's a bug in IDA's API.
-# If you undefine and redefine a function's data, the operands are marked as a disassembly problem.
-# This resets each problem in the reanalyzed functions.
-def reset_problems_in_function(func_start: int, func_end: int):
-    current_address: int = func_start
-    while current_address != func_end:
-        ida_problems.forget_problem(ida_problems.PR_DISASM, current_address)
-        current_address = current_address + 1
-
-
-def re_analyze(decryption_results: dict):
-    text_section = decryption_results[".text"]
-    section_start = text_section[0]["address"]
-    section_end = text_section[-1]["address"] + text_section[-1]["size"]
-    ida_bytes.del_items(
-        section_start,
-        ida_bytes.DELIT_SIMPLE | ida_bytes.DELIT_EXPAND,
-        section_end - section_start,
-    )
-
-    # ida_auto.auto_mark_range(section_start, section_end, ida_auto.AU_CODE)
-
-    # attempt to re-analyze the reverted region
-    ida_auto.plan_and_wait(section_start, section_end, True)
-    reset_problems_in_function(section_start, section_end)
-    # ida_auto.plan_range(section_start, section_end)
-    # ida_auto.auto_wait()
-    ida_kernwin.request_refresh(ida_kernwin.IWID_DISASMS)
-    ida_kernwin.refresh_idaview_anyway()
-
-
-def execute(decrypt=False, dry_run=False, reanalyze=False):
+def execute(
+    decrypt=False,
+    reanalyze=False,
+    patch_mode=PatchManager.Mode.PATCH,
+    dry_run=False,
+):
     key_addr, num_keys, per_key_length = find_crypto_key()
     if not key_addr:
         logger.error("[!] No key extracted")
-        return -1
+        return
     tls_data = get_tls_region()
     if not tls_data:
         logger.error("[!] tls data offset not found")
-        return -1
+        return
 
     decryption_results = None
-    if decrypt:
-        decryption_results = decrypt_pe_file(
-            key_addr,
-            num_keys,
-            per_key_length,
-            tls_data,
-            dry_run,
-            patch_mode="put",
-            max_pages=None,
-        )
-        if not decryption_results:
-            logger.error("[!] Decryption did not succeed.")
-            return
 
-        for result in decryption_results[".text"]:
-            if not validate_decrypted_data(result["decrypted"]):
-                continue
-            logger.info("[+] Decryption succeeded!")
-            dump_key(
-                key_addr=key_addr,
-                num_keys=num_keys,
-                per_key_length=per_key_length,
-                output_file=pathlib.Path("g_bufCryptKey.json"),
-            )
-            if reanalyze:
-                re_analyze(decryption_results)
-            return
-        else:
-            logger.error("[!] Decryption did not succeed.")
+    # Create the PatchManager
+    patch_manager = PatchManager(patch_mode=patch_mode, dry_run=dry_run)
+
+    if not decrypt:
+        return
+
+    decryption_results = decrypt_pe_file(
+        key_addr,
+        num_keys,
+        per_key_length,
+        tls_data,
+        patch_manager,
+        max_pages=None,
+    )
+    if not decryption_results:
+        logger.error("[!] Decryption did not succeed.")
+        return
+
+    validated = False
+    for result in decryption_results[".text"]:
+        if (validated := validate_decrypted_data(result["decrypted"])):
+            break
+
+    if not validated:
+        logger.error("[!] Decryption did not succeed.")
+        return
+
+    logger.info("[+] Decryption succeeded!")
+    patch_manager.apply_all()
+    dump_key(
+        key_addr=key_addr,
+        num_keys=num_keys,
+        per_key_length=per_key_length,
+        output_file=pathlib.Path("g_bufCryptKey.json"),
+    )
+    if reanalyze and not dry_run:
+        re_analyze(
+            decryption_results,
+            delete_items=True,
+            plan_and_wait=True,
+            auto_wait_range=True,
+            reset=True,
+        )
 
 
 def dump_key(
@@ -1562,4 +1663,9 @@ def cli(args=sys.argv[1:]):
 
 if __name__ == "__main__":
     configure_logging(log=logger)
-    execute(decrypt=True, dry_run=True, reanalyze=True)
+    execute(
+        decrypt=True,
+        reanalyze=True,
+        patch_mode=PatchManager.Mode.PUT,
+        dry_run=False,
+    )

@@ -5,12 +5,12 @@ keystone-engine==0.9.2
 angr==9.2.148
 capstone==5.0.3
 setuptools==78.1.0
-flare-capa==8.0.1
+flare-capa
 debugpy==1.8.13
 openai==1.70.0
 groq==0.22.0
 together==1.5.4
 ollama==0.4.7
 clang==20.1.0
-pywin32==310
+pywin32==310; sys_platform == 'Windows'
 ipython

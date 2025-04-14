@@ -1,10 +1,11 @@
 import sys
 
-import ida_idaapi
-import ida_kernwin
 import mutilz
 import mutilz.plugincore
 from mutilz import reloader
+
+import ida_idaapi
+import ida_kernwin
 
 
 class mutilz_t(ida_idaapi.plugin_t):
@@ -33,8 +34,7 @@ class mutilz_t(ida_idaapi.plugin_t):
         # initialize the plugin
         self.core = mutilz.plugincore.PluginCore.deferred_load()
 
-        # add plugin to the IDA python console scope, for test/dev/cli access
-        setattr(sys.modules["__main__"], self.wanted_name, self)
+        self.add_plugin_to_console()
 
         # mark the plugin as loaded
         return ida_idaapi.PLUGIN_KEEP
@@ -54,6 +54,9 @@ class mutilz_t(ida_idaapi.plugin_t):
     # --------------------------------------------------------------------------
     # Development Helpers
     # --------------------------------------------------------------------------
+    def add_plugin_to_console(self):
+        # add plugin to the IDA python console scope, for test/dev/cli access
+        setattr(sys.modules["__main__"], self.wanted_name, self)
 
     def reload(self):
         """
@@ -64,6 +67,7 @@ class mutilz_t(ida_idaapi.plugin_t):
         reloader.reload_package(mutilz)
         reloader.reload_plugin()
         self.core = mutilz.plugincore.PluginCore()
+        self.add_plugin_to_console()
 
     def test(self):
         """
@@ -72,9 +76,9 @@ class mutilz_t(ida_idaapi.plugin_t):
         self.reload()
         self.core.test()
 
-    @property
-    def reload_module(self):
-        return reloader
+    def reload_plugin(self):
+        reloader.reload_plugin()
+        self.add_plugin_to_console()
 
 
 def PLUGIN_ENTRY():

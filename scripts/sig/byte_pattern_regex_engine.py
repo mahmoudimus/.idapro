@@ -1115,12 +1115,14 @@ def _compile(code, pattern, flags):
             min_count, max_count, item_tuple = av
             # Determine specific opcode based on greediness (inferred from op)
             # and simplicity of the item tuple
-            is_simple = _simple_tuple(item_tuple) # Use _simple_tuple
-            is_min_one = (op == OPCODES["MIN_REPEAT_ONE_BYTE"])
-            is_repeat_one = (op == OPCODES["REPEAT_ONE_BYTE"])
+            is_simple = _simple_tuple(item_tuple)  # Use _simple_tuple
+            is_min_one = op == OPCODES["MIN_REPEAT_ONE_BYTE"]
+            is_repeat_one = op == OPCODES["REPEAT_ONE_BYTE"]
 
             # *** Wrap the item_tuple in a SubPattern *before* compiling it ***
-            item_subpattern = SubPattern(pattern.state, [item_tuple]) # pattern is the parent SubPattern
+            item_subpattern = SubPattern(
+                pattern.state, [item_tuple]
+            )  # pattern is the parent SubPattern
 
             if is_simple and (is_repeat_one or is_min_one):
                 emit(
@@ -1128,28 +1130,32 @@ def _compile(code, pattern, flags):
                     if is_min_one
                     else OPCODES["REPEAT_ONE_BYTE"]
                 )
-                skip = _len(code); emit(0)
+                skip = _len(code)
+                emit(0)
                 emit(min_count)
                 emit(max_count)
                 # *** Compile the wrapped item_subpattern ***
                 _compile(code, item_subpattern, flags)
-                emit(OPCODES["SUCCESS"]) # Mark end of item for engine
+                emit(OPCODES["SUCCESS"])  # Mark end of item for engine
                 code[skip] = _len(code) - skip
             else:
                 # Use general REPEAT / MAX_UNTIL / MIN_UNTIL
-                until_op = OPCODES["MAX_UNTIL"] # Default to greedy
+                until_op = OPCODES["MAX_UNTIL"]  # Default to greedy
                 if op == OPCODES["MIN_REPEAT_ONE_BYTE"]:
-                     # until_op = OPCODES["MIN_UNTIL"] # Requires engine support
-                     logger.warning("Non-greedy general repeat '??' may behave greedily.")
+                    # until_op = OPCODES["MIN_UNTIL"] # Requires engine support
+                    logger.warning(
+                        "Non-greedy general repeat '??' may behave greedily."
+                    )
 
                 emit(OPCODES["REPEAT"])
-                skip = _len(code); emit(0)
+                skip = _len(code)
+                emit(0)
                 emit(min_count)
                 emit(max_count)
                 # *** Compile the wrapped item_subpattern ***
                 _compile(code, item_subpattern, flags)
                 code[skip] = _len(code) - skip
-                emit(until_op) # Emit MAX_UNTIL or MIN_UNTIL
+                emit(until_op)  # Emit MAX_UNTIL or MIN_UNTIL
 
         elif op is OPCODES["SUBPATTERN"]:
             group, add_flags, del_flags, p = av
