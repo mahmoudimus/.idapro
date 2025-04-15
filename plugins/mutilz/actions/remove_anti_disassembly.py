@@ -32,8 +32,11 @@ import idaapi
 import idautils
 import idc
 
-logger = logging.getLogger("mutilz.actions.remove_anti_disassembly")
+import capstone
 
+logger = logging.getLogger("mutilz.actions.remove_anti_disassembly")
+md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+md.detail = True
 
 class ThreadUtils:
     @staticmethod
@@ -917,6 +920,92 @@ class MatchChains:
         return len(self.chains)
 
 
+@dataclasses.dataclass
+class BasicDecodedInstruction:
+    """Holds standardized information about a decoded instruction."""
+    address: int
+    size: int
+    is_jump: bool = False
+    jump_target: typing.Optional[int] = None
+    is_nop: bool = False
+
+    
+class InstructionDecoder(typing.Protocol):
+    """Protocol defining the expected signature for decoder functions."""
+    def decode(self, ea: int, mem_bytes_at_ea: bytes) -> typing.Optional[BasicDecodedInstruction]:
+        """
+        Decodes the instruction at virtual address 'ea' using the provided memory bytes.
+
+        Args:
+            ea: The virtual address of the instruction to decode.
+            mem_bytes_at_ea: A bytes object containing memory starting from 'ea'.
+                             The implementation should only consume the bytes
+                             needed for the single instruction at 'ea'.
+
+        Returns:
+            An InstructionInfo object if decoding is successful, otherwise None.
+        """
+        ...
+
+
+class IdaInstructionDecoder(InstructionDecoder):
+    
+    def decode(self, ea: int, mem_bytes_at_ea: bytes) -> typing.Optional[BasicDecodedInstruction]:
+        """
+        Decodes instruction at ea using IDA's disassembler.
+        Ignores mem_bytes_at_ea, uses IDA's database.
+        Conforms to DecoderProtocol.
+        """
+        insn = ida_ua.insn_t()
+        length = ida_ua.decode_insn(insn, ea)
+
+        if length == 0:
+            logger.debug(f"IDA decode failed: Zero length instruction at 0x{ea:X}.")
+            return None
+
+        decoded = BasicDecodedInstruction(address=ea, size=length)
+        if insn.itype == ida_allins.NN_nop:
+            decoded.is_nop = True
+
+        elif insn.itype in ALL_JUMPS and insn.Op1.type == ida_ua.o_near:
+            decoded.is_jump = True
+            decoded.jump_target = insn.Op1.addr
+        return decoded        
+    
+    
+
+class CapstoneInstructionDecoder(InstructionDecoder):
+
+    def decode(self, ea: int, mem_bytes_at_ea: bytes) -> typing.Optional[BasicDecodedInstruction]:
+        """
+        Decodes instruction at ea using IDA's disassembler.
+        Ignores mem_bytes_at_ea, uses IDA's database.
+        Conforms to DecoderProtocol.
+        """
+        # Decode using Capstone
+        try:
+            # Use list comprehension and next to get the first instruction or None
+            insn = next(
+                md.disasm(mem_bytes_at_ea, ea, count=1), None
+            )
+        except capstone.CsError as e:
+            logger.error(f"Capstone decoding error at 0x{ea:X}: {e}")
+            return None
+        
+        if insn is None:
+            return None
+        
+        decoded = BasicDecodedInstruction(address=ea, size=insn.size)
+        if insn.id == capstone.x86.X86_INS_NOP:
+            decoded.is_nop = True
+        elif capstone.CS_GRP_JUMP in insn.groups:
+            if len(insn.operands) > 0 and insn.operands[0].type == capstone.x86.X86_OP_IMM:
+                decoded.is_jump = True
+                decoded.jump_target = insn.operands[0].imm
+        return decoded   
+
+
+
 @dataclass
 class JumpTargetAnalyzer:
     # Input parameters for processing jumps.
@@ -946,97 +1035,132 @@ class JumpTargetAnalyzer:
     target_type: dict = field(
         init=False, default_factory=dict
     )  # final_target -> stage1_type
-
+            
     def follow_jump_chain(
         self,
-        mem: Memory,
+        mem: Memory, # Expect a Memory object
         current_ea: int,
         match_end: int,
+        decoder: InstructionDecoder,
         visited: set = None,
         depth: int = 0,
     ) -> typing.Optional[int]:
         """
-        Follow a chain of jumps starting from current_ea.
-        Avoid loops or out-of-bounds jumps.
+        Follow a chain of 2-byte jumps starting from current_ea using the provided decoder.
+
+        Args:
+            mem: Memory object containing the relevant byte data. Its 'base' attribute
+                 defines the absolute address corresponding to the start of its buffer.
+            current_ea: The absolute starting virtual address for tracing.
+            match_end: The absolute end address (exclusive) of the 'stage1' area.
+            decoder: A function conforming to DecoderProtocol used for disassembly.
+            visited: Set of visited addresses to prevent loops (internal use).
+            depth: Recursion depth for logging (internal use).
+
+        Returns:
+            The absolute virtual address where the jump chain ends, or None.
         """
         indent = "  " * depth + "|_ "
         if visited is None:
             visited = set()
-        # Avoid loops or jumps outside the memory block.
-        if (
-            current_ea in visited
-            or current_ea < self.start_ea
-            or current_ea >= self.start_ea + len(mem)
-        ):
-            logger.debug(
-                f"{indent}Jump chain stopped: Visited or out of bounds at 0x{current_ea:X}"
-            )
+
+        # Get an efficient view of the memory buffer
+        mem_view = mem.view
+        mem_start_ea = mem.base # Absolute start address of the buffer
+        mem_len = len(mem_view)
+        mem_end_ea = mem_start_ea + mem_len # Absolute end address (exclusive)
+
+        if current_ea in visited:
+            logger.debug(f"{indent}Jump chain stopped: Already visited 0x{current_ea:X}")
             return None
+        # Check if start address is within the bounds defined by the Memory object
+        if not (mem_start_ea <= current_ea < mem_end_ea):
+             logger.debug(
+                f"{indent}Jump chain stopped: Start address 0x{current_ea:X} is outside Memory bounds [0x{mem_start_ea:X}, 0x{mem_end_ea:X})"
+             )
+             return None
+
         visited.add(current_ea)
-        current_offset = current_ea - self.start_ea
 
-        try:
-            current_bytes = mem[current_offset : self.block_end - self.start_ea]
-            # print(f"current_ea: {current_ea:X} , current_bytes: {current_bytes.hex()[:16]}...")
-            # print(f"current_offset: {current_offset} , range: {current_offset}:{self.block_end - self.start_ea}")
-        except IndexError:
-            logger.debug(
-                f"{indent}IndexError at {current_ea} with offset {current_offset}"
-            )
-            return None
-        # Try matching each jump pattern.
-        # we do not modify current_ea because we need to be *EXACT*
-        # via addresses to check if the target is within the valid
-        # conditional range and whether the big instruction
-        # falls at the last 6 bytes of the buffer
-        curr_addr = current_ea
+        trace_ea = current_ea
         while True:
-            insn = ida_ua.insn_t()
-            length = ida_ua.decode_insn(insn, curr_addr)
-            if insn.itype == ida_allins.NN_nop:
-                curr_addr += length
-                continue
-            # we only care about 2 byte jumps
-            if insn.itype not in ALL_JUMPS or length != 2:
-                break
+            # Check if the current tracing address is still within the Memory bounds
+            if not (mem_start_ea <= trace_ea < mem_end_ea):
+                 logger.debug(f"{indent}Stopping trace: Address 0x{trace_ea:X} is outside Memory bounds [0x{mem_start_ea:X}, 0x{mem_end_ea:X}). Returning last valid start: 0x{current_ea:X}")
+                 return current_ea # Return the start address of the sequence that led out of bounds
 
-            target = insn.Op1.addr
+            decoded_insn = None
+            # Calculate offset relative to the start of the Memory object's buffer
+            offset = trace_ea - mem_start_ea
+            # We already know offset is >= 0 because trace_ea >= mem_start_ea
+            # We need to ensure we have enough bytes left for *potential* instructions
+
+            # Get bytes starting from the offset using the memoryview slice
+            # Convert the slice to bytes for the decoder interface
+            bytes_for_decoder = mem_view[offset:].tobytes()
+            if not bytes_for_decoder: # Should not happen if bounds check is correct, but defensive check
+                 logger.warning(f"{indent}No bytes available for decoding at offset {offset} (address 0x{trace_ea:X}). Stopping trace.")
+                 return current_ea
+
+            try:
+                # Call the passed-in decoder function
+                decoded_insn = decoder.decode(trace_ea, bytes_for_decoder)
+            except Exception as e:
+                logger.error(f"{indent}Decoder function raised exception at 0x{trace_ea:X}: {e}")
+                decoded_insn = None # Treat as decode failure
+
+            # If decoding failed or decoder returned None
+            if not decoded_insn:
+                logger.debug(f"{indent}Failed to decode instruction at 0x{trace_ea:X}. Stopping trace. Returning start: 0x{current_ea:X}")
+                return current_ea # Return start of the sequence
+
+            # --- Process the decoded instruction ---
+            if decoded_insn.is_nop:
+                logger.debug(f"{indent}NOP found at 0x{trace_ea:X} (size {decoded_insn.size}). Skipping.")
+                trace_ea += decoded_insn.size
+                continue # Continue the while loop to the next instruction
+
+            if not decoded_insn.is_jump or decoded_insn.size != 2:
+                 logger.debug(f"{indent}Chain stopped at 0x{trace_ea:X}: Instruction is not a 2-byte jump. Returning start: 0x{current_ea:X}")
+                 return current_ea # Return the start address of the sequence that ended
+
+            # --- We have a 2-byte jump ---
+            target = decoded_insn.jump_target # This is an absolute address
             logger.debug(
-                f"{indent}  -> Found {idc.generate_disasm_line(curr_addr, idc.GENDSM_FORCE_CODE)} @ 0x{current_ea:X} targeting 0x{target:X}"
+                 f"{indent}  -> Found 2-byte jump at 0x{trace_ea:X} targeting 0x{target:X}"
             )
-            # If the jump target is within the valid conditional range,
-            # # continue following the chain.
 
+            # --- Decide action based on the jump target (using absolute addresses) ---
+            # 1. Target is within the 'followable' range [match_start, match_end + 6)
             if self.match_start <= target < match_end + 6:
                 logger.debug(
-                    f"{indent}Following jump from 0x{curr_addr:X} to 0x{target:X}"
+                    f"{indent}Following jump from 0x{trace_ea:X} to 0x{target:X} (recursive call)"
                 )
+                # Pass the same Memory object and decoder down recursively
                 return self.follow_jump_chain(
-                    mem, target, match_end, visited, depth + 1
+                    mem, target, match_end, decoder, visited, depth + 1
                 )
-            elif target == match_end + 6:
-                # Landed exactly at the potential big instruction start
-                logger.debug(
-                    f"{indent}Jump chain ends: Reached potential big instruction start 0x{target:X}"
-                )
-                return target
-            # Otherwise, if the target is within the *overall* memory block, return it.
-            # This means the jump goes outside the matched junk+stage1 but before the big instruction.
-            elif self.start_ea <= target < match_end + 6:
-                logger.debug(
-                    f"{indent}Jump chain ends: Target 0x{target:X} is within bounds but outside conditional range."
-                )
-                return target
-            else:
-                # Jump goes out of bounds or to an unexpected location. Stop tracing.
-                logger.debug(
-                    f"{indent}Jump chain stopped: Target 0x{target:X} is out of bounds."
-                )
-                break  # Exit the while loop, will return current_ea below
 
-        # If no jump pattern matches or loop broken, end of the chain; return the current address.
-        logger.debug(f"{indent}Jump chain naturally ends at 0x{current_ea:X}")
-        return current_ea
+            # 2. Target lands exactly at the potential start of the next stage
+            elif target == match_end + 6:
+                logger.debug(
+                    f"{indent}Jump chain ends: Reached potential next stage start 0x{target:X}"
+                )
+                return target # Return the exact target address
+
+            # 3. Target is within the overall Memory block, but *before* match_start.
+            elif mem_start_ea <= target < self.match_start:
+                 logger.debug(
+                    f"{indent}Jump chain ends: Target 0x{target:X} is within Memory bounds [{mem_start_ea:X},{mem_end_ea:X}) but outside followable range [{self.match_start:X}, {match_end + 6:X}). Returning target."
+                 )
+                 return target # Return the target address itself
+
+            # 4. Target is out of the overall Memory bounds or otherwise unexpected.
+            else:
+                logger.debug(
+                    f"{indent}Jump chain stopped: Target 0x{target:X} is outside allowed ranges. Returning start address 0x{current_ea:X}"
+                )
+                return current_ea # Return the start address of the sequence containing the invalid jump
 
     def process(self, mem, chain):
         """
@@ -1045,6 +1169,7 @@ class JumpTargetAnalyzer:
           - junk_length: int
           - stage1_type: SegmentType
         """
+        decoder = IdaInstructionDecoder()
         match_end = chain.overall_start() + chain.overall_length()
         logger.debug(
             f"Processing jumps for chain @ 0x{chain.overall_start():X}, match_end=0x{match_end:X}"
@@ -1057,7 +1182,7 @@ class JumpTargetAnalyzer:
             # offset = struct.unpack("<b", jump_match.group()[-1:])[0]
             # Compute the final target assuming a 2-byte instruction.
             # final_target = jump_ea + 2 + offset
-            final_target = self.follow_jump_chain(mem, jump_ea, match_end)
+            final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
             if not final_target:
                 logger.debug(
                     f"  Skipping jump at 0x{jump_ea:X}: Invalid final target 0x{final_target if final_target else 0:X}"
@@ -1203,7 +1328,7 @@ def find_junk_instructions_after_stage1(
         f"Phase 2: Checking for junk instructions immediately following {len(stage1_chains)} stage1 matches"
     )
 
-    for chain in stage1_chains:
+    for chain in ida_helpers.ida_tguidm(stage1_chains):
         stage1_start = chain.overall_start()
         stage1_len = chain.overall_length()
         stage1_desc = chain.segments[0].description
@@ -1407,7 +1532,7 @@ def filter_match_chains(match_chains: MatchChains) -> list[MatchChains]:
       - The junk length must be nonzero.
     """
     valid_chains = []
-    for chain in match_chains:
+    for chain in ida_helpers.ida_tguidm(match_chains):
         total_length = chain.overall_length()
         junk_length = (
             chain.junk_length
@@ -1449,7 +1574,7 @@ def filter_antidisasm_patterns(
     logger.info("Stage 1: Basic validation")
     filtered_chains = []
 
-    for chain in chains:
+    for chain in ida_helpers.ida_tguidm(chains):
 
         # Apply basic filters
         length = chain.overall_length()
@@ -1474,7 +1599,7 @@ def filter_antidisasm_patterns(
     logger.info("Stage 2: Big instruction validation")
     validated_with_big_instr = []
 
-    for chain in filtered_chains:
+    for chain in ida_helpers.ida_tguidm(filtered_chains):
         # Check if we already have a big instruction segment
         if any(
             seg.segment_type == SegmentType.BIG_INSTRUCTION for seg in chain.segments
@@ -1603,7 +1728,7 @@ def filter_antidisasm_patterns(
     final_chains: list[MatchChains] = []
     covered_ranges: list[tuple[int, int]] = []
 
-    for chain in sorted_chains:
+    for chain in ida_helpers.ida_tguidm(sorted_chains):
         chain_start = chain.overall_start()
 
         # Calculate chain end including the big instruction
@@ -1651,30 +1776,6 @@ def decompile_function(func_start: int):
     ida_auto.auto_wait()
 
 
-def process(start_ea: int, end_ea: int, patch_manager: PatchManager):
-    mem = Memory.from_ida_range(start_ea, end_ea)
-    chains: MatchChains = find_stage1(mem, start_ea, end_ea)
-    if not chains:
-        logger.info("No stage1 matches found!")
-        return
-
-    chains: MatchChains = find_junk_instructions_after_stage1(
-        mem, chains, start_ea, end_ea
-    )
-    chain_list: list[MatchChains] = filter_match_chains(chains)
-    chain_list: list[MatchChains] = filter_antidisasm_patterns(
-        mem, chain_list, start_ea
-    )
-    logger.info("=== Updated matches ===")
-    chain_list.sort()
-    for chain in chain_list:
-        logger.info(chain)
-        patch_manager.add_patch(chain.overall_start(), b"\x90" * chain.overall_length())
-    logger.info(
-        "Analysis completed. Found {} patch operations.".format(len(patch_manager))
-    )
-    return patch_manager
-
 
 def get_garbage_blobs(text_seg: ida_segment.segment_t):
     """
@@ -1718,6 +1819,31 @@ def get_tls_region(text_seg: ida_segment.segment_t):
         blobs.append(xref)
     blobs.sort()
     return blobs
+
+
+def process(start_ea: int, end_ea: int, patch_manager: PatchManager):
+    mem = Memory.from_ida_range(start_ea, end_ea)
+    chains: MatchChains = find_stage1(mem, start_ea, end_ea)
+    if not chains:
+        logger.info("No stage1 matches found!")
+        return
+    
+    chains: MatchChains = find_junk_instructions_after_stage1(
+        mem, chains, start_ea, end_ea
+    )
+    chain_list: list[MatchChains] = filter_match_chains(chains)
+    chain_list: list[MatchChains] = filter_antidisasm_patterns(
+        mem, chain_list, start_ea
+    )
+    logger.info("=== Updated matches ===")
+    chain_list.sort()
+    for chain in chain_list:
+        logger.info(chain)
+        patch_manager.add_patch(chain.overall_start(), b"\x90" * chain.overall_length())
+    logger.info(
+        "Analysis completed. Found {} patch operations.".format(len(patch_manager))
+    )
+    return patch_manager
 
 
 def execute_action(
@@ -1830,86 +1956,3 @@ class RemoveAntiDisassemblyAction(
 # retrieve the action
 def get_action() -> actions.action_t:
     return RemoveAntiDisassemblyAction()
-
-
-# Failing test case:
-
-"""
-.text:000000014000CB71 188 A9 32 A0 32 7C                                      test    eax, 7C32A032h
-.text:000000014000CB76 188 73 2D                                               jnb     short near ptr loc_14000CBA2+3
-.text:000000014000CB78 188 81 C1 E5 46 50 B3                                   add     ecx, 0B35046E5h
-.text:000000014000CB7E 188 80 C1 61                                            add     cl, 61h ; 'a'
-.text:000000014000CB81 188 0F 80 4B 20 01 00                                   jo      near ptr loc_14001EBCD+5
-.text:000000014000CB87 188 0F 31                                               rdtsc
-.text:000000014000CB89 188 81 E9 C5 1C 77 72                                   sub     ecx, 72771CC5h
-.text:000000014000CB8F 188 0F 31                                               rdtsc
-.text:000000014000CB91 188 6A BE                                               push    0FFFFFFFFFFFFFFBEh
-.text:000000014000CB93 190 83 C6 85                                            add     esi, 0FFFFFF85h
-.text:000000014000CB96 190 81 C3 0C 69 C0 43                                   add     ebx, 43C0690Ch
-.text:000000014000CB9C 190 81 E8 22 13 CE 92                                   sub     eax, 92CE1322h
-.text:000000014000CBA2
-.text:000000014000CBA2                                         loc_14000CBA2:                          ; CODE XREF: InitAegisContext(_ANTIDEBUG_CONTEXT *)+21D6↑j
-.text:000000014000CBA2 190 88 82 A0 48 8B 44                                   mov     [rdx+448B48A0h], al
-.text:000000014000CBA8 190 24 58                                               and     al, 58h
-.text:000000014000CBAA 190 48 C1 E8 34                                         shr     rax, 34h
-.text:000000014000CBAE 190 41 8B D0                                            mov     edx, r8d
-.text:000000014000CBB1 190 4A 8B 8C 20 80 28 B7 02                             mov     rcx, [rax+r12+2B72880h]
-.text:000000014000CBB9 190 41 8B C0                                            mov     eax, r8d
-.text:000000014000CBBC 190 C1 C9 0B                                            ror     ecx, 0Bh
-.text:000000014000CBBF 190 4D 23 C5                                            and     r8, r13
-.text:000000014000CBC2 190 F7 D0                                               not     eax
-.text:000000014000CBC4 190 33 C8                                               xor     ecx, eax
-.text:000000014000CBC6 190 48 C1 E1 20                                         shl     rcx, 20h
-.text:000000014000CBCA 190 49 33 C8                                            xor     rcx, r8
-.text:000000014000CBCD 190 48 0B CA                                            or      rcx, rdx
-.text:000000014000CBD0 190 4A 89 8C 23 A8 38 B7 02                             mov     [rbx+r12+2B738A8h], rcx
-.text:000000014000CBD8 190 0F 1F 84 00 00 00 00 00                             nop     dword ptr [rax+rax+00000000h]
-"""
-
-# debug output:
-
-"""
-Starting search...
-Searching for stage1 patterns from 0x14000A9A0 to 0x14000CD62
-
-Looking for Multi-Part Conditional Jumps patterns:
-
-Looking for Single-Part Conditional Jumps patterns:
-   Single-Part Conditional Jumps @ 0x14000B121 - f6c376732f
-   Single-Part Conditional Jumps @ 0x14000CB71 - a932a0327c732d
-
-Phase 2: Checking for junk instructions immediately following Stage1 matches
-
-Searching for junk instruction sequence after Single-Part Conditional Jumps at 0x14000B121 (starting from 0x14000B126)
-  Found Random 112-127 @ 0x14000B126 (2 bytes: 7a99)
-  No more junk instructions match with 7226 bytes remaining
-
-Searching for junk instruction sequence after Single-Part Conditional Jumps at 0x14000CB71 (starting from 0x14000CB78)
-  Found ADD reg32, imm32 @ 0x14000CB78 (6 bytes: 81c1e54650b3)
-  Found ADD reg8, imm8 @ 0x14000CB7E (3 bytes: 80c161)
-  Found TwoByte Conditional Jump @ 0x14000CB81 (6 bytes: 0f804b200100)
-  Found RDTSC @ 0x14000CB87 (2 bytes: 0f31)
-  Found AND reg32, imm32 @ 0x14000CB89 (6 bytes: 81e9c51c7772)
-  Found RDTSC @ 0x14000CB8F (2 bytes: 0f31)
-  Found PUSH imm8 @ 0x14000CB91 (2 bytes: 6abe)
-  Found ADD reg32, imm8 @ 0x14000CB93 (3 bytes: 83c685)
-  Found ADD reg32, imm32 @ 0x14000CB96 (6 bytes: 81c30c69c043)
-  Found AND reg32, imm32 @ 0x14000CB9C (6 bytes: 81e82213ce92)
-  No more junk instructions match with 448 bytes remaining
-Single-Part Conditional Jumps -> Random 112-127 @ 0x14000B121 - f6c376732f7a99
-Single-Part Conditional Jumps -> ADD reg32, imm32 -> ADD reg8, imm8 -> TwoByte Conditional Jump -> RDTSC -> AND reg32, imm32 -> RDTSC -> PUSH imm8 -> ADD reg32, imm8 -> ADD reg32, imm32 -> AND reg32, imm32 @ 0x14000CB71 - a932a0327c732d81...
-
-Filtering 1 potential anti-disassembly patterns...
-Stage 1: Basic validation
-  After basic filtering: 1 chains remain
-Stage 2: Big instruction validation
-Analyzing match: Single-Part Conditional Jumps -> ADD reg32, imm32 -> ADD reg8, imm8 -> TwoByte Conditional Jump -> RDTSC -> AND reg32, imm32 -> RDTSC -> PUSH imm8 -> ADD reg32, imm8 -> ADD reg32, imm32 -> AND reg32, imm32 @ 0x14000CB71
-  -> Found jl      short loc_14000CBEA @ 0x14000CB75 targeting 0x14000CBEA
-  7c73 @ 0x14000CB75 targeting 0x14000CB75 is NOT within 6 bytes of match end 14000CBA2
-  -> Found ja      short loc_14000CC01 @ 0x14000CB8D targeting 0x14000CC01
-  7772 @ 0x14000CB8D targeting 0x14000CB8D is NOT within 6 bytes of match end 14000CBA2
-  Rejected: Single-Part Conditional Jumps -> ADD reg32, imm32 -> ADD reg8, imm8 -> TwoByte Conditional Jump -> RDTSC -> AND reg32, imm32 -> RDTSC -> PUSH imm8 -> ADD reg32, imm8 -> ADD reg32, imm32 -> AND reg32, imm32 @ 0x14000CB71 - no valid big instruction
-  After big instruction validation: 0 chains remain
-Stage 3: Resolving overlaps
-Filtering complete: 0 of 1 chains accepted
-"""
