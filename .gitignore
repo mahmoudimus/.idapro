@@ -9,3 +9,6 @@ extras/
 
 packages/
 tmp/boombox.exe.i64
+sig
+til
+tmp/*.db

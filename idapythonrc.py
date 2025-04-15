@@ -22,6 +22,8 @@ import platform
 import shlex
 import subprocess
 
+import ida_kernwin
+
 
 def init_sys_path():
     import sys
@@ -165,3 +167,13 @@ def configure_gepetto_api_keys():
 
 
 configure_gepetto_api_keys()
+
+
+def clear_window(window):
+    form = ida_kernwin.find_widget(window)
+    ida_kernwin.activate_widget(form, True)
+    ida_kernwin.process_ui_action("msglist:Clear")
+
+
+def clear_output():
+    clear_window("Output window")
