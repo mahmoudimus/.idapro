@@ -363,8 +363,7 @@ def find_byte_sequence(
     start: int,
     end: int,
     seq: list[int] | bytes,
-    direction: ida_bytes.BIN_SEARCH_DIRECTION = ida_bytes.BIN_SEARCH_FORWARD
-    | ida_bytes.BIN_SEARCH_NOSHOW,
+    direction: int = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW,
 ) -> typing.Iterator[int]:
     """yield all ea of a given byte sequence
 
