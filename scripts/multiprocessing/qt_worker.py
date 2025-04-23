@@ -23,9 +23,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # --- Helper Functions ---
 def is_ida():
+    exec_name = pathlib.Path(sys.executable).name.lower()
     """Crude check to see if running inside IDA."""
-    exec_name = Path(sys.executable).name.lower()
-    return exec_name in ["ida.exe", "ida64.exe", "idat.exe", "idat64.exe"]
+    return exec_name.startswith("ida")
 
 
 # --- PySide6 Imports and Fallbacks ---

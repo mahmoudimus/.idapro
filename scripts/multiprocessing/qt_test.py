@@ -2,7 +2,10 @@
 import sys
 import time
 
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore, QtWidgets
+
+QApplication = QtWidgets.QApplication
+QWidget = QtWidgets.QWidget
 
 TOTAL_WIDGETS = 10
 
@@ -26,7 +29,7 @@ class Worker(QtCore.QObject):
         self.finished.emit()
 
 
-class MainUI(QtGui.QWidget):
+class MainUI(QWidget):
     def __init__(self, parent=None):
         super(MainUI, self).__init__(parent)
         self.extraThread = QtCore.QThread()
@@ -36,7 +39,7 @@ class MainUI(QtGui.QWidget):
         #
         #     QThread: Destroyed while thread is still running
         #
-        QtGui.QApplication.instance().aboutToQuit.connect(self.quit)
+        QApplication.instance().aboutToQuit.connect(self.quit)
 
         self.worker = Worker()
         self.worker.moveToThread(self.extraThread)
@@ -45,22 +48,22 @@ class MainUI(QtGui.QWidget):
 
     def setupUI(self):
         # CREAT MAIN LAYOUT AND WIDGETS
-        mainLayout = QtGui.QVBoxLayout()
-        btnLayout = QtGui.QHBoxLayout()
+        mainLayout = QtWidgets.QVBoxLayout()
+        btnLayout = QtWidgets.QHBoxLayout()
         mainLayout.addLayout(btnLayout)
         self.setLayout(mainLayout)
 
-        self.progressBar = QtGui.QProgressBar(self)
+        self.progressBar = QtWidgets.QProgressBar(self)
         self.progressBar.setRange(0, TOTAL_WIDGETS)
         self.progressBar.setVisible(False)
-        self.btnWork = QtGui.QPushButton("Do Work")
-        self.btnCancel = QtGui.QPushButton("Cancel")
+        self.btnWork = QtWidgets.QPushButton("Do Work")
+        self.btnCancel = QtWidgets.QPushButton("Cancel")
         self.btnCancel.setDisabled(True)
 
-        self.guiResponseProgressbar = QtGui.QProgressBar(self)
+        self.guiResponseProgressbar = QtWidgets.QProgressBar(self)
         self.guiResponseProgressbar.setRange(0, 0)
 
-        self.outputWindow = QtGui.QTextEdit()
+        self.outputWindow = QtWidgets.QTextEdit()
 
         mainLayout.addWidget(self.progressBar)
         mainLayout.addWidget(self.outputWindow)
@@ -131,7 +134,7 @@ class MainUI(QtGui.QWidget):
 
 if __name__ == "__main__":
     args = sys.argv
-    app = QtGui.QApplication(args)
+    app = QApplication(args)
     p = MainUI()
     p.show()
     # Annoyance on Mac OS X.

@@ -37,9 +37,9 @@ PROCESSING_POOL_CONTEXT.set_executable(PYTHON_EXECUTABLE)
 
 
 def is_ida():
-    """Crude check to see if running inside IDA."""
     exec_name = pathlib.Path(sys.executable).name.lower()
-    return exec_name in ["ida.exe", "ida64.exe", "idat.exe", "idat64.exe"]
+    """Crude check to see if running inside IDA."""
+    return exec_name.startswith("ida")
 
 
 # from queue import Queue

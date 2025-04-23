@@ -5,7 +5,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 
 # Import Qt modules from PySide6 (this may be replaced with PyQt if needed)
-from PySide6.QtCore import QCoreApplication, QTimer
+from PySide6.QtCore import QCoreApplication, QTextStream, QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 # Optionally import IDA API if available. In IDA Pro the IDAPython environment will have it.
@@ -68,15 +68,21 @@ def worker_task(server_name, worker_id):
 # Function to process new incoming connections from workers.
 # -----------------------------
 def handle_new_connection(server):
-    # Accept the pending connection.
+    # pull off the new QLocalSocket
     socket = server.nextPendingConnection()
 
-    # Slot to read data from the socket.
+    # wrap it in a QTextStream for line‑based UTF‑8 reads
+    stream = QTextStream(socket)
+    stream.setCodec("UTF-8")
+    stream.setAutoDetectUnicode(True)
+
     def read_socket():
-        while socket.bytesAvailable():
-            data = socket.readAll().data().decode("utf-8").strip()
-            if data:
-                print("Log received:", data)
+        # read as many lines as the socket has buffered
+        while not stream.atEnd():
+            line = stream.readLine()
+            if line:
+                # send it to IDA's console
+                idaapi.msg(line + "\n")
 
     socket.readyRead.connect(read_socket)
 
@@ -103,40 +109,56 @@ def _in_ida(app):
     mpctx = multiprocessing.get_context("spawn")
     mpctx.set_executable(str(specific_python_path))
 
-    # Define a server name unique to your logging server.
-    server_name = "LoggingServer_IDA"
-    local_server = QLocalServer()
-    # Clean up any old server with the same name.
-    QLocalServer.removeServer(server_name)
-    if not local_server.listen(server_name):
-        print("Error: Unable to start the logging server:", local_server.errorString())
+    # 1) remove old socket; 2) start listening
+    orig_name = "LoggingServer_IDA"
+    QLocalServer.removeServer(orig_name)
+    server = QLocalServer(app)
+    if not server.listen(orig_name):
+        idaapi.msg(f"Error: Unable to start logging server: {server.errorString()}\n")
         sys.exit(1)
-    local_server.newConnection.connect(lambda: handle_new_connection(local_server))
 
-    # Launch worker processes using ProcessPoolExecutor.
+    try:
+        # Qt ≥5.10 / Qt6 provides this static helper
+        full_socket_path = QLocalServer.fullServerName(orig_name)
+    except (AttributeError, TypeError):
+        # Fallback: build "/tmp/{appName}_{orig_name}" if appName is set,
+        # otherwise "/tmp/{orig_name}"
+        from PySide6.QtCore import QDir
+
+        app_name = app.applicationName() if app else ""
+        socket_file = f"{app_name}_{orig_name}" if app_name else orig_name
+        full_socket_path = QDir.tempPath() + QDir.separator() + socket_file
+
+    idaapi.msg(f"Logging server listening on: {full_socket_path}\n")
+    server.newConnection.connect(lambda: handle_new_connection(server))
+
+    # Launch workers exactly as before...
     futures = []
 
-    # Define a function to check if workers are done.
+    # install a QTimer on the IDA app so it doesn't get GC'd
+    timer = QTimer(app)
+
     def check_workers():
-        # if all(f.done() for f in futures):
+        all_done = True
         for f in futures:
             if f.done():
-                print("Result:", f.result())
+                idaapi.msg(f"Result: {f.result()}\n")
             else:
-                print("Not done:", f)
+                all_done = False
+                idaapi.msg("Not done yet…\n")
+        # once all are done, you can shut down the executor
+        if all_done and executor:
+            executor.shutdown(wait=False)
 
-    # Set up a QTimer to check on the worker results.
-    timer = QTimer()
     timer.timeout.connect(check_workers)
-    timer.start(500)  # Check every 500 ms
+    timer.start(500)  # every half‑second
+    idaapi.msg("Starting workers...\n")
+    # IMPORTANT: keep a reference so we don't block the UI by shutting down immediately
+    executor = ProcessPoolExecutor(max_workers=2, mp_context=mpctx)
+    for i in range(4):
+        futures.append(executor.submit(worker_task, full_socket_path, i))
 
-    with ProcessPoolExecutor(max_workers=2, mp_context=mpctx) as executor:
-        for i in range(4):
-            futures.append(executor.submit(worker_task, server_name, i))
-
-    # When running inside IDA Pro, the event loop is already running.
-    # So you can simply return control to IDA.
-    print("Logging server is running within IDA Pro's event loop.")
+    idaapi.msg("Waiting for workers to finish...\n")
 
 
 # -----------------------------
