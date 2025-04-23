@@ -7,11 +7,13 @@ import atexit
 import contextlib
 import json
 import logging
+import math
 import multiprocessing
 import os
 import pathlib
 import stat
 import sys
+import threading
 import typing
 import warnings
 from collections import defaultdict
@@ -302,121 +304,310 @@ class MatchChain:
         return f"<Chain {self.segments[0].description if self.segments else ''} @0x{self.overall_start():X} len={self.overall_length()}>"
 
 
-# ─── Stage 1: Capstone pattern matching ──────────────────────────────────────
+# fmt: off
+import re
+import struct
+
+# --- Reusable Padding Pattern ---
+# First, define the raw padding pattern without capturing groups.
+PADDING_PATTERN = rb"(?:\xC0[\xE0-\xFF]\x00|(?:\x86|\x8A)[\xC0\xC9\xD2\xDB\xE4\xED\xF6\xFF])"
+# (We do not wrap this in a named group here so that we can reuse it inside other groups.)
+
+# --- Enum for Pattern Categories ---
+class PatternCategory(Enum):
+    MULTI_PART = auto()
+    SINGLE_PART = auto()
+    JUNK = auto()
+
+# --- Dataclass for Regex Pattern Metadata ---
+@dataclass
+class RegexPatternMetadata:
+    category: PatternCategory
+    pattern: bytes  # The regex pattern as a bytes literal
+    description: typing.Optional[str] = None
+    compiled: typing.Optional[typing.Pattern] = None
+
+    def compile(self, flags=0):
+        """Compile the regex if not already done, and return the compiled object."""
+        if self.compiled is None:
+            self.compiled = re.compile(self.pattern, flags)
+        return self.compiled
+
+    @property
+    def group_names(self):
+        """Return the dictionary mapping group names to their indices."""
+        return self.compile().groupindex
+
+@dataclass
+class MultiPartPatternMetadata(RegexPatternMetadata):
+    category: PatternCategory = field(default=PatternCategory.MULTI_PART, init=False)
+
+    def __post_init__(self):
+        # Compile to ensure group names are available.
+        _ = self.compile(re.DOTALL)
+        required_groups = {"first_jump", "padding", "second_jump"}
+        missing = required_groups - set(self.group_names)
+        if missing:
+            raise ValueError(
+                f"MultiPart pattern is missing required groups: {missing}"
+            )
+
+@dataclass
+class SinglePartPatternMetadata(RegexPatternMetadata):
+    category: PatternCategory = field(default=PatternCategory.SINGLE_PART, init=False)
+
+    def __post_init__(self):
+        _ = self.compile(re.DOTALL)
+        required_groups = {"prefix", "padding", "jump"}
+        missing = required_groups - set(self.group_names)
+        if missing:
+            raise ValueError(
+                f"SinglePart pattern is missing required groups: {missing}"
+            )
+
+@dataclass
+class JunkPatternMetadata(RegexPatternMetadata):
+    category: PatternCategory = field(default=PatternCategory.JUNK, init=False)
+
+    def __post_init__(self):
+        _ = self.compile(re.DOTALL)
+        required_groups = {"junk"}
+        missing = required_groups - set(self.group_names)
+        if missing:
+            raise ValueError("Junk pattern must have a 'junk' group.")
+    
+# Multi-part jump patterns: pairs of conditional jumps with optional padding
+MULTI_PART_PATTERNS = [
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x70.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x71.)", "JO ... JNO"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x71.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x70.)", "JNO ... JO"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x72.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x73.)", "JB ... JAE"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x73.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x72.)", "JAE ... JB"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x74.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x75.)", "JE ... JNE"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x75.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x74.)", "JNE ... JE"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x76.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x77.)", "JBE ... JA"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x77.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x76.)", "JA ... JBE"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x78.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x79.)", "JS ... JNS"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x79.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x78.)", "JNS ... JS"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x7A.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x7B.)", "JP ... JNP"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x7B.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x7A.)", "JNP ... JP"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x7C.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x7D.)", "JL ... JGE"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x7D.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x7C.)", "JGE ... JL"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x7E.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x7F.)", "JLE ... JG"),
+    MultiPartPatternMetadata(rb"(?P<first_jump>\x7F.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x7E.)", "JG ... JLE"),
+]
+
+# Single-part jump patterns: prefix instruction + optional padding + conditional jump
+SINGLE_PART_PATTERNS = [
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF8)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "CLC ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF9)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x76.)", "STC ... JBE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF9)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x72.)", "STC ... JB"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xA8.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST AL, imm8 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xA9....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST EAX, imm32 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF6..)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m8, imm8 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF7.....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m32, imm32 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x84.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m8, r8 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x85.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m32, r32 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xA8.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST AL, imm8 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xA9....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST EAX, imm32 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF6..)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m8, imm8 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF7.....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m32, imm32 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x84.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m8, r8 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x85.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m32, r32 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xE0-\xE7]\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "AND r/m8, 0xFF ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x24\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "AND AL, 0xFF ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xC8-\xCF]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "OR r/m8, 0x00 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x0C\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "OR AL, 0x00 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xF0-\xF7]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "XOR r/m8, 0x00 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x34\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "XOR AL, 0x00 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xE0-\xE7]\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "AND r/m8, 0xFF ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x24\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "AND AL, 0xFF ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xC8-\xCF]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "OR r/m8, 0x00 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x0C\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "OR AL, 0x00 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xF0-\xF7]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "XOR r/m8, 0x00 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x34\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "XOR AL, 0x00 ... JAE"),
+]
 
 
-def find_stage1_capstone(buf: bytes, base_ea: int, is_64: bool):
-    md = capstone.Cs(
-        capstone.CS_ARCH_X86, capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32
-    )
-    md.detail = True
-    instrs = list(md.disasm(buf, base_ea))
+JUNK_PATTERNS = [
+    JunkPatternMetadata(rb"(?P<junk>\x0F\x31)", "RDTSC"),
+    JunkPatternMetadata(rb"(?P<junk>\x0F[\x80-\x8F]..[\x00\x01]\x00)", "TwoByte Conditional Jump"),
+    JunkPatternMetadata(rb"(?P<junk>\xE8..[\x00\x01]\x00)", "Invalid CALL"),
+    JunkPatternMetadata(rb"(?P<junk>\x81[\xC0-\xC3\xC5-\xC7]....)", "ADD reg32, imm32"),
+    JunkPatternMetadata(rb"(?P<junk>\x80[\xC0-\xC3\xC5-\xC7].)", "ADD reg8, imm8"),
+    JunkPatternMetadata(rb"(?P<junk>\x83[\xC0-\xC3\xC5-\xC7].)", "ADD reg32, imm8"),
+    JunkPatternMetadata(rb"(?P<junk>\xC6[\xC0-\xC3\xC5-\xC7].)", "MOV reg8, imm8"),
+    JunkPatternMetadata(rb"(?P<junk>\xC7[\xC0-\xC3\xC5-\xC7]....)", "MOV reg32, imm32"),
+    JunkPatternMetadata(rb"(?P<junk>\xF6[\xD8-\xDB\xDD-\xDF])", "NEG reg8"),
+    JunkPatternMetadata(rb"(?P<junk>\x80[\xE8-\xEB\xED-\xEF].)", "AND reg8, imm8"),
+    JunkPatternMetadata(rb"(?P<junk>\x81[\xE8-\xEB\xED-\xEF]....)", "AND reg32, imm32"),
+    JunkPatternMetadata(rb"(?P<junk>\x68....)", "PUSH imm32"),
+    JunkPatternMetadata(rb"(?P<junk>\x6A.)", "PUSH imm8"),
+    JunkPatternMetadata(rb"(?P<junk>[\x70-\x7F].)", "Random 112-127"),
+    JunkPatternMetadata(rb"(?P<junk>[\x50-\x5F])", "Single-byte PUSH/POP"),
+]   
+# fmt: on
 
-    # Conditional jump ↔ inverse
-    COND_JUMPS = {
-        capstone.x86.X86_INS_JA: capstone.x86.X86_INS_JNO,
-        capstone.x86.X86_INS_JNO: capstone.x86.X86_INS_JA,
-        capstone.x86.X86_INS_JAE: capstone.x86.X86_INS_JB,
-        capstone.x86.X86_INS_JB: capstone.x86.X86_INS_JAE,
-        capstone.x86.X86_INS_JBE: capstone.x86.X86_INS_JA,
-        capstone.x86.X86_INS_JA: capstone.x86.X86_INS_JBE,
-        capstone.x86.X86_INS_JE: capstone.x86.X86_INS_JNE,
-        capstone.x86.X86_INS_JNE: capstone.x86.X86_INS_JE,
-        capstone.x86.X86_INS_JG: capstone.x86.X86_INS_JLE,
-        capstone.x86.X86_INS_JLE: capstone.x86.X86_INS_JG,
-        capstone.x86.X86_INS_JGE: capstone.x86.X86_INS_JL,
-        capstone.x86.X86_INS_JL: capstone.x86.X86_INS_JGE,
-        capstone.x86.X86_INS_JS: capstone.x86.X86_INS_JNS,
-        capstone.x86.X86_INS_JNS: capstone.x86.X86_INS_JS,
-        capstone.x86.X86_INS_JP: capstone.x86.X86_INS_JNP,
-        capstone.x86.X86_INS_JNP: capstone.x86.X86_INS_JP,
-    }
 
-    # Allowed padding
-    PADDING_IDS = {
-        capstone.x86.X86_INS_ROL,
-        capstone.x86.X86_INS_ROR,
-        capstone.x86.X86_INS_RCL,
-        capstone.x86.X86_INS_RCR,
-        capstone.x86.X86_INS_SHL,
-        capstone.x86.X86_INS_SHR,
-        capstone.x86.X86_INS_XCHG,
-        capstone.x86.X86_INS_MOV,
-    }
+# def find_stage1(mem_bytes: bytes, ea: int) -> MatchChains:
+#     logger.info("Searching for stage1 patterns from 0x{:X}".format(ea))
 
-    # Single-part prefix→jump map
-    PREFIX_TO_JUMP = {
-        capstone.x86.X86_INS_CLC: capstone.x86.X86_INS_JAE,
-        capstone.x86.X86_INS_STC: capstone.x86.X86_INS_JBE,
-        capstone.x86.X86_INS_TEST: capstone.x86.X86_INS_JNO,
-    }
+#     # Combine all patterns, keeping your original format
+#     patterns = [
+#         (
+#             MULTI_PART_PATTERNS,
+#             "Multi-Part Conditional Jumps",
+#             SegmentType.STAGE1_MULTIPLE,
+#         ),
+#         (
+#             SINGLE_PART_PATTERNS,
+#             "Single-Part Conditional Jumps",
+#             SegmentType.STAGE1_SINGLE,
+#         ),
+#     ]
 
-    chains = []
+#     all_chains = MatchChains()
+#     for pattern_group, desc, segment_type in patterns:
+#         if not isinstance(pattern_group, list):
+#             pattern_group = [pattern_group]
 
-    # Multi-part
-    for i, insn1 in enumerate(instrs):
-        inv = COND_JUMPS.get(insn1.id)
-        if not inv:
-            continue
-        for insn2 in instrs[i + 1 :]:
-            if insn2.id in PADDING_IDS:
-                continue
-            if insn2.id == inv and insn2.size == insn1.size:
-                s = insn1.address
-                e = insn2.address + insn2.size
-                chains.append(
-                    MatchChain(
-                        base_address=base_ea,
-                        segments=[
-                            MatchSegment(
-                                start=s - base_ea,
-                                length=e - s,
-                                description="Multi-part CJ",
-                                matched_bytes=buf[s - base_ea : e - base_ea],
-                                segment_type=SegmentType.STAGE1_MULTIPLE,
-                                matched_groups={
-                                    "first_jump": insn1.bytes.hex(),
-                                    "second_jump": insn2.bytes.hex(),
-                                },
-                            )
-                        ],
-                    )
-                )
-            break
+#         for pattern in pattern_group:
+#             for m in re.finditer(pattern.compile(), mem_bytes):
+#                 match_len = m.end() - m.start()
+#                 matched_bytes = mem_bytes[m.start() : m.end()]
+#                 matched_groups = {
+#                     k: f"{v.hex()}" for k, v in m.groupdict().items() if k != "padding"
+#                 }
+#                 if "jump" in matched_groups:
+#                     offset = struct.unpack("<b", matched_bytes[-1:].view)[0]
+#                     target = ea + m.start() + match_len + offset
+#                     matched_groups["target"] = hex(target)
+#                 elif "first_jump" in matched_groups:
+#                     offset = struct.unpack("<b", matched_bytes[1:2].view)[0]
+#                     matched_groups["first_target"] = hex(ea + m.start() + 2 + offset)
+#                     offset = struct.unpack("<b", matched_bytes[-1:].view)[0]
+#                     target = ea + m.start() + match_len + offset
+#                     matched_groups["second_target"] = hex(target)
+#                 all_chains.add_chain(
+#                     MatchChain(
+#                         base_address=ea,
+#                         segments=[
+#                             MatchSegment(
+#                                 start=m.start(),
+#                                 length=match_len,
+#                                 description=desc,
+#                                 matched_bytes=matched_bytes,
+#                                 segment_type=segment_type,
+#                                 matched_groups=matched_groups,
+#                             )
+#                         ],
+#                     )
+#                 )
+#     all_chains.sort()
+#     logger.info(f"Phase 1: Found {len(all_chains)} stage1 chains")
+#     return all_chains
 
-    # Single-part
-    for i, insn1 in enumerate(instrs):
-        want = PREFIX_TO_JUMP.get(insn1.id)
-        if not want:
-            continue
-        for insn2 in instrs[i + 1 :]:
-            if insn2.id in PADDING_IDS:
-                continue
-            if insn2.id == want:
-                s = insn1.address
-                e = insn2.address + insn2.size
-                chains.append(
-                    MatchChain(
-                        base_address=base_ea,
-                        segments=[
-                            MatchSegment(
-                                start=s - base_ea,
-                                length=e - s,
-                                description="Single-part CJ",
-                                matched_bytes=buf[s - base_ea : e - base_ea],
-                                segment_type=SegmentType.STAGE1_SINGLE,
-                                matched_groups={
-                                    "prefix": insn1.bytes.hex(),
-                                    "jump": insn2.bytes.hex(),
-                                },
-                            )
-                        ],
-                    )
-                )
-            break
 
-    chains.sort(key=lambda c: c.overall_start())
-    return chains
+class MatchChains:
+    def __init__(self):
+        self.chains: list[MatchChain] = []
+
+    def add_chain(self, chain: MatchChain):
+        self.chains.append(chain)
+
+    def __iter__(self):
+        return iter(self.chains)
+
+    def sort(self):
+        self.chains.sort(key=lambda x: x.overall_start())
+
+    def __len__(self):
+        return len(self.chains)
+
+    def __repr__(self):
+        lines = []
+        for c in self.chains:
+            desc = c.segments[0].description
+            off = c.overall_start()
+            bhex = c.overall_matched_bytes().hex()[:16]
+            tail = "…" if c.overall_length() > 16 else ""
+            lines.append(f"{desc.rjust(32)} @0x{off:X} {bhex}{tail}")
+        return "\n".join(lines)
+
+
+# ─── Top-level scan function (picklable) ───────────────────────────────
+def _stage1_scan_one(job):
+    """
+    job = (pattern_bytes, description, segment_type, base_ea, buf)
+    returns MatchChains
+    """
+    pat_bytes, desc, segtype, base_ea, buf = job
+    prog = re.compile(pat_bytes, re.DOTALL)
+    hits = MatchChains()
+
+    for m in prog.finditer(buf):
+        s = m.start()
+        e = m.end()
+        mb = buf[s:e]
+        match_len = e - s
+
+        groups = {
+            k: v.hex()
+            for k, v in m.groupdict().items()
+            if (v is not None and k != "padding")
+        }
+
+        # compute jump targets
+        if "jump" in groups:
+            offset = struct.unpack("<b", mb[-1:])[0]
+            tgt = base_ea + s + match_len + offset
+            groups["target"] = hex(tgt)
+        elif "first_jump" in groups:
+            off1 = struct.unpack("<b", mb[1:2])[0]
+            groups["first_target"] = hex(base_ea + s + 2 + off1)
+            off2 = struct.unpack("<b", mb[-1:])[0]
+            groups["second_target"] = hex(base_ea + s + match_len + off2)
+
+        seg = MatchSegment(
+            start=s,
+            length=match_len,
+            description=desc,
+            matched_bytes=mb,
+            segment_type=segtype,
+            matched_groups=groups,
+        )
+        hits.add_chain(MatchChain(base_address=base_ea, segments=[seg]))
+
+    return hits
+
+
+# ─── Revised Stage1 entrypoint ─────────────────────────────────────────
+def stage1_find_patterns(buf: bytes, base_ea: int):
+    """
+    Regex-based Stage 1 (parallel). Returns List[MatchChain].
+    """
+    jobs = [
+        (
+            rgx.pattern,
+            rgx.description,
+            (
+                SegmentType.STAGE1_MULTIPLE
+                if rgx.category == PatternCategory.MULTI_PART
+                else SegmentType.STAGE1_SINGLE
+            ),
+            base_ea,
+            buf,
+        )
+        for rgx in (MULTI_PART_PATTERNS + SINGLE_PART_PATTERNS)
+    ]
+
+    ctx = get_context("spawn")
+    with ProcessPoolExecutor(mp_context=ctx) as exe:
+        all_groups = exe.map(_stage1_scan_one, jobs)
+
+    # flatten & sort
+    out = [chain for group in all_groups for chain in group]
+    out.sort(key=lambda c: c.overall_start())
+    return out
 
 
 # ─── Stage 2: peel off junk via Capstone ────────────────────────────────────
@@ -428,21 +619,27 @@ def peel_junk(buf: bytes, is_64: bool) -> int:
     )
     md.detail = True
     total = 0
+
     for insn in md.disasm(buf, 0):
         if total + insn.size > len(buf):
             break
+
         # RDTSC / RDTSCP
         if insn.id in (capstone.x86.X86_INS_RDTSC, capstone.x86.X86_INS_RDTSCP):
             total += insn.size
+
         # 2-byte conditional jump
         elif capstone.CS_GRP_JUMP in insn.groups and insn.size == 2:
             total += insn.size
+
         # CALL imm32
         elif (
             insn.id == capstone.x86.X86_INS_CALL
-            and insn.operands[0].type == insn.OP_IMM
+            and insn.operands
+            and insn.operands[0].type == capstone.CS_OP_IMM
         ):
             total += insn.size
+
         # ADD/MOV/NEG/AND/OR/XOR imm
         elif insn.id in (
             capstone.x86.X86_INS_ADD,
@@ -451,13 +648,16 @@ def peel_junk(buf: bytes, is_64: bool) -> int:
             capstone.x86.X86_INS_AND,
             capstone.x86.X86_INS_OR,
             capstone.x86.X86_INS_XOR,
-        ) and any(op.type == insn.OP_IMM for op in insn.operands):
+        ) and any(op.type == capstone.CS_OP_IMM for op in insn.operands):
             total += insn.size
+
         # PUSH/POP
         elif insn.id in (capstone.x86.X86_INS_PUSH, capstone.x86.X86_INS_POP):
             total += insn.size
+
         else:
             break
+
     return total
 
 
@@ -478,6 +678,20 @@ def find_junk_stage2_chain(chain: MatchChain, buf: bytes, base_ea: int, is_64: b
     return chain
 
 
+def _stage2_worker(
+    args: typing.Tuple[typing.List[MatchChain], bytes, int, bool],
+) -> typing.List[MatchChain]:
+    """
+    args = (chains_chunk, buf, base_ea, is_64)
+    Return updated chains with junk peeled.
+    """
+    chains_chunk, buf, base_ea, is_64 = args
+    out: typing.List[MatchChain] = []
+    for chain in chains_chunk:
+        out.append(find_junk_stage2_chain(chain, buf, base_ea, is_64))
+    return out
+
+
 # ─── Stage 3: filter ────────────────────────────────────────────────────────
 
 
@@ -488,6 +702,38 @@ def stage3_filter(chains):
 
 
 # ─── Stage 4: jump-chain + big-instr + overlap ──────────────────────────────
+
+
+def _stage4_validate_chain(args):
+    """
+    Top-level helper for Stage 4 so it can be pickled.
+    args = (chain, buf, base, block_end, is_64)
+    Returns either the updated chain or None.
+    """
+    chain, buf, base, block_end, is_64 = args
+
+    # 1) follow jump chain
+    exit_ea = follow_jump_chain(buf, base, chain.overall_start(), block_end, is_64)
+    off = exit_ea - base - 6
+    if off < 0:
+        return None
+
+    # 2) detect big instruction + junk after
+    bi = find_big_instruction(buf[off : off + 6], is_64)
+    if not bi:
+        return None
+
+    # 3) append that segment
+    chain.add_segment(
+        MatchSegment(
+            start=off,
+            length=6 + len(bi["junk_after"]),
+            description=bi["type"],
+            matched_bytes=buf[off : off + 6] + bi["junk_after"],
+            segment_type=SegmentType.BIG_INSTRUCTION,
+        )
+    )
+    return chain
 
 
 def follow_jump_chain(
@@ -584,9 +830,12 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         super().__post_init__()
         self.pause_evt = asyncio.Event()
         self.stop_evt = asyncio.Event()
-        workers = self.max_workers or multiprocessing.cpu_count() or 1
+        self.max_workers = self.max_workers or max(1, multiprocessing.cpu_count())
         ctx = get_context("spawn")
-        self.executor = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+        self.executor = ProcessPoolExecutor(
+            max_workers=self.max_workers, mp_context=ctx
+        )
+        logger.info(f"executor pool created with {self.max_workers} workers")
 
     @contextlib.asynccontextmanager
     async def _get_buffer(self):
@@ -608,27 +857,52 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         async with self._get_buffer() as buf:
             loop = asyncio.get_running_loop()
             chains = await loop.run_in_executor(
-                self.executor, find_stage1_capstone, buf, self.start_ea, self.is_64bit
+                self.executor, stage1_find_patterns, buf, self.start_ea
             )
         await self.emit("stage1_finished", chains)
         return chains
 
-    async def stage2(self, chains):
+    # async def stage2(self, chains):
+    #     await self.emit("stage2_started")
+    #     async with self._get_buffer() as buf:
+    #         loop = asyncio.get_running_loop()
+    #         tasks = [
+    #             loop.run_in_executor(
+    #                 self.executor,
+    #                 find_junk_stage2_chain,
+    #                 c,
+    #                 buf,
+    #                 self.start_ea,
+    #                 self.is_64bit,
+    #             )
+    #             for c in chains
+    #         ]
+    #         updated = await asyncio.gather(*tasks)
+    #     await self.emit("stage2_finished", updated)
+    #     return updated
+    async def stage2(self, chains: typing.List[MatchChain]) -> typing.List[MatchChain]:
         await self.emit("stage2_started")
+
+        # read the shared buffer once
         async with self._get_buffer() as buf:
             loop = asyncio.get_running_loop()
-            tasks = [
-                loop.run_in_executor(
-                    self.executor,
-                    find_junk_stage2_chain,
-                    c,
-                    buf,
-                    self.start_ea,
-                    self.is_64bit,
-                )
-                for c in chains
+
+            # split chains into roughly equal chunks
+            chunk_size = math.ceil(len(chains) / self.max_workers)
+            jobs = [
+                (chains[i : i + chunk_size], buf, self.start_ea, self.is_64bit)
+                for i in range(0, len(chains), chunk_size)
             ]
-            updated = await asyncio.gather(*tasks)
+
+            # schedule one big task per chunk
+            tasks = [
+                loop.run_in_executor(self.executor, _stage2_worker, job) for job in jobs
+            ]
+
+            # wait for them all, then flatten
+            results = await asyncio.gather(*tasks)
+        updated = [c for group in results for c in group]
+
         await self.emit("stage2_finished", updated)
         return updated
 
@@ -638,46 +912,73 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         await self.emit("stage3_finished", filtered)
         return filtered
 
+    # async def stage4(self, chains):
+    #     await self.emit("stage4_started")
+    #     async with self._get_buffer() as buf:
+    #         base = self.start_ea
+    #         block_end = base + self.data_size
+    #         loop = asyncio.get_running_loop()
+
+    #         async def validate_one(chain):
+    #             exit_ea = await loop.run_in_executor(
+    #                 self.executor,
+    #                 follow_jump_chain,
+    #                 buf,
+    #                 base,
+    #                 chain.overall_start(),
+    #                 block_end,
+    #                 self.is_64bit,
+    #             )
+    #             off = exit_ea - base - 6
+    #             if off < 0:
+    #                 return None
+    #             bi = find_big_instruction(buf[off : off + 6], self.is_64bit)
+    #             if not bi:
+    #                 return None
+    #             chain.add_segment(
+    #                 MatchSegment(
+    #                     start=off,
+    #                     length=6 + len(bi["junk_after"]),
+    #                     description=bi["type"],
+    #                     matched_bytes=buf[off : off + 6] + bi["junk_after"],
+    #                     segment_type=SegmentType.BIG_INSTRUCTION,
+    #                 )
+    #             )
+    #             return chain
+
+    #         tasks = [
+    #             loop.run_in_executor(self.executor, validate_one, c) for c in chains
+    #         ]
+    #         results = await asyncio.gather(*tasks)
+    #     results = [c for c in results if c]
+    #     final = resolve_overlaps(results)
+    #     await self.emit("stage4_finished", final)
+    #     return final
+
     async def stage4(self, chains):
         await self.emit("stage4_started")
+
         async with self._get_buffer() as buf:
             base = self.start_ea
             block_end = base + self.data_size
             loop = asyncio.get_running_loop()
 
-            async def validate_one(chain):
-                exit_ea = await loop.run_in_executor(
-                    self.executor,
-                    follow_jump_chain,
-                    buf,
-                    base,
-                    chain.overall_start(),
-                    block_end,
-                    self.is_64bit,
-                )
-                off = exit_ea - base - 6
-                if off < 0:
-                    return None
-                bi = find_big_instruction(buf[off : off + 6], self.is_64bit)
-                if not bi:
-                    return None
-                chain.add_segment(
-                    MatchSegment(
-                        start=off,
-                        length=6 + len(bi["junk_after"]),
-                        description=bi["type"],
-                        matched_bytes=buf[off : off + 6] + bi["junk_after"],
-                        segment_type=SegmentType.BIG_INSTRUCTION,
-                    )
-                )
-                return chain
+            # build one job per chain
+            jobs = [(c, buf, base, block_end, self.is_64bit) for c in chains]
 
+            # schedule each on your ProcessPoolExecutor
             tasks = [
-                loop.run_in_executor(self.executor, validate_one, c) for c in chains
+                loop.run_in_executor(self.executor, _stage4_validate_chain, job)
+                for job in jobs
             ]
+
+            # wait & filter out None
             results = await asyncio.gather(*tasks)
-        results = [c for c in results if c]
-        final = resolve_overlaps(results)
+        valid = [c for c in results if c]
+
+        # resolve overlaps & emit
+        final = resolve_overlaps(valid)
+
         await self.emit("stage4_finished", final)
         return final
 
@@ -695,6 +996,44 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         await self.emit("stopped")
 
 
+# ─── WorkerController: wrap AsyncDeobfuscator in its own event loop ───────
+class WorkerController:
+    def __init__(self, deob: AsyncDeobfuscator):
+        self.deob = deob
+        self.loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._result = None
+
+    def _run_loop(self):
+        # set and run the loop
+        asyncio.set_event_loop(self.loop)
+        self._result = self.loop.run_until_complete(self.deob.run())
+
+    def start(self):
+        """Launch the pipeline in its own thread."""
+        self._thread.start()
+
+    def pause(self):
+        """Pause after finishing the current iteration."""
+        print("▶️  Pausing…", flush=True)
+        self.loop.call_soon_threadsafe(self.deob.pause_evt.set)
+
+    def resume(self):
+        """Resume if previously paused."""
+        print("▶️  Resuming…", flush=True)
+        self.loop.call_soon_threadsafe(self.deob.pause_evt.clear)
+
+    def stop(self):
+        """Stop the pipeline as soon as possible."""
+        print("🛑  Stopping…", flush=True)
+        self.loop.call_soon_threadsafe(self.deob.stop_evt.set)
+
+    def join(self):
+        """Block until the pipeline finishes, return the final chains."""
+        self._thread.join()
+        return self._result
+
+
 # ─── Standalone worker entrypoint ───────────────────────────────────────────
 
 
@@ -705,8 +1044,6 @@ def worker_main():
     p.add_argument("--start_ea", type=lambda x: int(x, 0), required=True)
     p.add_argument("--is64", type=int, default=1)
     args = p.parse_args()
-    sys.stdout.write("worker_main ran baby!!!\n")
-    sys.stdout.flush()
 
     deob = AsyncDeobfuscator(
         shm_name=args.shm_name,
@@ -717,13 +1054,42 @@ def worker_main():
 
     # optional logging
     deob.on("run_started", lambda: print("▶️  Pipeline starting"))
-    deob.on("stage1_finished", lambda ch: print(f"✅ Stage1: {len(ch)} stubs"))
-    deob.on("stage2_finished", lambda ch: print(f"✅ Stage2: junk appended"))
-    deob.on("stage3_finished", lambda ch: print(f"✅ Stage3: {len(ch)} remain"))
-    deob.on("stage4_finished", lambda ch: print(f"✅ Stage4: {len(ch)} final"))
-    deob.on("stopped", lambda: print("🛑 Worker shutting down"))
+    deob.on(
+        "stage1_finished", lambda ch: print(f"✅ Stage1: {len(ch)} stubs", flush=True)
+    )
+    deob.on(
+        "stage2_finished", lambda ch: print(f"✅ Stage2: junk appended", flush=True)
+    )
+    deob.on(
+        "stage3_finished", lambda ch: print(f"✅ Stage3: {len(ch)} remain", flush=True)
+    )
+    deob.on(
+        "stage4_finished", lambda ch: print(f"✅ Stage4: {len(ch)} final", flush=True)
+    )
+    deob.on("stopped", lambda: print("🛑 Worker shutting down", flush=True))
 
-    results = asyncio.run(deob.run())
+    # ——— start in background thread ———
+    ctrl = WorkerController(deob)
+    ctrl.start()
+
+    # ——— command loop ———
+    # This will block until IDA sends an "exit", "pause", or "resume" line.
+    for line in sys.stdin:
+        cmd = line.strip().lower()
+        if cmd == "pause":
+            ctrl.pause()
+        elif cmd == "resume":
+            ctrl.resume()
+        elif cmd in ("stop", "exit", "shutdown"):
+            ctrl.stop()
+            break
+        # you can also respond to "ping" if you want:
+        elif cmd == "ping":
+            print("pong", flush=True)
+
+    # wait for the pipeline to complete
+    results = ctrl.join()
+
     out = [
         {
             "offset": c.overall_start() - args.start_ea,
@@ -903,6 +1269,7 @@ if is_ida():
             self.setProcessEnvironment(env)
             script = str(WORKER_SCRIPT_PATH)
             args = [
+                "-u",
                 script,
                 "--shm_name",
                 shm_name,
@@ -1054,10 +1421,19 @@ if is_ida():
             self._cleanup_shared_memory()
             logger.info("Terminated.")
 
+        def pause(self):
+            self.send_command("pause")
+
+        def resume(self):
+            self.send_command("resume")
+
+        def stop(self):
+            self.send_command("stop")
+
         @staticmethod
         def get_section_data(
             section_name: str,
-            max_size: int = 40 * 1024 * 1024,
+            max_size: int = 120 * 1024 * 1024,
             min_size: int = 1024,
         ) -> tuple[int, bytes]:
             """Get the data of a section by name and return the start address and the bytes."""
@@ -1065,15 +1441,17 @@ if is_ida():
             data_ea = seg.start_ea
             data_to_process_size = seg.end_ea - seg.start_ea
             # Cap size if needed, or handle very large sections
-            if data_to_process_size > max_size:  # Limit demo to ~40MB
+            if data_to_process_size > max_size:  # Limit to max_size (default is 120MB)
                 data_to_process_size = max_size
                 logger.warning(
-                    f"Limiting demo data size to {data_to_process_size} bytes from {section_name}."
+                    f"Limiting section data size to {data_to_process_size} bytes from {section_name}."
                 )
             elif data_to_process_size < min_size:  # Don't bother with tiny sections
+                # TODO: do we even still need this?
                 logger.error(
-                    f"{section_name} section is too small ({data_to_process_size} bytes) for demo."
+                    f"{section_name} section is too small ({data_to_process_size} bytes) for processing."
                 )
+
                 return
 
             logger.info(
@@ -1180,16 +1558,25 @@ if is_ida():
             """
             return self._processor
 
+        def pause(self):
+            self.get().pause()
+
+        def resume(self):
+            self.get().resume()
+
+        def stop(self):
+            self.get().stop()
+
     class DataProcessorPlugin(idaapi.plugin_t):
         """
-        IDA Pro plugin example demonstrating multiprocessing with a worker
+        IDA Pro multiprocessing plugin with a worker
         using shared memory for large data and QProcess pipes for signaling.
         """
 
         flags = idaapi.PLUGIN_PROC
-        comment = "External data processing via Shared Memory and QProcess"
-        help = "Press Alt-Shift-P to start data processing example"
-        wanted_name = "DataProcessingExample"
+        comment = "Deobfuscation via Shared Memory, Multiprocessing and QProcess"
+        help = "Press Alt-Shift-P to start data deobfuscation"
+        wanted_name = "FastDeobfuscator"
         wanted_hotkey = "Alt-Shift-P"
         _core = None
 
