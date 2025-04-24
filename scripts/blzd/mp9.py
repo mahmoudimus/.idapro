@@ -10,6 +10,7 @@ import math
 import multiprocessing
 import os
 import pathlib
+import platform
 import re
 import stat
 import struct
@@ -17,12 +18,13 @@ import sys
 import threading
 import time
 import typing
+import uuid
 import warnings
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from functools import lru_cache, partial, wraps
+from functools import lru_cache, wraps
 from multiprocessing import get_context, shared_memory
 
 import capstone
@@ -150,7 +152,7 @@ def get_logger(name=None):
 
 
 logger = get_logger()
-configure_logging(logger)
+configure_logging(logger, level=logging.DEBUG)
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1023,81 +1025,197 @@ class WorkerController:
 # ─── Standalone worker entrypoint ───────────────────────────────────────────
 
 
+def generate_pipe_name():
+    """Generates a unique, platform-specific pipe name."""
+    pid = os.getpid()
+    # Add a UUID component for extra uniqueness, especially if multiple IDA instances run
+    unique_id = str(uuid.uuid4()).split("-")[0]  # Short UUID part
+    pipe_base = f"ida_worker_pipe_{pid}_{unique_id}"
+    if platform.system() == "Windows":
+        return f"\\\\.\\pipe\\{pipe_base}"
+    else:
+        # Use /tmp or a similar directory for Unix domain sockets
+        # Ensure the path is not too long for socket names
+        tmp_dir = pathlib.Path("/tmp")
+        socket_path = tmp_dir / pipe_base
+        # Basic length check (common limit is around 108 bytes)
+        if len(str(socket_path)) > 100:
+            # Fallback to shorter name if path gets too long
+            pipe_base = f"iwp_{pid}_{unique_id}"
+            socket_path = tmp_dir / pipe_base
+        return str(socket_path)
+
+
 def worker_main():
     p = argparse.ArgumentParser()
     p.add_argument("--shm_name", required=True)
     p.add_argument("--data_size", type=int, required=True)
     p.add_argument("--start_ea", type=lambda x: int(x, 0), required=True)
     p.add_argument("--is64", type=int, default=1)
+    # --- New arguments for connection ---
+    p.add_argument("--pipe-name", required=True, help="Named pipe/socket path for IPC")
+    p.add_argument(
+        "--authkey", required=True, help="Hex-encoded authkey for IPC connection"
+    )
     args = p.parse_args()
 
-    deob = AsyncDeobfuscator(
-        shm_name=args.shm_name,
-        data_size=args.data_size,
-        start_ea=args.start_ea,
-        is_64bit=bool(args.is64),
-    )
+    listener = None
+    conn = None
+    try:
+        authkey_bytes = bytes.fromhex(args.authkey)
+        logger.info(f"Setting up Listener on pipe: {args.pipe_name}")
+        # Ensure the socket file doesn't exist on Unix before listening
+        if platform.system() != "Windows":
+            socket_path = pathlib.Path(args.pipe_name)
+            if socket_path.exists():
+                logger.warning(f"Removing existing socket file: {socket_path}")
+                socket_path.unlink()
 
-    # optional logging
+        listener = multiprocessing.connection.Listener(
+            args.pipe_name, authkey=authkey_bytes
+        )
+        logger.info("Listener created.")
 
-    @deob.on("run_started")
-    def on_run_started():
-        logger.info("▶️  Pipeline starting")
+        # --- Signal IDA that we are ready BEFORE blocking on accept ---
+        print("LISTENER_READY", flush=True)
+        logger.info("Signaled LISTENER_READY to parent. Waiting for connection...")
 
-    @deob.on("stage1_finished")
-    def on_stage1_finished(ch):
-        logger.info(f"✅ Stage1: {len(ch)} stubs")
+        conn = listener.accept()  # Blocks until IDA connects
+        logger.info(f"Connection accepted from: {listener.last_accepted}")
+        listener.close()  # Close listener immediately after accepting one connection
+        listener = None  # Clear listener reference
 
-    @deob.on("stage2_finished")
-    def on_stage2_finished(ch):
-        logger.info(f"✅ Stage2: {len(ch)} junk appended")
+        # --- Deobfuscator and Controller setup (can stay here) ---
+        deob = AsyncDeobfuscator(
+            shm_name=args.shm_name,
+            data_size=args.data_size,
+            start_ea=args.start_ea,
+            is_64bit=bool(args.is64),
+        )
 
-    @deob.on("stage3_finished")
-    def on_stage3_finished(ch):
-        logger.info(f"✅ Stage3: {len(ch)} remaining")
+        @deob.on("run_started")
+        def on_run_started():
+            logger.info("▶️  Pipeline starting")
 
-    @deob.on("stage4_finished")
-    def on_stage4_finished(ch):
-        logger.info(f"✅ Stage4: {len(ch)} final")
+        @deob.on("stage1_finished")
+        def on_stage1_finished(ch):
+            logger.info(f"✅ Stage1: {len(ch)} stubs")
 
-    @deob.on("stopped")
-    def on_stopped():
-        logger.info("🛑 Worker shutting down")
+        @deob.on("stage2_finished")
+        def on_stage2_finished(ch):
+            logger.info(f"✅ Stage2: {len(ch)} junk appended")
 
-    # ——— start in background thread ———
-    ctrl = WorkerController(deob)
-    ctrl.start()
+        @deob.on("stage3_finished")
+        def on_stage3_finished(ch):
+            logger.info(f"✅ Stage3: {len(ch)} remaining")
 
-    # ——— command loop ———
-    # This will block until IDA sends an "exit", "pause", or "resume" line.
-    for line in sys.stdin:
-        cmd = line.strip().lower()
-        if cmd == "pause":
-            ctrl.pause()
-        elif cmd == "resume":
-            ctrl.resume()
-        elif cmd in ("stop", "exit", "shutdown"):
-            ctrl.stop()
-            break
-        # you can also respond to "ping" if you want:
-        elif cmd == "ping":
-            logger.info("pong")
+        @deob.on("stage4_finished")
+        def on_stage4_finished(ch):
+            logger.info(f"✅ Stage4: {len(ch)} final")
 
-    # wait for the pipeline to complete
-    results = ctrl.join()
+        @deob.on("stopped")
+        def on_stopped():
+            logger.info("🛑 Worker shutting down")
 
-    out = [
-        {
-            "offset": c.overall_start() - args.start_ea,
-            "length": c.overall_length(),
-            "description": c.segments[0].description,
-        }
-        for c in results
-    ]
+        ctrl = WorkerController(deob)
+        # --- End Deobfuscator/Controller ---
 
-    logger.info("results_start")
-    logger.info(json.dumps(out))
-    logger.info("results_end")
+        # ——— command loop using the connection object ———
+        logger.info("Starting command loop (reading from connection)...")
+        while True:
+            try:
+                logger.info("waiting for command via connection.recv()...")
+                cmd = conn.recv()  # Blocks here, receives pickled object
+                logger.info(f"← Received raw command obj: {cmd}")
+                # Commands should be sent as strings
+                if not isinstance(cmd, str):
+                    logger.warning(f"Received non-string command: {type(cmd)} - {cmd}")
+                    continue
+
+                cmd_processed = cmd.strip().lower()
+                logger.info(f"← Processed command: {cmd_processed}")
+
+                if cmd_processed in ("stop", "exit", "shutdown"):
+                    logger.info("Received exit command.")
+                    ctrl.stop()  # Tell the controller to stop the pipeline
+                    break  # Exit the command loop
+                elif cmd_processed == "ping":
+                    logger.info("pong")
+                    # Optional: Send pong back? conn.send("pong_ack")
+                elif cmd_processed == "pause":
+                    ctrl.pause()
+                elif cmd_processed == "resume":
+                    ctrl.resume()
+                elif cmd_processed == "start":
+                    ctrl.start()
+                else:
+                    logger.warning(f"Unknown command received: {cmd}")
+
+            except EOFError:
+                logger.error(
+                    "EOFError on connection recv. Connection closed by parent."
+                )
+                ctrl.stop()  # Ensure pipeline stops if connection breaks
+                break
+            except Exception as e:
+                logger.error(f"Error processing command: {e}", exc_info=True)
+                # Decide whether to break or continue on other errors
+
+        logger.info("Exited command loop.")
+
+        # wait for the pipeline to complete
+        logger.info("Waiting for pipeline to finish...")
+        results = ctrl.join()
+        logger.info("Pipeline finished.")
+
+        # --- Print results to stdout for IDA ---
+        if results:
+            out = [
+                {
+                    "offset": c.overall_start() - args.start_ea,
+                    "length": c.overall_length(),
+                    "description": c.segments[0].description,
+                }
+                for c in results
+            ]
+            logger.info("results_start")
+            print("results_start", flush=True)  # Also print sentinel to stdout
+            print(json.dumps(out), flush=True)
+            print("results_end", flush=True)
+            logger.info("results_end")
+        else:
+            logger.info("No results generated by pipeline.")
+
+    except Exception as e:
+        logger.error(f"Unhandled exception in worker_main: {e}", exc_info=True)
+    finally:
+        if conn:
+            try:
+                logger.info("Closing worker-side connection.")
+                conn.close()
+            except Exception as e_close:
+                logger.error(f"Error closing connection: {e_close}")
+        if (
+            listener
+        ):  # Should be None if accept succeeded, but handle potential error case
+            try:
+                logger.warning("Closing listener (should have been closed earlier).")
+                listener.close()
+            except Exception as e_close_listener:
+                logger.error(f"Error closing listener: {e_close_listener}")
+        # Clean up socket file on Unix
+        if platform.system() != "Windows":
+            socket_path = pathlib.Path(args.pipe_name)
+            if socket_path.exists():
+                try:
+                    logger.info(f"Removing socket file: {socket_path}")
+                    socket_path.unlink()
+                except Exception as e_unlink:
+                    logger.error(
+                        f"Error removing socket file {socket_path}: {e_unlink}"
+                    )
+
+        logger.info("Worker finished.")
 
 
 # ─── IDA plugin entrypoint is no longer needed for console mode ─────────────
@@ -1244,20 +1362,31 @@ if is_ida():
             self.errorOccurred.connect(self._on_error)
             self.stateChanged.connect(self._on_state_changed)
             self.python_interpreter = MultiprocessingHelper.get_python_interpreter()
+            # --- Connection attributes ---
+            self.pipe_name = None
+            self.authkey = None
+            self.client_connection = None
+            self.listener_ready = False  # Flag to indicate worker is ready
+
+        @property
+        def cmd_queue(self):
+            return self.cmd_manager.get_cmd_queue() if self.cmd_manager else None
 
         def is_not_running(self):
             return self.state() == QtCore.QProcess.NotRunning
 
         def launch_worker(self, start_ea: int, shm_name: str, data_size: int):
-            """
-            Starts the worker script, passing shared memory details as arguments.
+            """Starts the worker script, passing connection details."""
+            # --- Generate connection details ---
+            self.pipe_name = generate_pipe_name()
+            self.authkey = os.urandom(32)  # Use a reasonably strong key
+            self.client_connection = None  # Reset connection state
+            self.listener_ready = False
 
-            :param worker_script_path: Path to the worker script.
-            :param shm_name: Name of the shared memory segment.
-            :param data_size: Size of the data in the shared memory segment.
-            :raises FileNotFoundError: If the worker script does not exist.
-            :raises RuntimeError: If the Python interpreter is not found or executable, or process fails to start.
-            """
+            logger.info(f"Generated Pipe Name: {self.pipe_name}")
+            logger.info(f"Generated Authkey: {self.authkey.hex()}")
+
+            # --- Prepare QProcess ---
             env = QProcessEnvironment.systemEnvironment()
             env.insert("PYTHON_PATH", str(self.python_interpreter.parent))
             env.insert("PYTHON_BIN", str(self.python_interpreter.name))
@@ -1274,68 +1403,177 @@ if is_ida():
                 hex(start_ea),
                 "--is64",
                 "1" if is_x64 else "0",
+                # --- Pass connection details ---
+                "--pipe-name",
+                self.pipe_name,
+                "--authkey",
+                self.authkey.hex(),
             ]
 
             logger.info(f"Starting worker process: {self.python_interpreter} {args}")
             self.start(str(self.python_interpreter), args)
+            if not self.waitForStarted(5000):
+                logger.error(f"Worker process failed to start: {self.errorString()}")
+                # Clean up pipe file if on Unix and it exists?
+                if platform.system() != "Windows":
+                    socket_path = pathlib.Path(self.pipe_name)
+                    if socket_path.exists():
+                        socket_path.unlink()
+                return False
 
-            return self.waitForStarted(5000)
+            # Don't try to connect here, wait for LISTENER_READY in _on_stdout
+            logger.info("Worker process started. Waiting for LISTENER_READY signal...")
+            return True  # Indicates process started, connection pending
 
         def stop_worker(self):
             """Attempts to terminate the worker process gracefully, then kills."""
-            if self.is_not_running():
-                logger.debug("Worker process was already stopped.")
+            if self.is_not_running() and not self.client_connection:
+                logger.debug(
+                    "Worker process was already stopped and connection closed."
+                )
                 return
 
-            logger.info("Attempting to terminate worker process...")
-            # Send 'exit' command first to allow graceful cleanup in worker
-            self.send_command("exit")
-            # Give worker a moment to process 'exit' command
-            if self.waitForFinished(1000):
-                logger.info("Worker process exited gracefully after 'exit' command.")
-                return  # Worker exited
+            logger.info("Attempting to stop worker process...")
 
-            logger.warning(
-                "Worker did not exit after 'exit' command, attempting terminate."
-            )
-            self.terminate()  # Send SIGTERM or similar
-            if not self.waitForFinished(2000):  # Wait up to 2 seconds
-                logger.warning("Worker did not terminate gracefully, killing process.")
-                self.kill()  # Send SIGKILL or similar
-                if not self.waitForFinished(1000):
-                    logger.error("Worker process did not respond to kill.")
-            logger.info("Worker process stopped.")
+            # 1. Close the client-side connection first
+            if self.client_connection:
+                logger.info("Closing client-side IPC connection.")
+                try:
+                    # Optionally send "exit" command first if worker handles it gracefully
+                    if self.state() == QtCore.QProcess.Running:
+                        logger.info("Sending 'exit' command over IPC connection.")
+                        self.client_connection.send("exit")
+                    self.client_connection.close()
+                except Exception as e:
+                    logger.error(f"Error closing client connection: {e}")
+                finally:
+                    self.client_connection = None
+                    self.listener_ready = False  # Reset flag
+
+            # 2. If process is still running, wait for it to finish or terminate
+            if not self.is_not_running():
+                # Give worker a moment to process 'exit' command if sent
+                if self.waitForFinished(1000):
+                    logger.info(
+                        "Worker process exited gracefully after closing connection/sending exit."
+                    )
+                    return  # Worker exited
+
+                logger.warning(
+                    "Worker did not exit gracefully after closing connection, attempting QProcess terminate."
+                )
+                self.terminate()
+                if not self.waitForFinished(2000):
+                    logger.warning(
+                        "Worker did not terminate gracefully, killing process."
+                    )
+                    self.kill()
+                    if not self.waitForFinished(1000):
+                        logger.error("Worker process failed to stop even after kill().")
+
+            # 3. Clean up socket file on Unix if it still exists
+            if platform.system() != "Windows":
+                socket_path = pathlib.Path(self.pipe_name)
+                if socket_path.exists():
+                    try:
+                        logger.info(f"Cleaning up socket file: {socket_path}")
+                        socket_path.unlink()
+                    except Exception as e_unlink:
+                        logger.error(
+                            f"Error removing socket file {socket_path}: {e_unlink}"
+                        )
+
+            logger.info("Worker process stop sequence complete.")
 
         def send_command(self, command: str):
-            """
-            Sends a command string to the worker process's stdin.
-            Appends a newline to delimit commands.
-
-            :param command: The command string to send (e.g., "process", "ping", "exit").
-            """
-            if self.state() == QtCore.QProcess.Running:
-                data = (command + "\n").encode("utf-8")
-                self.write(data)
-                logger.debug(f"→ Sent command: {command}")
-            else:
+            """Sends a command object via the client connection."""
+            if not self.client_connection:
                 logger.warning(
-                    f"Attempted to send command '{command}' but worker is not running (State: {self.state()})."
+                    f"Cannot send command '{command}', IPC connection not established or closed."
                 )
+                if not self.listener_ready and self.state() == QtCore.QProcess.Running:
+                    logger.warning("Worker listener might not be ready yet.")
+                elif self.state() != QtCore.QProcess.Running:
+                    logger.warning("Worker process is not running.")
+                return
+
+            logger.debug(f"→ Sending command via connection: {command}")
+            try:
+                self.client_connection.send(command)  # Sends pickled object
+                logger.debug(f"→ Successfully sent command: {command}")
+            except Exception as e:
+                # Handle broken pipe errors, etc.
+                logger.error(f"Failed to send command '{command}' via connection: {e}")
+                # Consider closing the connection here if it's broken
+                try:
+                    self.client_connection.close()
+                except Exception:
+                    pass
+                self.client_connection = None
+                self.listener_ready = False
 
         def _on_stdout(self):
-            """Reads data from worker's stdout, processes line by line or collects results."""
-            # Convert QByteArray to Python bytes
-            out = self.readAllStandardOutput().data().decode("utf-8")
-            # we use print() here b/c we want the log without the logger prefix
-            # from the parent process
-            print(out.strip(), flush=True)
-            m = re.search(r"results_start\n(.+?)\nresults_end", out, re.DOTALL)
-            if not m:
-                self.processing_results.emit([])
+            """Reads worker stdout, primarily looking for LISTENER_READY signal."""
+            out_bytes = self.readAllStandardOutput()
+            if not out_bytes:
                 return
-            results = json.loads(m.group(1))
-            results.append("results-ready")
-            self.processing_results.emit(results)
+            out = out_bytes.data().decode("utf-8", errors="replace")
+
+            processed_stdout = ""  # Accumulate non-signal output
+            listener_ready_found = False
+
+            for line in out.splitlines():
+                if line.strip() == "LISTENER_READY":
+                    if not self.client_connection and not self.listener_ready:
+                        logger.info("Received LISTENER_READY signal from worker.")
+                        listener_ready_found = True
+                    elif self.listener_ready:
+                        logger.warning("Received duplicate LISTENER_READY signal.")
+                    # else: connection already exists? should not happen ideally
+                elif line.strip().startswith("results_start"):
+                    # Handle results block separately if needed or let it pass through
+                    processed_stdout += line + "\n"
+                elif line.strip().startswith("results_end"):
+                    processed_stdout += line + "\n"
+                else:
+                    # Accumulate other output
+                    processed_stdout += line + "\n"
+
+            # Print accumulated non-signal output
+            if processed_stdout.strip():
+                print(processed_stdout.strip(), flush=True)
+
+            # Attempt connection if signal received and not already connected
+            if listener_ready_found:
+                logger.info(f"Attempting to connect to pipe: {self.pipe_name}")
+                try:
+                    self.client_connection = multiprocessing.connection.Client(
+                        self.pipe_name, authkey=self.authkey
+                    )
+                    self.listener_ready = True  # Set flag *after* successful connection
+                    logger.info("Successfully connected to worker IPC pipe.")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to connect to worker pipe '{self.pipe_name}': {e}",
+                        exc_info=True,
+                    )
+                    self.stop_worker()
+
+            # --- Results parsing (can stay the same, operates on the full 'out') ---
+            m = re.search(r"results_start\n(.*?)results_end", out, re.DOTALL | re.S)
+            if m:
+                results_json = m.group(1).strip()
+                try:
+                    results = json.loads(results_json)
+                    results.append("results-ready")
+                    self.processing_results.emit(results)
+                    logger.info("Emitted processing_results.")
+                except json.JSONDecodeError as e:
+                    logger.error(
+                        f"Failed to decode JSON results from worker stdout: {e}"
+                    )
+                    logger.error(f"Invalid JSON content: {results_json}")
+                    self.processing_results.emit(["error-decoding-json"])
 
         def _on_stderr(self):
             """Reads and logs data from the worker's standard error."""
@@ -1423,13 +1661,19 @@ if is_ida():
             logger.info("Terminated.")
 
         def pause(self):
-            self.send_command("pause")
+            self.proc.send_command("pause")
 
         def resume(self):
-            self.send_command("resume")
+            self.proc.send_command("resume")
 
         def stop(self):
-            self.send_command("stop")
+            self.proc.send_command("stop")
+
+        def start(self):
+            self.proc.send_command("start")
+
+        def ping(self):
+            self.proc.send_command("ping")
 
         @staticmethod
         def get_section_data(
@@ -1476,13 +1720,13 @@ if is_ida():
                 logger.info(f"Received plugin arg: {plugin_arg}")
 
             data_size = len(bytes_to_process)
-            # 2) create shared memory & copy
+            # create shared memory & copy
             self._shared_memory = shared_memory.SharedMemory(
                 create=True, size=data_size
             )
             self._shared_memory.buf[:data_size] = bytes_to_process
 
-            # 3) launch worker
+            # launch worker
             self.proc = WorkerLauncher()
             self.proc.status_message.connect(self._handle_worker_status)
             self.proc.processing_results.connect(self._handle_worker_results)

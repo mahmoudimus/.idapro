@@ -1683,5 +1683,5 @@ if __name__ == "__main__":
         decrypt=True,
         reanalyze=False,
         patch_mode=PatchManager.Mode.PUT,
-        dry_run=True,
+        dry_run=False,
     )
