@@ -692,7 +692,12 @@ class NumLengthProcessor:
     name = "NumLengthProcessor"
 
     def signatures(self):
-        return [BytePattern("33 D2 48 8B 5C 24")]
+        return [
+            BytePattern("33 D2 48 8B 5C 24"),
+            BytePattern("33 D2 48 ? ? 24"),
+            BytePattern("8B B4 24 ? ? ? ? 33 D2 48 ? ? 24"),
+            BytePattern("8B B4 24 ? ? ? ? 33 D2 48 ? ? 24"),
+        ]
 
     def is_valid(self, x):
         return isinstance(x, int) and 0x1E <= x < 0x100
@@ -1591,11 +1596,11 @@ def execute(
 
     validated = False
     for result in decryption_results[".text"]:
-        if (validated := validate_decrypted_data(result["decrypted"])):
+        if validated := validate_decrypted_data(result["decrypted"]):
             break
 
     if not validated:
-        logger.error("[!] Decryption did not succeed.")
+        logger.error("[!] Could not validate decrypted data.")
         return
 
     logger.info("[+] Decryption succeeded!")
