@@ -15,6 +15,7 @@ import stat
 import struct
 import sys
 import threading
+import time
 import typing
 import warnings
 from collections import defaultdict
@@ -829,6 +830,33 @@ def resolve_overlaps(chains):
     return final
 
 
+def log_execution_time(func, loglvl=logging.INFO):
+    """
+    Decorator to log the execution time of async stage methods.
+
+    >>> import asyncio, logging
+    >>> logging.basicConfig(level=logging.INFO)
+    >>> class Dummy:
+    ...     @log_execution_time
+    ...     async def foo(self):
+    ...         await asyncio.sleep(0.01)
+    ...         return 42
+    >>> d = Dummy()
+    >>> asyncio.run(d.foo())
+    42
+    """
+
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = await func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        logger.log(loglvl, f"{func.__qualname__} executed in {elapsed:.4f} seconds")
+        return result
+
+    return wrapper
+
+
 # ─── Async deobfuscator ───────────────────────────────────
 
 
@@ -866,6 +894,7 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         finally:
             shm.close()
 
+    @log_execution_time
     async def stage1(self):
         await self.emit("stage1_started")
         async with self._get_buffer() as buf:
@@ -876,6 +905,7 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         await self.emit("stage1_finished", chains)
         return chains
 
+    @log_execution_time
     async def stage2(self, chains: typing.List[MatchChain]) -> typing.List[MatchChain]:
         await self.emit("stage2_started")
 
@@ -902,12 +932,14 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         await self.emit("stage2_finished", updated)
         return updated
 
+    @log_execution_time
     async def stage3(self, chains):
         await self.emit("stage3_started")
         filtered = stage3_filter(chains)
         await self.emit("stage3_finished", filtered)
         return filtered
 
+    @log_execution_time
     async def stage4(self, chains):
         await self.emit("stage4_started")
 
@@ -935,6 +967,7 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         await self.emit("stage4_finished", final)
         return final
 
+    @log_execution_time
     async def run(self):
         await self.emit("run_started")
         s1 = await self.stage1()
@@ -968,17 +1001,17 @@ class WorkerController:
 
     def pause(self):
         """Pause after finishing the current iteration."""
-        print("▶️  Pausing…", flush=True)
+        logger.info("▶️  Pausing...")
         self.loop.call_soon_threadsafe(self.deob.pause_evt.set)
 
     def resume(self):
         """Resume if previously paused."""
-        print("▶️  Resuming…", flush=True)
+        logger.info("▶️  Resuming...")
         self.loop.call_soon_threadsafe(self.deob.pause_evt.clear)
 
     def stop(self):
         """Stop the pipeline as soon as possible."""
-        print("🛑  Stopping…", flush=True)
+        logger.info("🛑  Stopping...")
         self.loop.call_soon_threadsafe(self.deob.stop_evt.set)
 
     def join(self):
@@ -1017,7 +1050,7 @@ def worker_main():
 
     @deob.on("stage2_finished")
     def on_stage2_finished(ch):
-        logger.info(f"✅ Stage2: junk appended")
+        logger.info(f"✅ Stage2: {len(ch)} junk appended")
 
     @deob.on("stage3_finished")
     def on_stage3_finished(ch):
@@ -1065,7 +1098,6 @@ def worker_main():
     logger.info("results_start")
     logger.info(json.dumps(out))
     logger.info("results_end")
-
 
 
 # ─── IDA plugin entrypoint is no longer needed for console mode ─────────────
@@ -1294,7 +1326,9 @@ if is_ida():
             """Reads data from worker's stdout, processes line by line or collects results."""
             # Convert QByteArray to Python bytes
             out = self.readAllStandardOutput().data().decode("utf-8")
-            logger.info(f"Worker stdout: {out}")
+            # we use print() here b/c we want the log without the logger prefix
+            # from the parent process
+            print(out.strip(), flush=True)
             m = re.search(r"results_start\n(.+?)\nresults_end", out, re.DOTALL)
             if not m:
                 self.processing_results.emit([])
@@ -1309,7 +1343,9 @@ if is_ida():
             data = self.readAllStandardError().data()
             if data:
                 data = data.decode("utf-8", errors="replace").strip()
-                logger.warning(f"Worker stderr: {data}")
+                # we use print() here b/c we want the log without the logger prefix
+                # from the parent process
+                print(data.strip(), file=sys.stderr, flush=True)
 
         def _on_error(self, error: QtCore.QProcess.ProcessError):
             """Logs process errors and emits a signal."""
@@ -1323,7 +1359,9 @@ if is_ida():
             }
             error_str = error_map.get(error, f"UnknownError({error})")
             msg = f"Worker process error: {error_str} - {self.errorString()}"
-            logger.error(msg)
+            # we use print() here b/c we want the log without the logger prefix
+            # from the parent process
+            print(msg.strip(), file=sys.stderr, flush=True)
             self.error_occurred_msg.emit(msg)
 
         def _on_state_changed(self, state: QtCore.QProcess.ProcessState):

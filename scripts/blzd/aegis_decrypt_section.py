@@ -936,24 +936,26 @@ def get_garbage_blobs():
         BytePattern("48 8D ? ? ? 0A 00"),
         BytePattern("4C 8D ? ? ? 0A 00"),
     ]
-
+    _EMPTY_SET = set()
     found = False
-    for sig in blob_stage1:
+    for sig in blob_stage1 if not found else _EMPTY_SET:
         for ea in ByteSequenceFinder(text_seg, pattern=sig):
-            yield idc.get_operand_value(ea, 1)
+            if found:
+                return
+            glob1 = idautils.DecodeInstruction(ea)
             for followup_sig in blob_stage2:
                 # these sigs should be *very* close, less than 0x30 bytes apart
                 for followup_ea in ByteSequenceFinder(
-                    ea, max_distance=0x30, pattern=followup_sig
+                    glob1.ea, max_distance=0x30, pattern=followup_sig
                 ):
-                    yield idc.get_operand_value(followup_ea, 1)
+                    glob2 = idautils.DecodeInstruction(followup_ea)
+                    yield glob1.Op2.addr
+                    yield glob2.Op2.addr
                     found = True
-                    break
-            if found:
-                break
-    if found:
-        return
 
+    # fallback searches..if IDA has not done analysis,
+    # then xrefs will not work.
+    xref = None
     for xref in idautils.XrefsTo(text_seg.start_ea):
         ea = xref.frm
         if idc.get_segm_name(ea) != ".text":
@@ -964,6 +966,7 @@ def get_garbage_blobs():
 
     if not xref:
         raise StopIteration
+
     ea = xref.frm
     prev_addr = idc.prev_head(ea)
     next_addr = idc.next_head(ea)
@@ -1405,8 +1408,13 @@ class RC4PEDecryptor:
                 tls_start = self.tls_region.get("start", 0)
                 tls_end = self.tls_region.get("end", 0)
                 decrypt_addr = section_start + offset
-
                 if tls_start == 0 or (tls_start <= decrypt_addr < tls_end):
+                    logger.debug(
+                        "[+] Skipping TLS region at 0x%X (tls_start: 0x%X, tls_end: 0x%X)",
+                        decrypt_addr,
+                        tls_start,
+                        tls_end,
+                    )
                     continue
 
                 memory_offset = section_va + offset
@@ -1553,7 +1561,7 @@ def decrypt_pe_file(
         sections_to_decrypt=sections_to_decrypt,
         tls_region=tls_region,
         multipage_relocs=multipage_relocs,
-        max_pages=max_pages,
+        max_pages=None,
     )
     results = decryptor.decrypt()
     return results
@@ -1573,6 +1581,15 @@ def execute(
     if not tls_data:
         logger.error("[!] tls data offset not found")
         return
+    logger.info("AEGIS tls region is between the following garbage blobs:")
+    logger.info("g_bufInitBlob0 starts at: %s", hex(tls_data[0]))
+    logger.info("g_bufInitBlob12 starts at: %s", hex(tls_data[1]))
+    dump_key(
+        key_addr=key_addr,
+        num_keys=num_keys,
+        per_key_length=per_key_length,
+        output_file=pathlib.Path("g_bufCryptKey.json"),
+    )
 
     decryption_results = None
 
@@ -1605,12 +1622,6 @@ def execute(
 
     logger.info("[+] Decryption succeeded!")
     patch_manager.apply_all()
-    dump_key(
-        key_addr=key_addr,
-        num_keys=num_keys,
-        per_key_length=per_key_length,
-        output_file=pathlib.Path("g_bufCryptKey.json"),
-    )
     if reanalyze and not dry_run:
         re_analyze(
             decryption_results,
@@ -1670,7 +1681,7 @@ if __name__ == "__main__":
     configure_logging(log=logger)
     execute(
         decrypt=True,
-        reanalyze=True,
+        reanalyze=False,
         patch_mode=PatchManager.Mode.PUT,
-        dry_run=False,
+        dry_run=True,
     )
