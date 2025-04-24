@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # anti_deob.py
-
 import argparse
 import asyncio
 import atexit
@@ -11,7 +10,9 @@ import math
 import multiprocessing
 import os
 import pathlib
+import re
 import stat
+import struct
 import sys
 import threading
 import typing
@@ -36,6 +37,45 @@ warnings.filterwarnings(
         r"sipPyTypeDictRef\(\) instead"
     ),
 )
+
+
+def humanize_bytes(
+    num_bytes: int, precision: int = 2, units: list[str] = ["B", "KB", "MB", "GB"]
+) -> str:
+    """
+    Convert a byte count into a human-friendly string with units.
+
+    Args:
+        num_bytes (int): The number of bytes.
+        precision (int): Number of decimal places for non-integer values.
+
+    Returns:
+        str: Human-readable string, e.g. '10 MB', '1.23 GB', '512 B'.
+
+    Examples:
+        >>> humanize_bytes(10 * 1024 * 1024)
+        '10 MB'
+        >>> humanize_bytes(1536)
+        '1.5 KB'
+        >>> humanize_bytes(0)
+        '0 B'
+        >>> humanize_bytes(123456789)
+        '117.74 MB'
+    """
+
+    if num_bytes < 0:
+        raise ValueError("num_bytes must be non-negative")
+    if num_bytes == 0:
+        return "0 B"
+    idx = 0
+    value = float(num_bytes)
+    while value >= 1024 and idx < len(units) - 1:
+        value /= 1024
+        idx += 1
+    if value.is_integer():
+        return f"{int(value)} {units[idx]}"
+    else:
+        return f"{value:.{precision}f} {units[idx]}"
 
 
 def is_ida():
@@ -65,9 +105,15 @@ def is_ida():
     #     return False
 
 
+# on windows, we need to set the encoding to utf-8 because it defaults to cp1252
+# which does not support the emoji characters used in the logging
+# or really any non-ascii characters
 if not is_ida():
+    # this works in non IDA and for python 3.7+
     sys.stdout.reconfigure(encoding="utf-8")
 else:
+    # IDA wraps sys.stdout and does not expose the `reconfigure` method
+    # so we need to set the encoding manually
     sys.stdout.encoding = "utf-8"
 
 
@@ -75,12 +121,12 @@ def configure_logging(
     log,
     level=logging.INFO,
     handler_filters=None,
-    fmt_str="[%(levelname)s] @ %(asctime)s %(message)s",
+    fmt_str="[%(name)s:%(levelname)s:%(process)d:%(threadName)s] @ %(asctime)s %(message)s",
 ):
     log.propagate = False
     log.setLevel(level)
     formatter = logging.Formatter(fmt_str)
-    handler = logging.StreamHandler()
+    handler = logging.StreamHandler(stream=sys.stdout)
     handler.setFormatter(formatter)
     handler.setLevel(level)
 
@@ -98,7 +144,7 @@ def configure_logging(
 
 
 def get_logger(name=None):
-    name = name or f"{"ida_" if is_ida() else "worker_"}{__name__}"
+    name = name or f"{"ida." if is_ida() else "worker."}{__name__}"
     return logging.getLogger(name)
 
 
@@ -150,9 +196,35 @@ class EventEmitter:
         return defaultdict(set)
 
     def on(self, event, handler=None):
-        if handler is None:
-            return partial(self.on, event)
-        self._listeners[event].add(handler)
+        """
+        Register an event handler for the given event.
+
+        If handler is provided, it is registered directly.
+        If handler is None, returns a decorator that can be used to register a function.
+
+        The decorator can be wrapped with @wraps, but since it is not wrapping any
+        specific function (just passing through), it is not strictly necessary.
+        However, for consistency and to preserve metadata, we can use @wraps.
+
+        >>> emitter = EventEmitter()
+        >>> called = []
+        >>> @emitter.on('foo')
+        ... def handler():
+        ...     called.append(1)
+        >>> emitter.emit('foo')
+        >>> called
+        [1]
+        """
+        if handler:
+            self._listeners[event].add(handler)
+            return handler
+
+        @wraps(self.on)
+        def decorator(func):
+            self.on(event, func)
+            return func
+
+        return decorator
 
     def once(self, event, handler):
         @wraps(handler)
@@ -168,6 +240,30 @@ class EventEmitter:
     def emit(self, event, *args, **kwargs):
         for handler in self._listeners[event]:
             handler(*args, **kwargs)
+
+
+@dataclass
+class AsyncEventEmitter:
+    def __post_init__(self):
+        self._listeners = defaultdict(set)
+
+    def on(self, event, handler=None):
+        if handler:
+            self._listeners[event].add(handler)
+            return handler
+
+        @wraps(self.on)
+        def decorator(func):
+            self.on(event, func)
+            return func
+
+        return decorator
+
+    async def emit(self, event, *args):
+        for h in self._listeners.get(event, []):
+            res = h(*args)
+            if asyncio.iscoroutine(res):
+                await res
 
 
 class MultiprocessingHelper:
@@ -304,22 +400,42 @@ class MatchChain:
         return f"<Chain {self.segments[0].description if self.segments else ''} @0x{self.overall_start():X} len={self.overall_length()}>"
 
 
+# TODO: inherit from list?
+class MatchChains:
+    def __init__(self):
+        self.chains: list[MatchChain] = []
+
+    def add_chain(self, chain: MatchChain):
+        self.chains.append(chain)
+
+    def __iter__(self):
+        return iter(self.chains)
+
+    def sort(self):
+        self.chains.sort(key=lambda x: x.overall_start())
+
+    def __len__(self):
+        return len(self.chains)
+
+    def __repr__(self):
+        lines = []
+        for c in self.chains:
+            desc = c.segments[0].description
+            off = c.overall_start()
+            bhex = c.overall_matched_bytes().hex()[:16]
+            tail = "…" if c.overall_length() > 16 else ""
+            lines.append(f"{desc.rjust(32)} @0x{off:X} {bhex}{tail}")
+        return "\n".join(lines)
+
+
 # fmt: off
-import re
-import struct
-
-# --- Reusable Padding Pattern ---
-# First, define the raw padding pattern without capturing groups.
 PADDING_PATTERN = rb"(?:\xC0[\xE0-\xFF]\x00|(?:\x86|\x8A)[\xC0\xC9\xD2\xDB\xE4\xED\xF6\xFF])"
-# (We do not wrap this in a named group here so that we can reuse it inside other groups.)
 
-# --- Enum for Pattern Categories ---
 class PatternCategory(Enum):
     MULTI_PART = auto()
     SINGLE_PART = auto()
     JUNK = auto()
 
-# --- Dataclass for Regex Pattern Metadata ---
 @dataclass
 class RegexPatternMetadata:
     category: PatternCategory
@@ -448,93 +564,6 @@ JUNK_PATTERNS = [
 # fmt: on
 
 
-# def find_stage1(mem_bytes: bytes, ea: int) -> MatchChains:
-#     logger.info("Searching for stage1 patterns from 0x{:X}".format(ea))
-
-#     # Combine all patterns, keeping your original format
-#     patterns = [
-#         (
-#             MULTI_PART_PATTERNS,
-#             "Multi-Part Conditional Jumps",
-#             SegmentType.STAGE1_MULTIPLE,
-#         ),
-#         (
-#             SINGLE_PART_PATTERNS,
-#             "Single-Part Conditional Jumps",
-#             SegmentType.STAGE1_SINGLE,
-#         ),
-#     ]
-
-#     all_chains = MatchChains()
-#     for pattern_group, desc, segment_type in patterns:
-#         if not isinstance(pattern_group, list):
-#             pattern_group = [pattern_group]
-
-#         for pattern in pattern_group:
-#             for m in re.finditer(pattern.compile(), mem_bytes):
-#                 match_len = m.end() - m.start()
-#                 matched_bytes = mem_bytes[m.start() : m.end()]
-#                 matched_groups = {
-#                     k: f"{v.hex()}" for k, v in m.groupdict().items() if k != "padding"
-#                 }
-#                 if "jump" in matched_groups:
-#                     offset = struct.unpack("<b", matched_bytes[-1:].view)[0]
-#                     target = ea + m.start() + match_len + offset
-#                     matched_groups["target"] = hex(target)
-#                 elif "first_jump" in matched_groups:
-#                     offset = struct.unpack("<b", matched_bytes[1:2].view)[0]
-#                     matched_groups["first_target"] = hex(ea + m.start() + 2 + offset)
-#                     offset = struct.unpack("<b", matched_bytes[-1:].view)[0]
-#                     target = ea + m.start() + match_len + offset
-#                     matched_groups["second_target"] = hex(target)
-#                 all_chains.add_chain(
-#                     MatchChain(
-#                         base_address=ea,
-#                         segments=[
-#                             MatchSegment(
-#                                 start=m.start(),
-#                                 length=match_len,
-#                                 description=desc,
-#                                 matched_bytes=matched_bytes,
-#                                 segment_type=segment_type,
-#                                 matched_groups=matched_groups,
-#                             )
-#                         ],
-#                     )
-#                 )
-#     all_chains.sort()
-#     logger.info(f"Phase 1: Found {len(all_chains)} stage1 chains")
-#     return all_chains
-
-
-class MatchChains:
-    def __init__(self):
-        self.chains: list[MatchChain] = []
-
-    def add_chain(self, chain: MatchChain):
-        self.chains.append(chain)
-
-    def __iter__(self):
-        return iter(self.chains)
-
-    def sort(self):
-        self.chains.sort(key=lambda x: x.overall_start())
-
-    def __len__(self):
-        return len(self.chains)
-
-    def __repr__(self):
-        lines = []
-        for c in self.chains:
-            desc = c.segments[0].description
-            off = c.overall_start()
-            bhex = c.overall_matched_bytes().hex()[:16]
-            tail = "…" if c.overall_length() > 16 else ""
-            lines.append(f"{desc.rjust(32)} @0x{off:X} {bhex}{tail}")
-        return "\n".join(lines)
-
-
-# ─── Top-level scan function (picklable) ───────────────────────────────
 def _stage1_scan_one(job):
     """
     job = (pattern_bytes, description, segment_type, base_ea, buf)
@@ -580,10 +609,9 @@ def _stage1_scan_one(job):
     return hits
 
 
-# ─── Revised Stage1 entrypoint ─────────────────────────────────────────
 def stage1_find_patterns(buf: bytes, base_ea: int):
     """
-    Regex-based Stage 1 (parallel). Returns List[MatchChain].
+    Parallel regex-based Stage 1. Returns List[MatchChain].
     """
     jobs = [
         (
@@ -610,7 +638,7 @@ def stage1_find_patterns(buf: bytes, base_ea: int):
     return out
 
 
-# ─── Stage 2: peel off junk via Capstone ────────────────────────────────────
+# ─── Stage 2: peel off junk via Capstone ────────────────────────────────────
 
 
 def peel_junk(buf: bytes, is_64: bool) -> int:
@@ -692,48 +720,40 @@ def _stage2_worker(
     return out
 
 
-# ─── Stage 3: filter ────────────────────────────────────────────────────────
+# ─── Stage 3: filter ────────────────────────────────────────────────────────
 
 
-def stage3_filter(chains):
+def stage3_filter(chains, min_length=12, max_length=129):
     return [
-        c for c in chains if 12 <= c.overall_length() <= 129 and c.junk_length() > 0
+        c
+        for c in chains
+        if min_length <= c.overall_length() <= max_length and c.junk_length() > 0
     ]
 
 
-# ─── Stage 4: jump-chain + big-instr + overlap ──────────────────────────────
+# ─── Stage 4: jump-chain + big-instr + overlap ──────────────────────────────
 
 
-def _stage4_validate_chain(args):
-    """
-    Top-level helper for Stage 4 so it can be pickled.
-    args = (chain, buf, base, block_end, is_64)
-    Returns either the updated chain or None.
-    """
-    chain, buf, base, block_end, is_64 = args
-
-    # 1) follow jump chain
-    exit_ea = follow_jump_chain(buf, base, chain.overall_start(), block_end, is_64)
-    off = exit_ea - base - 6
-    if off < 0:
-        return None
-
-    # 2) detect big instruction + junk after
-    bi = find_big_instruction(buf[off : off + 6], is_64)
-    if not bi:
-        return None
-
-    # 3) append that segment
-    chain.add_segment(
-        MatchSegment(
-            start=off,
-            length=6 + len(bi["junk_after"]),
-            description=bi["type"],
-            matched_bytes=buf[off : off + 6] + bi["junk_after"],
-            segment_type=SegmentType.BIG_INSTRUCTION,
-        )
+def find_big_instruction(buf6: bytes, is_64: bool):
+    md = capstone.Cs(
+        capstone.CS_ARCH_X86, capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32
     )
-    return chain
+    md.detail = True
+    for pos in range(len(buf6)):
+        insns = list(md.disasm(buf6[pos:], 0, count=1))
+        if not insns:
+            continue
+        insn = insns[0]
+        sz = insn.size
+        if 2 <= sz <= 6:
+            return {
+                "type": f"{sz}-byte",
+                "bytes": insn.bytes,
+                "position": pos,
+                "junk_before": buf6[:pos],
+                "junk_after": buf6[pos + sz :],
+            }
+    return None
 
 
 def follow_jump_chain(
@@ -764,26 +784,35 @@ def follow_jump_chain(
     return ea
 
 
-def find_big_instruction(buf6: bytes, is_64: bool):
-    md = capstone.Cs(
-        capstone.CS_ARCH_X86, capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32
+def _stage4_validate_chain(args):
+    """
+    args = (chain, buf, base, block_end, is_64)
+    Returns either the updated chain or None.
+    """
+    chain, buf, base, block_end, is_64 = args
+
+    # 1) follow jump chain
+    exit_ea = follow_jump_chain(buf, base, chain.overall_start(), block_end, is_64)
+    off = exit_ea - base - 6
+    if off < 0:
+        return None
+
+    # 2) detect big instruction + junk after
+    bi = find_big_instruction(buf[off : off + 6], is_64)
+    if not bi:
+        return None
+
+    # 3) append that segment
+    chain.add_segment(
+        MatchSegment(
+            start=off,
+            length=6 + len(bi["junk_after"]),
+            description=bi["type"],
+            matched_bytes=buf[off : off + 6] + bi["junk_after"],
+            segment_type=SegmentType.BIG_INSTRUCTION,
+        )
     )
-    md.detail = True
-    for pos in range(len(buf6)):
-        insns = list(md.disasm(buf6[pos:], 0, count=1))
-        if not insns:
-            continue
-        insn = insns[0]
-        sz = insn.size
-        if 2 <= sz <= 6:
-            return {
-                "type": f"{sz}-byte",
-                "bytes": insn.bytes,
-                "position": pos,
-                "junk_before": buf6[:pos],
-                "junk_after": buf6[pos + sz :],
-            }
-    return None
+    return chain
 
 
 def resolve_overlaps(chains):
@@ -800,22 +829,7 @@ def resolve_overlaps(chains):
     return final
 
 
-# ─── Async event emitter & deobfuscator ───────────────────────────────────
-
-
-@dataclass
-class AsyncEventEmitter:
-    def __post_init__(self):
-        self._listeners = {}
-
-    def on(self, event, handler):
-        self._listeners.setdefault(event, []).append(handler)
-
-    async def emit(self, event, *args):
-        for h in self._listeners.get(event, []):
-            res = h(*args)
-            if asyncio.iscoroutine(res):
-                await res
+# ─── Async deobfuscator ───────────────────────────────────
 
 
 @dataclass
@@ -862,24 +876,6 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         await self.emit("stage1_finished", chains)
         return chains
 
-    # async def stage2(self, chains):
-    #     await self.emit("stage2_started")
-    #     async with self._get_buffer() as buf:
-    #         loop = asyncio.get_running_loop()
-    #         tasks = [
-    #             loop.run_in_executor(
-    #                 self.executor,
-    #                 find_junk_stage2_chain,
-    #                 c,
-    #                 buf,
-    #                 self.start_ea,
-    #                 self.is_64bit,
-    #             )
-    #             for c in chains
-    #         ]
-    #         updated = await asyncio.gather(*tasks)
-    #     await self.emit("stage2_finished", updated)
-    #     return updated
     async def stage2(self, chains: typing.List[MatchChain]) -> typing.List[MatchChain]:
         await self.emit("stage2_started")
 
@@ -911,49 +907,6 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         filtered = stage3_filter(chains)
         await self.emit("stage3_finished", filtered)
         return filtered
-
-    # async def stage4(self, chains):
-    #     await self.emit("stage4_started")
-    #     async with self._get_buffer() as buf:
-    #         base = self.start_ea
-    #         block_end = base + self.data_size
-    #         loop = asyncio.get_running_loop()
-
-    #         async def validate_one(chain):
-    #             exit_ea = await loop.run_in_executor(
-    #                 self.executor,
-    #                 follow_jump_chain,
-    #                 buf,
-    #                 base,
-    #                 chain.overall_start(),
-    #                 block_end,
-    #                 self.is_64bit,
-    #             )
-    #             off = exit_ea - base - 6
-    #             if off < 0:
-    #                 return None
-    #             bi = find_big_instruction(buf[off : off + 6], self.is_64bit)
-    #             if not bi:
-    #                 return None
-    #             chain.add_segment(
-    #                 MatchSegment(
-    #                     start=off,
-    #                     length=6 + len(bi["junk_after"]),
-    #                     description=bi["type"],
-    #                     matched_bytes=buf[off : off + 6] + bi["junk_after"],
-    #                     segment_type=SegmentType.BIG_INSTRUCTION,
-    #                 )
-    #             )
-    #             return chain
-
-    #         tasks = [
-    #             loop.run_in_executor(self.executor, validate_one, c) for c in chains
-    #         ]
-    #         results = await asyncio.gather(*tasks)
-    #     results = [c for c in results if c]
-    #     final = resolve_overlaps(results)
-    #     await self.emit("stage4_finished", final)
-    #     return final
 
     async def stage4(self, chains):
         await self.emit("stage4_started")
@@ -1053,20 +1006,30 @@ def worker_main():
     )
 
     # optional logging
-    deob.on("run_started", lambda: print("▶️  Pipeline starting"))
-    deob.on(
-        "stage1_finished", lambda ch: print(f"✅ Stage1: {len(ch)} stubs", flush=True)
-    )
-    deob.on(
-        "stage2_finished", lambda ch: print(f"✅ Stage2: junk appended", flush=True)
-    )
-    deob.on(
-        "stage3_finished", lambda ch: print(f"✅ Stage3: {len(ch)} remain", flush=True)
-    )
-    deob.on(
-        "stage4_finished", lambda ch: print(f"✅ Stage4: {len(ch)} final", flush=True)
-    )
-    deob.on("stopped", lambda: print("🛑 Worker shutting down", flush=True))
+
+    @deob.on("run_started")
+    def on_run_started():
+        logger.info("▶️  Pipeline starting")
+
+    @deob.on("stage1_finished")
+    def on_stage1_finished(ch):
+        logger.info(f"✅ Stage1: {len(ch)} stubs")
+
+    @deob.on("stage2_finished")
+    def on_stage2_finished(ch):
+        logger.info(f"✅ Stage2: junk appended")
+
+    @deob.on("stage3_finished")
+    def on_stage3_finished(ch):
+        logger.info(f"✅ Stage3: {len(ch)} remaining")
+
+    @deob.on("stage4_finished")
+    def on_stage4_finished(ch):
+        logger.info(f"✅ Stage4: {len(ch)} final")
+
+    @deob.on("stopped")
+    def on_stopped():
+        logger.info("🛑 Worker shutting down")
 
     # ——— start in background thread ———
     ctrl = WorkerController(deob)
@@ -1085,7 +1048,7 @@ def worker_main():
             break
         # you can also respond to "ping" if you want:
         elif cmd == "ping":
-            print("pong", flush=True)
+            logger.info("pong")
 
     # wait for the pipeline to complete
     results = ctrl.join()
@@ -1099,10 +1062,10 @@ def worker_main():
         for c in results
     ]
 
-    sys.stdout.write("results_start\n")
-    sys.stdout.write(json.dumps(out) + "\n")
-    sys.stdout.write("results_end\n")
-    sys.stdout.flush()
+    logger.info("results_start")
+    logger.info(json.dumps(out))
+    logger.info("results_end")
+
 
 
 # ─── IDA plugin entrypoint is no longer needed for console mode ─────────────
@@ -1288,7 +1251,7 @@ if is_ida():
 
         def stop_worker(self):
             """Attempts to terminate the worker process gracefully, then kills."""
-            if self.state() == QtCore.QProcess.NotRunning:
+            if self.is_not_running():
                 logger.debug("Worker process was already stopped.")
                 return
 
@@ -1444,25 +1407,25 @@ if is_ida():
             if data_to_process_size > max_size:  # Limit to max_size (default is 120MB)
                 data_to_process_size = max_size
                 logger.warning(
-                    f"Limiting section data size to {data_to_process_size} bytes from {section_name}."
+                    f"Limiting section data size to {humanize_bytes(data_to_process_size)} from {section_name}."
                 )
             elif data_to_process_size < min_size:  # Don't bother with tiny sections
                 # TODO: do we even still need this?
                 logger.error(
-                    f"{section_name} section is too small ({data_to_process_size} bytes) for processing."
+                    f"{section_name} section is too small ({humanize_bytes(data_to_process_size)}) for processing."
                 )
 
                 return
 
             logger.info(
-                f"Reading {data_to_process_size} bytes from address {hex(data_ea)}"
+                f"Reading {humanize_bytes(data_to_process_size)} from address {hex(data_ea)}"
             )
             # Read the bytes from IDA
             data_bytes = ida_bytes.get_bytes(data_ea, data_to_process_size)
 
             if not data_bytes or len(data_bytes) != data_to_process_size:
                 logger.error(
-                    f"Failed to read {data_to_process_size} bytes from {hex(data_ea)}. Read {len(data_bytes) if data_bytes else 0} bytes."
+                    f"Failed to read {humanize_bytes(data_to_process_size)} from {hex(data_ea)}. Read {len(data_bytes) if data_bytes else 0} bytes."
                 )
                 return
 
@@ -1489,10 +1452,7 @@ if is_ida():
             if not self.proc.launch_worker(
                 start_ea, self._shared_memory.name, data_size
             ):
-                self._cleanup_shared_memory()
-                if self.proc.is_not_running():
-                    self.proc.stop_worker()
-                self.proc = None
+                self.terminate()
                 logger.error(f"Failed to start worker process: {self.errorString()}")
                 return
 
@@ -1602,3 +1562,6 @@ if is_ida():
 if __name__ == "__main__":
     if not is_ida():
         worker_main()
+    else:
+        print("Running Taskr().get().run(*Taskr().get().get_section_data('.text'))")
+        Taskr().get().run(*Taskr().get().get_section_data(".text"))
