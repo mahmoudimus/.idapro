@@ -681,10 +681,16 @@ class PatchManager:
         PATCH = auto()  # Use ida_bytes.patch_bytes
         PUT = auto()  # Use ida_bytes.put_bytes
 
-    def __init__(self, patch_mode: Mode = Mode.PATCH, dry_run: bool = False):
+    def __init__(
+        self,
+        patch_mode: Mode = Mode.PATCH,
+        dry_run: bool = False,
+        auto_clear: bool = True,
+    ):
         self.dry_run = dry_run
         self.patch_mode = patch_mode
         self.pending_patches: list[DeferredPatchOp] = []
+        self.auto_clear = auto_clear
         logger.info(
             f"PatchManager initialized (dry_run={self.dry_run}, mode={self.patch_mode.name})"
         )
@@ -714,7 +720,8 @@ class PatchManager:
         logger.info(
             f"Patch application complete. Success: {success_count}, Failed: {fail_count}"
         )
-        self.pending_patches.clear()  # Clear the list after applying
+        if self.auto_clear:
+            self.pending_patches.clear()  # Clear the list after applying
         return fail_count == 0  # Return True if all patches were applied successfully
 
     def __len__(self) -> int:
@@ -1192,7 +1199,7 @@ class JumpTargetAnalyzer:
           - junk_length: int
           - stage1_type: SegmentType
         """
-        decoder = IdaInstructionDecoder()
+        decoder = CapstoneInstructionDecoder()
         match_end = chain.overall_start() + chain.overall_length()
         logger.debug(
             f"Processing jumps for chain @ 0x{chain.overall_start():X}, match_end=0x{match_end:X}"
@@ -1936,7 +1943,7 @@ class RemoveAntiDisassemblyActionHandler(ida_helpers.BaseActionHandler):
             patch_mode_name.upper(), PatchManager.Mode.PUT
         )
         return PatchManager(patch_mode=patch_mode, dry_run=dry_run)
-    
+
     def activate(self, ctx):
         ea = idaapi.get_screen_ea()
         settings = self.settings()

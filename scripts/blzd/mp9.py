@@ -26,7 +26,7 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from functools import lru_cache, wraps
+from functools import lru_cache, singledispatch, wraps
 from multiprocessing import get_context, shared_memory
 
 import capstone
@@ -154,7 +154,7 @@ def get_logger(name=None):
 
 
 logger = get_logger()
-configure_logging(logger)
+configure_logging(logger, level=logging.DEBUG)
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1090,319 +1090,6 @@ def _stage2_worker(
     return processed_chains
 
 
-# def peel_junk(buf: bytes, is_64: bool) -> int:
-#     """
-#     Disassembles the buffer using Capstone and calculates the total length
-#     of a contiguous sequence of instructions that match the criteria derived
-#     from the original regex JUNK_PATTERNS, using a match statement.
-
-#     Stops at the first instruction that does not match any of the junk criteria.
-
-#     Args:
-#         buf: The byte buffer to disassemble and peel junk from.
-#         is_64: True if disassembling in 64-bit mode, False for 32-bit.
-#                (Note: Register checks are based on regex-implied 8/32-bit sets,
-#                 as REX prefixes are not used for these patterns).
-
-#     Returns:
-#         The total length of the contiguous junk instruction sequence found
-#         at the start of the buffer. Returns 0 if no junk is found or on error.
-#     """
-#     if not buf:
-#         return 0
-
-#     # Initialize Capstone disassembler
-#     try:
-#         md = capstone.Cs(
-#             capstone.CS_ARCH_X86, capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32
-#         )
-#         md.detail = True  # Needed for operand types, groups, and registers
-#     except Exception as e:
-#         logger.error(f"Failed to initialize Capstone: {e}")
-#         return 0  # Cannot proceed without disassembler
-
-#     total_junk_length = 0
-#     current_offset = 0
-
-#     # Helper to check if the first operand is a register from the allowed set
-#     # based on the ModR/M ranges implied by the regexes.
-#     # Assumes no REX prefixes are used with these specific junk patterns,
-#     # so we only check against the 8-bit and 32-bit sets.
-#     def is_allowed_reg(operands):
-#         if not operands or operands[0].type != capstone.CS_OP_REG:
-#             return False
-#         reg = operands[0].reg
-#         # Check if the register is one of the 8-bit or 32-bit registers
-#         # corresponding to the ModR/M R/M field 0-3, 5-7 when MOD=11.
-#         return reg in REG_8_SET or reg in REG_32_SET
-
-#     # Helper to check if there's an immediate operand
-#     def has_imm_operand(operands):
-#         return any(op.type == capstone.CS_OP_IMM for op in operands)
-
-#     # Disassemble instructions from the start of the buffer
-#     # The address 0 is relative to the start of the input buffer 'buf'
-#     try:
-#         for insn in md.disasm(buf, 0):
-#             # Safety check: Ensure the instruction doesn't go past the buffer end
-#             if current_offset + insn.size > len(buf):
-#                 logger.warning(
-#                     f"Instruction {insn.mnemonic} at offset {current_offset} exceeds buffer bounds ({insn.size} bytes, buffer has {len(buf) - current_offset} remaining). Stopping."
-#                 )
-#                 break
-
-#             is_junk = False
-#             junk_description = "Unknown Junk"  # Default description
-
-#             # --- Translate Regex Patterns to Capstone Checks using match ---
-#             # We match on a tuple containing key instruction properties.
-#             # Using _ for properties we don't need to match on directly in the case pattern.
-#             # Guard clauses (if ...) are used for more complex conditions.
-
-#             match (insn.id, insn.size, insn.bytes, insn.operands, insn.groups):
-#                 # 1. rb"(?P<junk>\x0F\x31)" - RDTSC (2 bytes)
-#                 case (capstone.x86.X86_INS_RDTSC, 2, _, _, _):
-#                     is_junk = True
-#                     junk_description = "RDTSC"
-
-#                 # 2. rb"(?P<junk>\x0F[\x80-\x8F]..[\x00\x01]\x00)" - 6-byte Conditional Jump with specific displacement
-#                 # Match on size 6, then use a guard to check bytes and groups.
-#                 case (_, 6, bytes_, _, groups) if (
-#                     len(bytes_) >= 6
-#                     and bytes_[0] == 0x0F
-#                     and 0x80 <= bytes_[1] <= 0x8F
-#                     and (bytes_[4:6] == b"\x00\x00" or bytes_[4:6] == b"\x01\x00")
-#                     and (
-#                         capstone.CS_GRP_JUMP in groups or capstone.CS_GRP_CALL in groups
-#                     )  # Sanity check group
-#                 ):
-#                     is_junk = True
-#                     junk_description = "Specific 6-byte Conditional Jump"
-
-#                 # 3. rb"(?P<junk>\xE8..[\x00\x01]\x00)" - 5-byte CALL with specific displacement
-#                 # Match on ID and size, then use a guard to check bytes and operands.
-#                 case (capstone.x86.X86_INS_CALL, 5, bytes_, operands, _) if (
-#                     len(bytes_) >= 5
-#                     and (bytes_[3:5] == b"\x00\x00" or bytes_[3:5] == b"\x01\x00")
-#                     and has_imm_operand(operands)
-#                 ):
-#                     is_junk = True
-#                     junk_description = "Specific 5-byte CALL"
-
-#                 # 4. rb"(?P<junk>\x81[\xC0-\xC3\xC5-\xC7]....)" - ADD reg32, imm32 (6 bytes)
-#                 # 5. rb"(?P<junk>\x80[\xC0-\xC3\xC5-\xC7].)" - ADD reg8, imm8 (3 bytes)
-#                 # 6. rb"(?P<junk>\x83[\xC0-\xC3\xC5-\xC7].)" - ADD reg32, imm8 (3 bytes)
-#                 # Group ADD instructions by size, then use a guard to check register and immediate operands.
-#                 case (capstone.x86.X86_INS_ADD, size, _, operands, _) if (
-#                     size in (3, 6)
-#                     and is_allowed_reg(operands)
-#                     and has_imm_operand(operands)
-#                 ):
-#                     # We could refine description based on size if needed, but "ADD reg, imm" is sufficient
-#                     junk_description = f"ADD reg{32 if size==6 else (32 if size==3 and insn.bytes[0]==0x83 else 8)}, imm{32 if size==6 else 8}"
-#                     is_junk = True
-
-#                 # 7. rb"(?P<junk>\xC6[\xC0-\xC3\xC5-\xC7].)" - MOV reg8, imm8 (2 bytes)
-#                 # 8. rb"(?P<junk>\xC7[\xC0-\xC3\xC5-\xC7]....)" - MOV reg32, imm32 (5 bytes)
-#                 # Group MOV instructions by size, then use a guard.
-#                 case (capstone.x86.X86_INS_MOV, size, _, operands, _) if (
-#                     size in (2, 5)
-#                     and is_allowed_reg(operands)
-#                     and has_imm_operand(operands)
-#                 ):
-#                     junk_description = (
-#                         f"MOV reg{32 if size==5 else 8}, imm{32 if size==5 else 8}"
-#                     )
-#                     is_junk = True
-
-#                 # 9. rb"(?P<junk>\xF6[\xD8-\xDB\xDD-\xDF])" - NEG reg8 (2 bytes)
-#                 # Match on ID and size, then use a guard to check register operand.
-#                 case (capstone.x86.X86_INS_NEG, 2, _, operands, _) if is_allowed_reg(
-#                     operands
-#                 ):
-#                     is_junk = True
-#                     junk_description = "NEG reg8"
-
-#                 # 10. rb"(?P<junk>\x80[\xE8-\xEB\xED-\xEF].)" - AND reg8, imm8 (3 bytes)
-#                 # 11. rb"(?P<junk>\x81[\xE8-\xEB\xED-\xEF]....)" - AND reg32, imm32 (6 bytes)
-#                 # Group AND instructions by size, then use a guard.
-#                 case (capstone.x86.X86_INS_AND, size, _, operands, _) if (
-#                     size in (3, 6)
-#                     and is_allowed_reg(operands)
-#                     and has_imm_operand(operands)
-#                 ):
-#                     junk_description = (
-#                         f"AND reg{32 if size==6 else 8}, imm{32 if size==6 else 8}"
-#                     )
-#                     is_junk = True
-
-#                 # 12. rb"(?P<junk>\x68....)" - PUSH imm32 (5 bytes)
-#                 # 13. rb"(?P<junk>\x6A.)" - PUSH imm8 (2 bytes)
-#                 # Group PUSH instructions by size, then use a guard.
-#                 case (capstone.x86.X86_INS_PUSH, size, _, operands, _) if size in (
-#                     2,
-#                     5,
-#                 ) and has_imm_operand(operands):
-#                     junk_description = f"PUSH imm{32 if size==5 else 8}"
-#                     is_junk = True
-
-#                 # 14. rb"(?P<junk>[\x70-\x7F].)" - 2-byte Conditional Jump (Short)
-#                 # Match on size, then use a guard to check bytes and group.
-#                 case (_, 2, bytes_, _, groups) if (
-#                     len(bytes_) >= 2
-#                     and 0x70 <= bytes_[0] <= 0x7F
-#                     and capstone.CS_GRP_JUMP in groups
-#                 ):
-#                     is_junk = True
-#                     junk_description = "2-byte Conditional Jump"
-
-#                 # 15. rb"(?P<junk>[\x50-\x5F])" - Single-byte PUSH/POP reg (1 byte)
-#                 # Match on size, then use a guard to check bytes, ID, and operand type.
-#                 case (_, 1, bytes_, operands, _) if (
-#                     len(bytes_) >= 1
-#                     and 0x50 <= bytes_[0] <= 0x5F
-#                     and insn.id in (capstone.x86.X86_INS_PUSH, capstone.x86.X86_INS_POP)
-#                     and operands
-#                     and operands[0].type == capstone.CS_OP_REG
-#                 ):
-#                     is_junk = True
-#                     junk_description = "Single-byte PUSH/POP reg"
-
-#                 # Wildcard case: If none of the above patterns match
-#                 case _:
-#                     is_junk = False
-#                     # No need to set description, it won't be used if not junk
-
-#             # --- End of match statement ---
-
-#             if is_junk:
-#                 total_junk_length += insn.size
-#                 current_offset += insn.size
-#                 # logger.debug(f"  Found junk: {junk_description} - {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset - insn.size}")
-#             else:
-#                 # Stop at the first non-junk instruction
-#                 # logger.debug(f"  Non-junk instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset}. Stopping.")
-#                 break
-
-#     except capstone.CsError as e:
-#         logger.error(f"Capstone disassembly error at offset {current_offset}: {e}")
-#         # If disassembly fails, we can't reliably continue. Return length found so far.
-#         return total_junk_length
-#     except Exception as e:
-#         logger.error(
-#             f"Unexpected error during junk peeling at offset {current_offset}: {e}"
-#         )
-#         return total_junk_length
-
-#     return total_junk_length
-
-
-# def find_junk_stage2_chain(
-#     chain: MatchChain, buf: bytes, base_ea: int, is_64: bool
-# ) -> MatchChain:
-#     """
-#     Finds a contiguous block of junk instructions immediately following the
-#     stage 1 match in a single MatchChain using Capstone (peel_junk)
-#     and adds it as a single segment.
-
-#     Args:
-#         chain: The MatchChain object representing the stage 1 match.
-#         buf: The full byte buffer containing the function/memory region.
-#         base_ea: The base effective address of the buffer.
-#         is_64: True if disassembling in 64-bit mode, False for 32-bit.
-
-#     Returns:
-#         The updated MatchChain object.
-#     """
-#     # Calculate the offset in the buffer immediately after the stage 1 match
-#     # chain.overall_start() is the EA of the start of the chain (stage 1)
-#     # base_ea is the EA of the start of the buffer
-#     # The offset in the buffer is (chain_start_ea - buffer_base_ea) + chain_length
-#     buffer_offset_after_stage1 = (
-#         chain.overall_start() - base_ea
-#     ) + chain.overall_length()
-
-#     # Ensure the offset is within the buffer bounds
-#     if buffer_offset_after_stage1 >= len(buf):
-#         logger.debug(
-#             f"No bytes available after stage 1 match at EA 0x{chain.overall_start():X} to search for junk."
-#         )
-#         return chain  # No buffer left to search
-
-#     # Get the sub-buffer starting after the stage 1 match
-#     sub_buffer = buf[buffer_offset_after_stage1:]
-
-#     # Use peel_junk to find the total length of the contiguous junk block
-#     junk_length = peel_junk(sub_buffer, is_64)
-
-#     # The original code had a minimum/maximum length constraint (12 to 124 bytes)
-#     # for the *total* anti-disassembly routine (stage1 + junk).
-#     # This check should ideally happen *after* finding both stage1 and junk.
-#     # If you need to filter chains based on the *total* length (stage1_len + junk_len)
-#     # being within 12-124, you would do that *after* this function returns
-#     # and you have the final chain length.
-#     # For the peeling logic itself, we just peel as much as matches the patterns.
-
-#     if junk_length > 0:
-#         # Add the entire junk block as a single segment to the chain
-#         # The start address of the junk segment is the EA corresponding to
-#         # buffer_offset_after_stage1.
-#         junk_start_ea = base_ea + buffer_offset_after_stage1
-#         junk_bytes = sub_buffer[:junk_length]
-
-#         logger.debug(
-#             f"Found {junk_length} bytes of junk after stage 1 match at EA 0x{chain.overall_start():X}, "
-#             f"starting at EA 0x{junk_start_ea:X} ({junk_bytes.hex()})"
-#         )
-
-#         # Create and add the new junk segment
-#         junk_segment = MatchSegment(
-#             start=junk_start_ea,  # Store the actual EA
-#             length=junk_length,
-#             description="Junk",  # peel_junk could potentially return a more specific description
-#             matched_bytes=junk_bytes,
-#             segment_type=SegmentType.JUNK,
-#         )
-#         chain.add_segment(junk_segment)
-#     else:
-#         logger.debug(
-#             f"No junk found after stage 1 match at EA 0x{chain.overall_start():X}"
-#         )
-
-#     return chain
-
-
-# def _stage2_worker(
-#     args: typing.Tuple[typing.List[MatchChain], bytes, int, bool],
-# ) -> typing.List[MatchChain]:
-#     """
-#     Worker function for multiprocessing stage 2 junk peeling.
-
-#     Args:
-#         args: A tuple containing:
-#             - chains_chunk: A list of MatchChain objects to process.
-#             - buf: The full byte buffer of the memory region.
-#             - base_ea: The base effective address of the buffer.
-#             - is_64: True for 64-bit disassembly, False for 32-bit.
-
-#     Returns:
-#         A list of the processed MatchChain objects with junk segments added.
-#     """
-#     # chains_chunk, buf, base_ea, is_64 = args
-#     # out: typing.List[MatchChain] = []
-#     # for chain in chains_chunk:
-#     #     out.append(find_junk_stage2_chain(chain, buf, base_ea, is_64))
-#     # return out
-#     chains_chunk, buf, base_ea, is_64 = args
-#     logger.info(f"Worker processing {len(chains_chunk)} chains...")
-#     processed_chains: typing.List[MatchChain] = []
-#     for chain in chains_chunk:
-#         processed_chain = find_junk_stage2_chain(chain, buf, base_ea, is_64)
-#         processed_chains.append(processed_chain)
-#     logger.info(f"Worker finished processing {len(chains_chunk)} chains.")
-#     return processed_chains
-
-
 # ─── Stage 3: filter ────────────────────────────────────────────────────────
 
 
@@ -1513,7 +1200,8 @@ class JumpTargetAnalyzer:
 
     def follow_jump_chain(
         self,
-        mem: bytes,  # Expect a Memory object
+        mem: bytes,
+        mem_base: int,
         current_ea: int,
         match_end: int,
         decoder: InstructionDecoder,
@@ -1540,8 +1228,8 @@ class JumpTargetAnalyzer:
             visited = set()
 
         # Get an efficient view of the memory buffer
-        mem_view = mem.view
-        mem_start_ea = mem.base  # Absolute start address of the buffer
+        mem_view = mem
+        mem_start_ea = mem_base  # Absolute start address of the buffer
         mem_len = len(mem_view)
         mem_end_ea = mem_start_ea + mem_len  # Absolute end address (exclusive)
 
@@ -1576,7 +1264,7 @@ class JumpTargetAnalyzer:
 
             # Get bytes starting from the offset using the memoryview slice
             # Convert the slice to bytes for the decoder interface
-            bytes_for_decoder = mem_view[offset:].tobytes()
+            bytes_for_decoder = mem_view[offset:]
             if (
                 not bytes_for_decoder
             ):  # Should not happen if bounds check is correct, but defensive check
@@ -1653,14 +1341,14 @@ class JumpTargetAnalyzer:
                 )
                 return current_ea  # Return the start address of the sequence containing the invalid jump
 
-    def process(self, mem, chain):
+    def process(self, mem, chain, is_x64: bool):
         """
         Process each jump match in match_bytes.
         'chain' is expected to have attributes:
           - junk_length: int
           - stage1_type: SegmentType
         """
-        decoder = CapstoneInstructionDecoder()
+        decoder = CapstoneInstructionDecoder(is_x64)
         match_end = chain.overall_start() + chain.overall_length()
         logger.debug(
             f"Processing jumps for chain @ 0x{chain.overall_start():X}, match_end=0x{match_end:X}"
@@ -1670,7 +1358,9 @@ class JumpTargetAnalyzer:
         ):
             jump_offset = jump_match.start()
             jump_ea = self.match_start + jump_offset
-            final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
+            final_target = self.follow_jump_chain(
+                mem, self.match_start, jump_ea, match_end, decoder
+            )
             if not final_target:
                 logger.debug(
                     f"  Skipping jump at 0x{jump_ea:X}: Invalid final target 0x{final_target if final_target else 0:X}"
@@ -1860,14 +1550,13 @@ def find_big_instruction(buffer_bytes: bytes, is_x64: bool = False) -> dict:
     }
 
 
-def _stage4_validate_chain(
-    chains: list[MatchChains],
+def _stage4_is_chain_valid(
+    chain: MatchChain,
     mem: bytes,
     start_ea: int,
     is_x64: bool,
-    min_size: int = 12,
     max_size: int = 129,
-) -> list[MatchChains]:
+) -> MatchSegment | None:
     """
     Filter out false positive anti-disassembly patterns and handle overlaps.
     Integrates with existing big instruction detection code.
@@ -1876,162 +1565,109 @@ def _stage4_validate_chain(
         chains: List of MatchChain objects
         mem: Memory object containing binary data
         start_ea: Starting effective address
-        min_size: Minimum valid size for an anti-disassembly routine (default: 12)
         max_size: Maximum valid size for an anti-disassembly routine (default: 129)
 
     Returns:
-        List of validated MatchChain objects
+        A single validated MatchChain object
     """
-    logger.info(f"Filtering {len(chains)} potential anti-disassembly patterns...")
 
-    # Stage 1: Basic filtering based on size and junk presence
-    logger.info("Stage 4: Basic validation step")
-    filtered_chains = []
+    # Check if we already have a big instruction segment
+    for seg in chain.segments:
+        if seg.segment_type == SegmentType.BIG_INSTRUCTION:
+            return seg
 
-    for chain in chains:
-        # Apply basic filters
-        length = chain.overall_length()
-        if length < min_size or length > max_size:
+    # Find the big instruction
+    match_start = chain.overall_start()
+    chain_end = match_start + max_size
+
+    logger.info(f"Analyzing match: {chain.description} @ 0x{match_start:X}")
+
+    # Determine possible jump targets - using your existing code
+    jump_targets = JumpTargetAnalyzer(
+        chain.overall_matched_bytes(), match_start, chain_end, start_ea
+    ).process(mem=mem, chain=chain, is_x64=is_x64)
+
+    for target in jump_targets:
+        # The most_likely_target represents the most likely jump target within the
+        # stub—likely the point where execution exits to the unobfuscated code.
+        # however, if we do not find a match, then we want to continue searching
+        # previous targets and use those in decending order until we find a match
+        logger.debug(f"most_likely_target: 0x{target:X}, block_end: 0x{chain_end:X}")
+        # Check for big instruction in the 6 bytes before target
+        # a big instruction (e.g., one with a 32-bit operand, up to 6 bytes)
+        # just before the final jump target to confuse disassemblers.
+        search_start = target - 6
+        if search_start < start_ea:
+            continue
+
+        # Extract the 6-byte buffer
+        buffer_offset = search_start - start_ea
+        target_offset = target - start_ea
+        target_offset_forward = target - start_ea + 6
+        if buffer_offset < 0 or target_offset > len(mem):
+            continue
+
+        if target_offset_forward > len(mem):
             logger.debug(
-                f"  Rejected: {chain.description} @ 0x{chain.overall_start():X} - length {length} outside valid range {min_size}-{max_size}"
+                f"  Rejected: {chain.description} @ 0x{match_start:X} - target_offset_forward out of bounds: {target_offset_forward}"
             )
             continue
+        search_bytes_backwards = mem[buffer_offset:target_offset]
+        search_bytes_forwards = mem[target_offset:target_offset_forward]
 
-        if not chain.junk_segments or chain.junk_length == 0:
-            logger.debug(
-                f"  Rejected: {chain.description} @ 0x{chain.overall_start():X} - no junk instructions"
+        for start_offset, search_bytes in [
+            (buffer_offset, search_bytes_backwards),
+            (target_offset, search_bytes_forwards),
+        ]:
+            logger.debug(f"search_bytes: {search_bytes.hex()}")
+            # up to 6 bytes to search for a big instruction.
+            if len(search_bytes) != 6:
+                logger.debug(
+                    f"  Rejected: {chain.description} @ 0x{match_start:X} - search_bytes too long: {len(search_bytes)} bytes"
+                )
+                continue
+            result = find_big_instruction(search_bytes, is_x64=is_x64)
+
+            if not result["type"]:
+                logger.debug("No valid instruction found.")
+                # if we do not find a match, then we want to find the previous targets and use those
+                # in decending order until we find a match
+                continue
+
+            # check for multiple anti-disassembly bytes after search_start + 6
+            # if found, then we want to add them to the new_bytes
+            new_len = (
+                len(result["junk_before"])
+                + len(result["instruction"])
+                + len(result["junk_after"])
             )
-            continue
+            new_bytes = (
+                result["junk_before"]
+                + bytes(result["instruction"])
+                + bytes(result["junk_after"])
+            )
 
-        # If big instruction hasn't been detected yet, we'll validate it in Stage 2
-        filtered_chains.append(chain)
+            # Check for additional anti-disassembly bytes
+            for i in itertools.count():
+                extra_offset = start_offset + new_len + i
+                b = mem[extra_offset]
+                if b != SUPERFLULOUS_BYTE:
+                    if i != 0:
+                        logger.debug(
+                            f"    Found {i} extra anti-disassembly bytes @ 0x{search_start + 6:X}"
+                        )
+                    break
 
-    logger.info(f"  After basic filtering: {len(filtered_chains)} chains remain")
+                new_bytes += bytes([b])
+                new_len += 1
 
-    # Stage 2: Validate big instructions if not already done
-    logger.info("Stage 4: Big instruction validation step")
-    validated_with_big_instr = []
-
-    for chain in filtered_chains:
-        # Check if we already have a big instruction segment
-        if any(
-            seg.segment_type == SegmentType.BIG_INSTRUCTION for seg in chain.segments
-        ):
-            validated_with_big_instr.append(chain)
-            continue
-
-        # Find the big instruction
-        match_start = chain.overall_start()
-        chain_end = match_start + max_size
-
-        logger.info(f"Analyzing match: {chain.description} @ 0x{match_start:X}")
-
-        # Determine possible jump targets - using your existing code
-        jump_targets = JumpTargetAnalyzer(
-            chain.overall_matched_bytes(), match_start, chain_end, start_ea
-        ).process(mem=mem, chain=chain)
-
-        big_instr_found = False
-
-        for target in jump_targets:
-            # The most_likely_target represents the most likely jump target within the
-            # stub—likely the point where execution exits to the unobfuscated code.
-            # however, if we do not find a match, then we want to continue searching
-            # previous targets and use those in decending order until we find a match
-            logger.info(f"most_likely_target: 0x{target:X}, block_end: 0x{chain_end:X}")
-            # Check for big instruction in the 6 bytes before target
-            # a big instruction (e.g., one with a 32-bit operand, up to 6 bytes)
-            # just before the final jump target to confuse disassemblers.
-            search_start = target - 6
-            if search_start < start_ea:
-                continue
-
-            # Extract the 6-byte buffer
-            buffer_offset = search_start - start_ea
-            target_offset = target - start_ea
-            target_offset_forward = target - start_ea + 6
-            if buffer_offset < 0 or target_offset > len(mem):
-                continue
-
-            if target_offset_forward > len(mem):
-                logger.info(
-                    f"  Rejected: {chain.description} @ 0x{match_start:X} - target_offset_forward out of bounds: {target_offset_forward}"
-                )
-                continue
-            search_bytes_backwards = mem[buffer_offset:target_offset]
-            search_bytes_forwards = mem[target_offset:target_offset_forward]
-
-            for start_offset, search_bytes in [
-                (buffer_offset, search_bytes_backwards),
-                (target_offset, search_bytes_forwards),
-            ]:
-                logger.info(f"search_bytes: {search_bytes.hex()}")
-                # up to 6 bytes to search for a big instruction.
-                if len(search_bytes) != 6:
-                    logger.info(
-                        f"  Rejected: {chain.description} @ 0x{match_start:X} - search_bytes too long: {len(search_bytes)} bytes"
-                    )
-                    continue
-                result = find_big_instruction(search_bytes, is_x64=is_x64)
-
-                if not result["type"]:
-                    logger.debug("No valid instruction found.")
-                    # if we do not find a match, then we want to find the previous targets and use those
-                    # in decending order until we find a match
-                    continue
-
-                # Found a valid big instruction
-                big_instr_found = True
-
-                # check for multiple anti-disassembly bytes after search_start + 6
-                # if found, then we want to add them to the new_bytes
-                new_len = (
-                    len(result["junk_before"])
-                    + len(result["instruction"])
-                    + len(result["junk_after"])
-                )
-                new_bytes = (
-                    result["junk_before"]
-                    + bytes(result["instruction"])
-                    + bytes(result["junk_after"])
-                )
-
-                # Check for additional anti-disassembly bytes
-                for i in itertools.count():
-                    extra_offset = start_offset + new_len + i
-                    b = mem[extra_offset]
-                    if b != SUPERFLULOUS_BYTE:
-                        if i != 0:
-                            logger.debug(
-                                f"    Found {i} extra anti-disassembly bytes @ 0x{search_start + 6:X}"
-                            )
-                        break
-
-                    new_bytes += bytes([b])
-                    new_len += 1
-
-                chain.add_segment(
-                    MatchSegment(
-                        start=start_offset,
-                        length=new_len,
-                        description=result["name"],
-                        matched_bytes=new_bytes,
-                        segment_type=SegmentType.BIG_INSTRUCTION,
-                    )
-                )
-                break
-
-            if big_instr_found:
-                validated_with_big_instr.append(chain)
-                break
-            else:
-                logger.info(
-                    f"  Rejected: {chain.description} @ 0x{chain.overall_start():X} - no valid big instruction found for any jump target"
-                )
-
-    logger.info(
-        f"  After big instruction validation: {len(validated_with_big_instr)} of {len(chains)} chains remain"
-    )
+            return MatchSegment(
+                start=start_offset,
+                length=new_len,
+                description=result["name"],
+                matched_bytes=new_bytes,
+                segment_type=SegmentType.BIG_INSTRUCTION,
+            )
 
 
 def resolve_overlaps(
@@ -2106,23 +1742,24 @@ def _stage4_worker(
             - chains_chunk: A list of MatchChain objects to process.
             - buf: The full byte buffer of the memory region.
             - base_ea: The base effective address of the buffer.
-            - max_routine_size: Max allowed size for a validated routine.
             - is_64: True for 64-bit disassembly, False for 32-bit.
 
     Returns:
         A list of the MatchChain objects from the chunk that were successfully validated.
     """
-    chains_chunk, buf, base_ea, max_routine_size, is_64 = args
+    chains_chunk, buf, base_ea, is_64 = args
     logger.info(
         f"Worker processing {len(chains_chunk)} chains for Stage 4 validation..."
     )
     validated_in_chunk: typing.List[MatchChain] = []
+    logger.info("Stage 4: Big instruction validation step")
     for chain in chains_chunk:
-        # Prepare args for the single-chain validation function
-        validation_args = (chain, buf, base_ea, max_routine_size, is_64)
-        validated_chain = _stage4_validate_chain(validation_args)
-        if validated_chain:
-            validated_in_chunk.append(validated_chain)
+        if _stage4_is_chain_valid(chain, buf, base_ea, is_64):
+            validated_in_chunk.append(chain)
+        else:
+            logger.info(
+                f"  Rejected: {chain.description} @ 0x{chain.overall_start():X} - no valid big instruction found for any jump target"
+            )
 
     logger.info(
         f"Worker finished Stage 4 validation: {len(validated_in_chunk)} chains validated in this chunk."
@@ -2389,7 +2026,186 @@ def generate_pipe_name():
         return str(socket_path)
 
 
-def worker_main():
+class UnixSocketCleaner:
+    """
+    Context manager to ensure the Unix socket file is removed before and after use.
+    On Windows, this is a no-op.
+    """
+
+    def __init__(self, pipe_name):
+        self.pipe_name = pipe_name
+        self.is_unix = platform.system() != "Windows"
+        self.socket_path = pathlib.Path(pipe_name) if self.is_unix else None
+
+    def __enter__(self):
+        if self.is_unix and self.socket_path.exists():
+            logger.warning(f"Removing existing socket file: {self.socket_path}")
+            try:
+                self.socket_path.unlink()
+            except Exception as e:
+                logger.error(f"Error removing socket file {self.socket_path}: {e}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.is_unix and self.socket_path.exists():
+            try:
+                logger.info(f"Removing socket file: {self.socket_path}")
+                self.socket_path.unlink()
+            except Exception as e:
+                logger.error(f"Error removing socket file {self.socket_path}: {e}")
+
+
+class ListenerContext:
+    """
+    Context manager for multiprocessing.connection.Listener.
+    Ensures the listener is closed on exit.
+    """
+
+    def __init__(self, pipe_name, authkey):
+        self.pipe_name = pipe_name
+        self.authkey = authkey
+        self.listener = None
+
+    def __enter__(self):
+        self.listener = multiprocessing.connection.Listener(
+            self.pipe_name, authkey=self.authkey
+        )
+        logger.info("Listener created.")
+        return self.listener
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.listener is not None:
+            try:
+                logger.info("Closing listener.")
+                self.listener.close()
+            except Exception as e:
+                logger.error(f"Error closing listener: {e}")
+
+
+class ConnectionContext:
+    """
+    Context manager for a multiprocessing.connection.Connection.
+    Ensures the connection is closed on exit.
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn is not None:
+            try:
+                logger.info("Closing worker-side connection.")
+                self.conn.close()
+            except Exception as e:
+                logger.error(f"Error closing connection: {e}")
+
+
+@contextlib.contextmanager
+def worker_setup(pipe_name, authkey):
+    """
+    Context manager that sets up the worker listener and yields the accepted connection.
+    Signals readiness to the parent process before blocking on accept.
+
+    Yields:
+        multiprocessing.connection.Connection: The accepted connection object.
+
+    Example:
+        with setup_worker_listener(args) as conn:
+            # ... use conn ...
+    """
+    authkey_bytes = bytes.fromhex(authkey)
+    logger.info(f"Setting up Listener on pipe: {pipe_name}")
+
+    with UnixSocketCleaner(pipe_name):
+        with ListenerContext(pipe_name, authkey=authkey_bytes) as listener:
+            # --- Signal IDA that we are ready BEFORE blocking on accept ---
+            print("LISTENER_READY", flush=True)
+            logger.info("Signaled LISTENER_READY to parent. Waiting for connection...")
+
+            conn = listener.accept()  # Blocks until IDA connects
+            logger.info(f"Connection accepted from: {listener.last_accepted}")
+
+            with ConnectionContext(conn):
+                yield conn
+
+
+def process(deob, pipe_name, authkey):
+
+    @deob.on("run_started")
+    def on_run_started():
+        logger.info("▶️  Pipeline starting")
+
+    @deob.on("stage1_finished")
+    def on_stage1_finished(ch):
+        logger.info(f"✅ Stage1: {len(ch)} stubs")
+
+    @deob.on("stage2_finished")
+    def on_stage2_finished(ch):
+        logger.info(f"✅ Stage2: {len(ch)} junk appended")
+
+    @deob.on("stage3_finished")
+    def on_stage3_finished(ch):
+        logger.info(f"✅ Stage3: {len(ch)} remaining")
+
+    @deob.on("stage4_finished")
+    def on_stage4_finished(ch):
+        logger.info(f"✅ Stage4: {len(ch)} final")
+
+    @deob.on("stopped")
+    def on_stopped():
+        logger.info("🛑 Worker shutting down")
+
+    ctrl = WorkerController(deob)
+
+    with worker_setup(pipe_name, authkey) as conn:
+        logger.info("Starting command loop (reading from connection)...")
+        try:
+            while cmd := conn.recv():
+                logger.debug(f"← Received raw command obj: {cmd}")
+                # Commands should be sent as strings
+                if not isinstance(cmd, str):
+                    logger.warning(f"Received non-string command: {type(cmd)} - {cmd}")
+                    continue
+
+                payload = json.loads(cmd.strip())
+                logger.info(f"← Received command: {payload}")
+                match payload["cmd"]:
+                    case "stop" | "exit" | "shutdown":
+                        logger.info("Received exit command.")
+                        ctrl.stop()  # Tell the controller to stop the pipeline
+                        break
+                    case "ping":
+                        logger.info("pong")
+                        # Optional: Send pong back? conn.send("pong_ack")
+                    case "pause":
+                        ctrl.pause()
+                    case "resume":
+                        ctrl.resume()
+                    case "start":
+                        ctrl.start()
+                    case "set_log_level":
+                        logger.setLevel(payload["level"])
+                        ctrl.set_log_level(payload["level"])
+                        logger.info(f"Worker log level set to {payload['level']}")
+                    case _:
+                        logger.warning(f"Unknown command received: {payload}")
+
+        except EOFError:
+            logger.error("EOFError on connection recv. Connection closed by parent.")
+            ctrl.stop()  # Ensure pipeline stops if connection breaks
+        except Exception as e:
+            logger.error(f"Error processing command: {e}", exc_info=True)
+            # Decide whether to break or continue on other errors
+
+        # wait for the pipeline to complete
+        logger.info("Waiting for pipeline to finish...")
+        return ctrl.join()  # join now handles the not-started case internally
+
+
+def _wmain():
     p = argparse.ArgumentParser()
     p.add_argument("--shm_name", required=True)
     p.add_argument("--data_size", type=int, required=True)
@@ -2401,168 +2217,199 @@ def worker_main():
         "--authkey", required=True, help="Hex-encoded authkey for IPC connection"
     )
     args = p.parse_args()
-
-    listener = None
-    conn = None
     try:
-        authkey_bytes = bytes.fromhex(args.authkey)
-        logger.info(f"Setting up Listener on pipe: {args.pipe_name}")
-        # Ensure the socket file doesn't exist on Unix before listening
-        if platform.system() != "Windows":
-            socket_path = pathlib.Path(args.pipe_name)
-            if socket_path.exists():
-                logger.warning(f"Removing existing socket file: {socket_path}")
-                socket_path.unlink()
-
-        listener = multiprocessing.connection.Listener(
-            args.pipe_name, authkey=authkey_bytes
-        )
-        logger.info("Listener created.")
-
-        # --- Signal IDA that we are ready BEFORE blocking on accept ---
-        print("LISTENER_READY", flush=True)
-        logger.info("Signaled LISTENER_READY to parent. Waiting for connection...")
-
-        conn = listener.accept()  # Blocks until IDA connects
-        logger.info(f"Connection accepted from: {listener.last_accepted}")
-        listener.close()  # Close listener immediately after accepting one connection
-        listener = None  # Clear listener reference
-
-        # --- Deobfuscator and Controller setup (can stay here) ---
         deob = AsyncDeobfuscator(
             shm_name=args.shm_name,
             data_size=args.data_size,
             start_ea=args.start_ea,
             is_64bit=bool(args.is64),
+            max_workers=1,
         )
-
-        @deob.on("run_started")
-        def on_run_started():
-            logger.info("▶️  Pipeline starting")
-
-        @deob.on("stage1_finished")
-        def on_stage1_finished(ch):
-            logger.info(f"✅ Stage1: {len(ch)} stubs")
-
-        @deob.on("stage2_finished")
-        def on_stage2_finished(ch):
-            logger.info(f"✅ Stage2: {len(ch)} junk appended")
-
-        @deob.on("stage3_finished")
-        def on_stage3_finished(ch):
-            logger.info(f"✅ Stage3: {len(ch)} remaining")
-
-        @deob.on("stage4_finished")
-        def on_stage4_finished(ch):
-            logger.info(f"✅ Stage4: {len(ch)} final")
-
-        @deob.on("stopped")
-        def on_stopped():
-            logger.info("🛑 Worker shutting down")
-
-        ctrl = WorkerController(deob)
-        # --- End Deobfuscator/Controller ---
-
-        # ——— command loop using the connection object ———
-        logger.info("Starting command loop (reading from connection)...")
-        while True:
-            try:
-                logger.info("waiting for command via connection.recv()...")
-                cmd = conn.recv()  # Blocks here, receives pickled object
-                logger.info(f"← Received raw command obj: {cmd}")
-                # Commands should be sent as strings
-                if not isinstance(cmd, str):
-                    logger.warning(f"Received non-string command: {type(cmd)} - {cmd}")
-                    continue
-
-                cmd_processed = cmd.strip().lower()
-                logger.info(f"← Processed command: {cmd_processed}")
-
-                if cmd_processed in ("stop", "exit", "shutdown"):
-                    logger.info("Received exit command.")
-                    ctrl.stop()  # Tell the controller to stop the pipeline
-                    break  # Exit the command loop
-                elif cmd_processed == "ping":
-                    logger.info("pong")
-                    # Optional: Send pong back? conn.send("pong_ack")
-                elif cmd_processed == "pause":
-                    ctrl.pause()
-                elif cmd_processed == "resume":
-                    ctrl.resume()
-                elif cmd_processed == "start":
-                    ctrl.start()
-                else:
-                    logger.warning(f"Unknown command received: {cmd}")
-
-            except EOFError:
-                logger.error(
-                    "EOFError on connection recv. Connection closed by parent."
-                )
-                ctrl.stop()  # Ensure pipeline stops if connection breaks
-                break
-            except Exception as e:
-                logger.error(f"Error processing command: {e}", exc_info=True)
-                # Decide whether to break or continue on other errors
-
-        logger.info("Exited command loop.")
-
-        # wait for the pipeline to complete
-        logger.info("Waiting for pipeline to finish...")
-        results = ctrl.join()  # join now handles the not-started case internally
-        if results is not None:  # Check if join returned actual results
-            logger.info("Pipeline finished.")
-        # else: join logged a warning if not started
+        results = process(deob, args.pipe_name, args.authkey)
+        logger.info("Pipeline finished.")
+        if not results:  # Check if join returned actual results
+            logger.info("No results generated or retrieved from pipeline.")
+            return
 
         # --- Print results to stdout for IDA ---
-        if results:  # Only process if results is not None
-            out = [
-                {
-                    "offset": c.overall_start() - args.start_ea,
-                    "length": c.overall_length(),
-                    "description": c.segments[
-                        0
-                    ].description,  # Use the first segment's description
-                }
-                for c in results
-            ]
-            logger.info("results_start")
-            print("results_start", flush=True)  # Also print sentinel to stdout
-            print(json.dumps(out), flush=True)
-            print("results_end", flush=True)
-            logger.info("results_end")
-        else:
-            logger.info("No results generated or retrieved from pipeline.")
 
+        out = [
+            {
+                "offset": c.overall_start() - args.start_ea,
+                "length": c.overall_length(),
+                "description": c.segments[
+                    0
+                ].description,  # Use the first segment's description
+            }
+            for c in results
+        ]
+        logger.info("results_start")
+        print("results_start", flush=True)  # Also print sentinel to stdout
+        print(json.dumps(out), flush=True)
+        print("results_end", flush=True)
+        logger.info("results_end")
     except Exception as e:
         logger.error(f"Unhandled exception in worker_main: {e}", exc_info=True)
     finally:
-        if conn:
-            try:
-                logger.info("Closing worker-side connection.")
-                conn.close()
-            except Exception as e_close:
-                logger.error(f"Error closing connection: {e_close}")
-        if (
-            listener
-        ):  # Should be None if accept succeeded, but handle potential error case
-            try:
-                logger.warning("Closing listener (should have been closed earlier).")
-                listener.close()
-            except Exception as e_close_listener:
-                logger.error(f"Error closing listener: {e_close_listener}")
-        # Clean up socket file on Unix
-        if platform.system() != "Windows":
-            socket_path = pathlib.Path(args.pipe_name)
-            if socket_path.exists():
-                try:
-                    logger.info(f"Removing socket file: {socket_path}")
-                    socket_path.unlink()
-                except Exception as e_unlink:
-                    logger.error(
-                        f"Error removing socket file {socket_path}: {e_unlink}"
-                    )
-
         logger.info("Worker finished.")
+    # listener = None
+    # conn = None
+    # try:
+    #     authkey_bytes = bytes.fromhex(args.authkey)
+    #     logger.info(f"Setting up Listener on pipe: {args.pipe_name}")
+    #     # Ensure the socket file doesn't exist on Unix before listening
+    #     if platform.system() != "Windows":
+    #         socket_path = pathlib.Path(args.pipe_name)
+    #         if socket_path.exists():
+    #             logger.warning(f"Removing existing socket file: {socket_path}")
+    #             socket_path.unlink()
+
+    #     listener = multiprocessing.connection.Listener(
+    #         args.pipe_name, authkey=authkey_bytes
+    #     )
+    #     logger.info("Listener created.")
+
+    #     # --- Signal IDA that we are ready BEFORE blocking on accept ---
+    #     print("LISTENER_READY", flush=True)
+    #     logger.info("Signaled LISTENER_READY to parent. Waiting for connection...")
+
+    #     conn = listener.accept()  # Blocks until IDA connects
+    #     logger.info(f"Connection accepted from: {listener.last_accepted}")
+    #     listener.close()  # Close listener immediately after accepting one connection
+    #     listener = None  # Clear listener reference
+
+    #     # --- Deobfuscator and Controller setup (can stay here) ---
+    #     deob = AsyncDeobfuscator(
+    #         shm_name=args.shm_name,
+    #         data_size=args.data_size,
+    #         start_ea=args.start_ea,
+    #         is_64bit=bool(args.is64),
+    #         max_workers=1,
+    #     )
+
+    #     @deob.on("run_started")
+    #     def on_run_started():
+    #         logger.info("▶️  Pipeline starting")
+
+    #     @deob.on("stage1_finished")
+    #     def on_stage1_finished(ch):
+    #         logger.info(f"✅ Stage1: {len(ch)} stubs")
+
+    #     @deob.on("stage2_finished")
+    #     def on_stage2_finished(ch):
+    #         logger.info(f"✅ Stage2: {len(ch)} junk appended")
+
+    #     @deob.on("stage3_finished")
+    #     def on_stage3_finished(ch):
+    #         logger.info(f"✅ Stage3: {len(ch)} remaining")
+
+    #     @deob.on("stage4_finished")
+    #     def on_stage4_finished(ch):
+    #         logger.info(f"✅ Stage4: {len(ch)} final")
+
+    #     @deob.on("stopped")
+    #     def on_stopped():
+    #         logger.info("🛑 Worker shutting down")
+
+    #     ctrl = WorkerController(deob)
+    #     # --- End Deobfuscator/Controller ---
+
+    #     # ——— command loop using the connection object ———
+    #     logger.info("Starting command loop (reading from connection)...")
+    #     try:
+    #         while cmd := conn.recv():
+    #             logger.debug(f"← Received raw command obj: {cmd}")
+    #             # Commands should be sent as strings
+    #             if not isinstance(cmd, str):
+    #                 logger.warning(f"Received non-string command: {type(cmd)} - {cmd}")
+    #                 continue
+
+    #             payload = json.loads(cmd.strip())
+    #             logger.info(f"← Received command: {payload}")
+    #             match payload["cmd"]:
+    #                 case "stop" | "exit" | "shutdown":
+    #                     logger.info("Received exit command.")
+    #                     ctrl.stop()  # Tell the controller to stop the pipeline
+    #                     break
+    #                 case "ping":
+    #                     logger.info("pong")
+    #                     # Optional: Send pong back? conn.send("pong_ack")
+    #                 case "pause":
+    #                     ctrl.pause()
+    #                 case "resume":
+    #                     ctrl.resume()
+    #                 case "start":
+    #                     ctrl.start()
+    #                 case "set_log_level":
+    #                     logger.setLevel(payload["level"])
+    #                     logger.info(f"Worker log level set to {payload['level']}")
+    #                 case _:
+    #                     logger.warning(f"Unknown command received: {payload}")
+
+    #     except EOFError:
+    #         logger.error("EOFError on connection recv. Connection closed by parent.")
+    #         ctrl.stop()  # Ensure pipeline stops if connection breaks
+    #     except Exception as e:
+    #         logger.error(f"Error processing command: {e}", exc_info=True)
+    #         # Decide whether to break or continue on other errors
+
+    #     # wait for the pipeline to complete
+    #     logger.info("Waiting for pipeline to finish...")
+    #     results = ctrl.join()  # join now handles the not-started case internally
+    #     if results is not None:  # Check if join returned actual results
+    #         logger.info("Pipeline finished.")
+    #     # else: join logged a warning if not started
+
+    #     # --- Print results to stdout for IDA ---
+    #     if results:  # Only process if results is not None
+    #         out = [
+    #             {
+    #                 "offset": c.overall_start() - args.start_ea,
+    #                 "length": c.overall_length(),
+    #                 "description": c.segments[
+    #                     0
+    #                 ].description,  # Use the first segment's description
+    #             }
+    #             for c in results
+    #         ]
+    #         logger.info("results_start")
+    #         print("results_start", flush=True)  # Also print sentinel to stdout
+    #         print(json.dumps(out), flush=True)
+    #         print("results_end", flush=True)
+    #         logger.info("results_end")
+    #     else:
+    #         logger.info("No results generated or retrieved from pipeline.")
+
+    # except Exception as e:
+    #     logger.error(f"Unhandled exception in worker_main: {e}", exc_info=True)
+    # finally:
+    #     if conn:
+    #         try:
+    #             logger.info("Closing worker-side connection.")
+    #             conn.close()
+    #         except Exception as e_close:
+    #             logger.error(f"Error closing connection: {e_close}")
+    #     if (
+    #         listener
+    #     ):  # Should be None if accept succeeded, but handle potential error case
+    #         try:
+    #             logger.warning("Closing listener (should have been closed earlier).")
+    #             listener.close()
+    #         except Exception as e_close_listener:
+    #             logger.error(f"Error closing listener: {e_close_listener}")
+    #     # Clean up socket file on Unix
+    #     if platform.system() != "Windows":
+    #         socket_path = pathlib.Path(args.pipe_name)
+    #         if socket_path.exists():
+    #             try:
+    #                 logger.info(f"Removing socket file: {socket_path}")
+    #                 socket_path.unlink()
+    #             except Exception as e_unlink:
+    #                 logger.error(
+    #                     f"Error removing socket file {socket_path}: {e_unlink}"
+    #                 )
+
+    #     logger.info("Worker finished.")
 
 
 # ─── IDA plugin entrypoint is no longer needed for console mode ─────────────
@@ -2590,10 +2437,16 @@ if is_ida():
             PATCH = auto()  # Use ida_bytes.patch_bytes
             PUT = auto()  # Use ida_bytes.put_bytes
 
-        def __init__(self, patch_mode: Mode = Mode.PATCH, dry_run: bool = False):
+        def __init__(
+            self,
+            patch_mode: Mode = Mode.PATCH,
+            dry_run: bool = False,
+            auto_clear: bool = True,
+        ):
             self.dry_run = dry_run
             self.patch_mode = patch_mode
             self.pending_patches: list[DeferredPatchOp] = []
+            self.auto_clear = auto_clear
             logger.info(
                 f"PatchManager initialized (dry_run={self.dry_run}, mode={self.patch_mode.name})"
             )
@@ -2623,10 +2476,9 @@ if is_ida():
             logger.info(
                 f"Patch application complete. Success: {success_count}, Failed: {fail_count}"
             )
-            self.pending_patches.clear()  # Clear the list after applying
-            return (
-                fail_count == 0
-            )  # Return True if all patches were applied successfully
+            if self.auto_clear:
+                self.pending_patches.clear()  # Clear the list after applying
+            return fail_count == 0  # Return True if all patches were applied successfully
 
         def __len__(self) -> int:
             return len(self.pending_patches)
@@ -2750,7 +2602,6 @@ if is_ida():
                 hex(start_ea),
                 "--is64",
                 "1" if is_x64 else "0",
-                # --- Pass connection details ---
                 "--pipe-name",
                 self.pipe_name,
                 "--authkey",
@@ -2789,7 +2640,7 @@ if is_ida():
                     # Optionally send "exit" command first if worker handles it gracefully
                     if self.state() == QtCore.QProcess.Running:
                         logger.info("Sending 'exit' command over IPC connection.")
-                        self.client_connection.send("exit")
+                        self.send_command("exit")
                     self.client_connection.close()
                 except Exception as e:
                     logger.error(f"Error closing client connection: {e}")
@@ -2832,7 +2683,7 @@ if is_ida():
 
             logger.info("Worker process stop sequence complete.")
 
-        def send_command(self, command: str):
+        def send_command(self, command: dict):
             """Sends a command object via the client connection."""
             if not self.client_connection:
                 logger.warning(
@@ -2846,7 +2697,7 @@ if is_ida():
 
             logger.debug(f"→ Sending command via connection: {command}")
             try:
-                self.client_connection.send(command)  # Sends pickled object
+                self.client_connection.send(json.dumps(command))  # Sends pickled object
                 logger.debug(f"→ Successfully sent command: {command}")
             except Exception as e:
                 # Handle broken pipe errors, etc.
@@ -3008,19 +2859,28 @@ if is_ida():
             logger.info("Terminated.")
 
         def pause(self):
-            self.proc.send_command("pause")
+            self.proc.send_command({"cmd": "pause"})
 
         def resume(self):
-            self.proc.send_command("resume")
+            self.proc.send_command({"cmd": "resume"})
 
         def stop(self):
-            self.proc.send_command("stop")
+            self.proc.send_command({"cmd": "stop"})
 
         def start(self):
-            self.proc.send_command("start")
+            self.proc.send_command({"cmd": "start"})
 
         def ping(self):
-            self.proc.send_command("ping")
+            self.proc.send_command({"cmd": "ping"})
+
+        def set_log_level(self, level: int):
+            """
+            Dynamically request the worker process switch its logger level.
+            Example:
+                import logging
+                Taskr().get().log_level(logging.DEBUG)
+            """
+            self.proc.send_command({"cmd": "set_log_level", "level": level})
 
         @staticmethod
         def get_section_data(
@@ -3059,6 +2919,12 @@ if is_ida():
                 return
 
             return data_ea, data_bytes
+
+        @staticmethod
+        def from_range(start_ea: int, end_ea: int):
+            """Get the data of a section by name and return the start address and the bytes."""
+            data_bytes = ida_bytes.get_bytes(start_ea, end_ea - start_ea)
+            return start_ea, data_bytes
 
         def run(self, start_ea: int, bytes_to_process: bytes, **kwargs):
             """Run the main plugin logic when hotkey is pressed."""
@@ -3190,7 +3056,7 @@ if is_ida():
 
 if __name__ == "__main__":
     if not is_ida():
-        worker_main()
+        _wmain()
     else:
         print("Running Taskr().get().run(*Taskr().get().get_section_data('.text'))")
         Taskr().get().run(*Taskr().get().get_section_data(".text"))
