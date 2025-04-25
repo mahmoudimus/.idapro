@@ -310,7 +310,7 @@ JUNK_PATTERNS = [
     JunkPatternMetadata(rb"(?P<junk>\xC7[\xC0-\xC3\xC5-\xC7]....)", "MOV reg32, imm32"),
     JunkPatternMetadata(rb"(?P<junk>\xF6[\xD8-\xDB\xDD-\xDF])", "NEG reg8"),
     JunkPatternMetadata(rb"(?P<junk>\x80[\xE8-\xEB\xED-\xEF].)", "AND reg8, imm8"),
-    JunkPatternMetadata(rb"(?P<junk>\x81[\xE8-\xEB\xED-\xEF]....)", "AND reg32, imm32"),
+    JunkPatternMetadata(rb"(?P<junk>\x81[\xE8-\xEB\xED-\xEF]....)", "SUB reg32, imm32"),
     JunkPatternMetadata(rb"(?P<junk>\x68....)", "PUSH imm32"),
     JunkPatternMetadata(rb"(?P<junk>\x6A.)", "PUSH imm8"),
     JunkPatternMetadata(rb"(?P<junk>[\x70-\x7F].)", "Random 112-127"),

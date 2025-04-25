@@ -4,7 +4,11 @@ import argparse
 import asyncio
 import atexit
 import collections
+import concurrent.futures
 import contextlib
+import dataclasses
+import enum
+import functools
 import itertools
 import json
 import logging
@@ -22,12 +26,6 @@ import time
 import typing
 import uuid
 import warnings
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from functools import lru_cache, singledispatch, wraps
-from multiprocessing import get_context, shared_memory
 
 import capstone
 import capstone.x86
@@ -186,7 +184,7 @@ class emit:
         self.event = event
 
     def __call__(self, fn):
-        @wraps(fn)
+        @functools.wraps(fn)
         def wrapper(inst, *args, **kwargs):
             result = fn(inst, *args, **kwargs)
             inst.emit(self.event)
@@ -198,7 +196,7 @@ class emit:
 class EventEmitter:
     @reify
     def _listeners(self):
-        return defaultdict(set)
+        return collections.defaultdict(set)
 
     def on(self, event, handler=None):
         """
@@ -224,7 +222,7 @@ class EventEmitter:
             self._listeners[event].add(handler)
             return handler
 
-        @wraps(self.on)
+        @functools.wraps(self.on)
         def decorator(func):
             self.on(event, func)
             return func
@@ -232,7 +230,7 @@ class EventEmitter:
         return decorator
 
     def once(self, event, handler):
-        @wraps(handler)
+        @functools.wraps(handler)
         def once_handler(*args, **kwargs):
             self.remove(event, once_handler)
             return handler(*args, **kwargs)
@@ -247,17 +245,17 @@ class EventEmitter:
             handler(*args, **kwargs)
 
 
-@dataclass
+@dataclasses.dataclass
 class AsyncEventEmitter:
     def __post_init__(self):
-        self._listeners = defaultdict(set)
+        self._listeners = collections.defaultdict(set)
 
     def on(self, event, handler=None):
         if handler:
             self._listeners[event].add(handler)
             return handler
 
-        @wraps(self.on)
+        @functools.wraps(self.on)
         def decorator(func):
             self.on(event, func)
             return func
@@ -281,7 +279,7 @@ class MultiprocessingHelper:
     """
 
     @staticmethod
-    @lru_cache(maxsize=1)
+    @functools.lru_cache(maxsize=1)
     def get_python_interpreter():
         """
         Gets the path to a suitable Python interpreter.
@@ -347,7 +345,7 @@ class MultiprocessingHelper:
         multiprocessing.set_executable(
             str(MultiprocessingHelper.get_python_interpreter())
         )
-        # multiprocessing.get_context() or multiprocessing.get_context("spawn")
+        # multiprocessing.multiprocessing.get_context() or multiprocessing.multiprocessing.get_context("spawn")
 
 
 MultiprocessingHelper.set_multiprocessing_context()
@@ -355,21 +353,21 @@ MultiprocessingHelper.set_multiprocessing_context()
 # ─── Core data structures ───────────────────────────────────────────────────
 
 
-class SegmentType(Enum):
-    STAGE1_MULTIPLE = auto()
-    STAGE1_SINGLE = auto()
-    JUNK = auto()
-    BIG_INSTRUCTION = auto()
+class SegmentType(enum.Enum):
+    STAGE1_MULTIPLE = enum.auto()
+    STAGE1_SINGLE = enum.auto()
+    JUNK = enum.auto()
+    BIG_INSTRUCTION = enum.auto()
 
 
-@dataclass
+@dataclasses.dataclass
 class MatchSegment:
     start: int
     length: int
     description: str
     matched_bytes: bytes
     segment_type: SegmentType
-    matched_groups: dict = field(default_factory=dict)
+    matched_groups: dict = dataclasses.field(default_factory=dict)
 
 
 class MatchChain:
@@ -485,7 +483,7 @@ class MatchChains:
         self.chains.append(chain)
 
     def __iter__(self):
-        return iter(self.chains)
+        yield from self.chains
 
     def sort(self):
         self.chains.sort(key=lambda x: x.overall_start())
@@ -496,23 +494,23 @@ class MatchChains:
     def __repr__(self):
         lines = []
         for c in self.chains:
-            desc = c.segments[0].description
+            desc = c.description
             off = c.overall_start()
             bhex = c.overall_matched_bytes().hex()[:16]
             tail = "…" if c.overall_length() > 16 else ""
-            lines.append(f"{desc.rjust(32)} @0x{off:X} {bhex}{tail}")
+            lines.append(f"{desc.rjust(32)} @ 0x{off:X} - {bhex}{tail}")
         return "\n".join(lines)
 
 
 # fmt: off
 PADDING_PATTERN = rb"(?:\xC0[\xE0-\xFF]\x00|(?:\x86|\x8A)[\xC0\xC9\xD2\xDB\xE4\xED\xF6\xFF])"
 
-class PatternCategory(Enum):
-    MULTI_PART = auto()
-    SINGLE_PART = auto()
-    JUNK = auto()
+class PatternCategory(enum.Enum):
+    MULTI_PART = enum.auto()
+    SINGLE_PART = enum.auto()
+    JUNK = enum.auto()
 
-@dataclass
+@dataclasses.dataclass
 class RegexPatternMetadata:
     category: PatternCategory
     pattern: bytes  # The regex pattern as a bytes literal
@@ -530,9 +528,9 @@ class RegexPatternMetadata:
         """Return the dictionary mapping group names to their indices."""
         return self.compile().groupindex
 
-@dataclass
+@dataclasses.dataclass
 class MultiPartPatternMetadata(RegexPatternMetadata):
-    category: PatternCategory = field(default=PatternCategory.MULTI_PART, init=False)
+    category: PatternCategory = dataclasses.field(default=PatternCategory.MULTI_PART, init=False)
 
     def __post_init__(self):
         # Compile to ensure group names are available.
@@ -544,9 +542,9 @@ class MultiPartPatternMetadata(RegexPatternMetadata):
                 f"MultiPart pattern is missing required groups: {missing}"
             )
 
-@dataclass
+@dataclasses.dataclass
 class SinglePartPatternMetadata(RegexPatternMetadata):
-    category: PatternCategory = field(default=PatternCategory.SINGLE_PART, init=False)
+    category: PatternCategory = dataclasses.field(default=PatternCategory.SINGLE_PART, init=False)
 
     def __post_init__(self):
         _ = self.compile(re.DOTALL)
@@ -557,9 +555,9 @@ class SinglePartPatternMetadata(RegexPatternMetadata):
                 f"SinglePart pattern is missing required groups: {missing}"
             )
 
-@dataclass
+@dataclasses.dataclass
 class JunkPatternMetadata(RegexPatternMetadata):
-    category: PatternCategory = field(default=PatternCategory.JUNK, init=False)
+    category: PatternCategory = dataclasses.field(default=PatternCategory.JUNK, init=False)
 
     def __post_init__(self):
         _ = self.compile(re.DOTALL)
@@ -718,8 +716,8 @@ def stage1_find_patterns(buf: bytes, base_ea: int):
         for rgx in (MULTI_PART_PATTERNS + SINGLE_PART_PATTERNS)
     ]
 
-    ctx = get_context("spawn")
-    with ProcessPoolExecutor(mp_context=ctx) as exe:
+    ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(mp_context=ctx) as exe:
         all_groups = exe.map(_stage1_scan_one, jobs)
 
     # flatten & sort
@@ -747,14 +745,23 @@ REG_32_SET = {
     capstone.x86.X86_REG_ESI,
     capstone.x86.X86_REG_EDI,
 }
+
 REG_8_SET = {
     capstone.x86.X86_REG_AL,
     capstone.x86.X86_REG_CL,
     capstone.x86.X86_REG_DL,
     capstone.x86.X86_REG_BL,
-    capstone.x86.X86_REG_BPL,
-    capstone.x86.X86_REG_SIL,
-    capstone.x86.X86_REG_DIL,
+    # AH (C4) is skipped by the regex range
+    capstone.x86.X86_REG_CH,  # C5
+    capstone.x86.X86_REG_DH,  # C6
+    capstone.x86.X86_REG_BH,  # C7
+    # Low bytes of SI, DI, BP, SP are only accessible with REX in 64-bit
+    # but the regex implies non-REX. The original set included BPL, SIL, DIL
+    # which correspond to ModR/M 101, 110, 111 when MOD != 11.
+    # The regex range C0-C3, C5-C7 *specifically* uses MOD=11.
+    # So, the correct registers are AL, CL, DL, BL, CH, DH, BH.
+    # Let's redefine REG_8_SET based *only* on the registers implied by
+    # the specific ModR/M bytes in the regexes when MOD=11.
 }
 
 
@@ -767,7 +774,8 @@ def is_allowed_reg(operands):
         return False
     reg = operands[0].reg
     # Check if the register is one of the 8-bit or 32-bit registers
-    # corresponding to the ModR/M R/M field 0-3, 5-7 when MOD=11.
+    # corresponding to the ModR/M R/M field 0-3, 5-7 when MOD=11,
+    # which is the set derived from ModR/M=11 ranges
     return reg in REG_8_SET or reg in REG_32_SET
 
 
@@ -776,47 +784,113 @@ def has_imm_operand(operands):
     return any(op.type == capstone.CS_OP_IMM for op in operands)
 
 
-def peel_junk(buf: bytes, is_64: bool) -> typing.List[MatchSegment]:
+@dataclasses.dataclass
+class JunkInstruction:
+    """Holds information about a single peeled junk instruction."""
+
+    #: Offset relative to the start of the peeled buffer
+    start_offset: int
+    #: Length of the peeled junk instruction
+    length: int
+    #: Description of the peeled junk instruction
+    description: str
+    #: Bytes of the peeled junk instruction
+    matched_bytes: bytes
+
+
+class CapstoneDisasmContext:
     """
-    Disassembles the buffer using Capstone and identifies a contiguous sequence
-    of instructions that match the criteria derived from the original regex
-    JUNK_PATTERNS.
+    Context manager and iterable for Capstone disassembly.
+
+    Usage:
+        with CapstoneDisasmContext(is_64, buf) as disasm_ctx:
+            for insn in disasm_ctx:
+                ...
+
+    On error, iteration yields nothing.
+    """
+
+    _EMPTY_SET = set()
+
+    def __init__(self, is_64: bool):
+        self.is_64 = is_64
+
+    @functools.cached_property
+    def md(self):
+        """
+        Cached property for the Capstone disassembler instance.
+        Returns None if initialization fails.
+        """
+        try:
+            md = capstone.Cs(
+                capstone.CS_ARCH_X86,
+                capstone.CS_MODE_64 if self.is_64 else capstone.CS_MODE_32,
+            )
+            md.detail = True
+            return md
+        except Exception as e:
+            logger.error(f"Failed to initialize Capstone: {e}")
+            return None
+
+    def __enter__(self):
+        # No setup needed; iteration is handled in __iter__
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # The __exit__ method is not a generator and should not yield.
+        # Instead, handle exceptions by logging them if present.
+        PROPOGATE = False
+        SUPPRESS = True
+        match exc_type:
+            case None:
+                return PROPOGATE
+            case capstone.CsError:
+                logger.error(f"Capstone disassembly error: {exc_val}")
+                return SUPPRESS
+            case _:
+                logger.error(f"Unexpected error during Capstone disassembly: {exc_val}")
+                return SUPPRESS
+
+    def disasm(self, buf: bytes, start_ea: int, **kwargs):
+        """
+        Disassemble the buffer and return an iterator of instructions.
+        If initialization failed, returns an empty iterator.
+        start_ea = 0 means is relative to the start of the input buffer 'buf'
+        """
+        if not self.md:
+            yield from self._EMPTY_SET
+            return
+
+        for insn in self.md.disasm(buf, start_ea, **kwargs):
+            yield insn
+
+
+def peel_junk(buf: bytes, is_64: bool) -> typing.List[JunkInstruction]:
+    """
+    Disassembles the buffer using Capstone and returns a list of
+    contiguous instructions that match the criteria derived from the
+    original regex JUNK_PATTERNS, using a match statement.
 
     Stops at the first instruction that does not match any of the junk criteria.
 
     Args:
         buf: The byte buffer to disassemble and peel junk from.
         is_64: True if disassembling in 64-bit mode, False for 32-bit.
-               (Note: Register checks are based on regex-implied 8/32-bit sets,
-                as REX prefixes are not used for these patterns).
-
     Returns:
-        A list of MatchSegment objects, where each segment represents an
-        individual junk instruction found in the contiguous sequence.
-        The 'start' attribute of each segment is the offset relative to the
-        beginning of the input 'buf'. Returns an empty list if no junk is found
-        or on error.
+        A list of JunkInstruction objects for each matched junk instruction.
+        Returns an empty list if no junk is found or on error.
     """
+    peeled_instructions: typing.List[JunkInstruction] = []
     if not buf:
-        return []
+        return peeled_instructions
 
-    # Initialize Capstone disassembler
-    try:
-        md = capstone.Cs(
-            capstone.CS_ARCH_X86, capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32
-        )
-        md.detail = True  # Needed for operand types, groups, and registers
-    except Exception as e:
-        logger.error(f"Failed to initialize Capstone: {e}")
-        return []  # Cannot proceed without disassembler
-
-    peeled_segments: typing.List[MatchSegment] = []
     current_offset = 0
 
-    # Disassemble instructions from the start of the buffer
-    # The address 0 is relative to the start of the input buffer 'buf'
-    try:
-        for insn in md.disasm(buf, 0):
+    with CapstoneDisasmContext(is_64) as disasm_ctx:
+        for insn in disasm_ctx.disasm(buf, 0):
+            logger.debug(
+                f"Disassembled instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset} - bytes: {insn.bytes.hex()}"
+            )
             # Safety check: Ensure the instruction doesn't go past the buffer end
             if current_offset + insn.size > len(buf):
                 logger.warning(
@@ -827,19 +901,15 @@ def peel_junk(buf: bytes, is_64: bool) -> typing.List[MatchSegment]:
             is_junk = False
             junk_description = "Unknown Junk"  # Default description
 
-            # --- Translate Regex Patterns to Capstone Checks using match ---
-            # We match on a tuple containing key instruction properties.
-            # Using _ for properties we don't need to match on directly in the case pattern.
-            # Guard clauses (if ...) are used for more complex conditions.
-
+            # Uses guard clauses (if ...) for complex conditions.
             match (insn.id, insn.size, insn.bytes, insn.operands, insn.groups):
+
                 # 1. rb"(?P<junk>\x0F\x31)" - RDTSC (2 bytes)
                 case (capstone.x86.X86_INS_RDTSC, 2, _, _, _):
                     is_junk = True
                     junk_description = "RDTSC"
 
-                # 2. rb"(?P<junk>\x0F[\x80-\x8F]..[\x00\x01]\x00)" - 6-byte Conditional Jump with specific displacement
-                # Match on size 6, then use a guard to check bytes and groups.
+                # 2. rb"(?P<junk>\x0F[\x80-\x8F]..[\x00\x01]\x00)" - 6-byte Conditional Jump
                 case (_, 6, bytes_, _, groups) if (
                     len(bytes_) >= 6
                     and bytes_[0] == 0x0F
@@ -847,13 +917,12 @@ def peel_junk(buf: bytes, is_64: bool) -> typing.List[MatchSegment]:
                     and (bytes_[4:6] == b"\x00\x00" or bytes_[4:6] == b"\x01\x00")
                     and (
                         capstone.CS_GRP_JUMP in groups or capstone.CS_GRP_CALL in groups
-                    )  # Sanity check group
+                    )
                 ):
                     is_junk = True
                     junk_description = "Specific 6-byte Conditional Jump"
 
-                # 3. rb"(?P<junk>\xE8..[\x00\x01]\x00)" - 5-byte CALL with specific displacement
-                # Match on ID and size, then use a guard to check bytes and operands.
+                # 3. rb"(?P<junk>\xE8..[\x00\x01]\x00)" - 5-byte CALL
                 case (capstone.x86.X86_INS_CALL, 5, bytes_, operands, _) if (
                     len(bytes_) >= 5
                     and (bytes_[3:5] == b"\x00\x00" or bytes_[3:5] == b"\x01\x00")
@@ -863,77 +932,92 @@ def peel_junk(buf: bytes, is_64: bool) -> typing.List[MatchSegment]:
                     junk_description = "Specific 5-byte CALL"
 
                 # 4. rb"(?P<junk>\x81[\xC0-\xC3\xC5-\xC7]....)" - ADD reg32, imm32 (6 bytes)
+                case (capstone.x86.X86_INS_ADD, 6, bytes_, operands, _) if (
+                    bytes_[0] == 0x81
+                    and is_allowed_reg(operands)
+                    and has_imm_operand(operands)
+                ):
+                    is_junk = True
+                    junk_description = "ADD reg32, imm32"
+
                 # 5. rb"(?P<junk>\x80[\xC0-\xC3\xC5-\xC7].)" - ADD reg8, imm8 (3 bytes)
                 # 6. rb"(?P<junk>\x83[\xC0-\xC3\xC5-\xC7].)" - ADD reg32, imm8 (3 bytes)
-                # Group ADD instructions by size, then use a guard to check register and immediate operands.
-                case (capstone.x86.X86_INS_ADD, size, _, operands, _) if (
-                    size in (3, 6)
-                    and is_allowed_reg(operands)
-                    and has_imm_operand(operands)
-                ):
-                    # Refine description based on size and opcode for clarity
-                    if size == 6:
-                        junk_description = "ADD reg32, imm32"
-                    elif size == 3:
-                        # Check the first byte to distinguish 80h vs 83h
-                        if insn.bytes and insn.bytes[0] == 0x80:
-                            junk_description = "ADD reg8, imm8"
-                        elif insn.bytes and insn.bytes[0] == 0x83:
-                            junk_description = "ADD reg32, imm8"
-                        else:  # Should not happen based on regexes, but defensive
-                            junk_description = "ADD reg, imm (size 3)"
-                    is_junk = True
+                # Combine ADD size 3, differentiate with guard on opcode byte
+                case (
+                    capstone.x86.X86_INS_ADD,
+                    3,
+                    bytes_,
+                    operands,
+                    _,
+                ) if is_allowed_reg(operands) and has_imm_operand(operands):
+                    if bytes_[0] == 0x80:
+                        is_junk = True
+                        junk_description = "ADD reg8, imm8"
+                    elif bytes_[0] == 0x83:
+                        is_junk = True
+                        junk_description = "ADD reg32, imm8"
 
-                # 7. rb"(?P<junk>\xC6[\xC0-\xC3\xC5-\xC7].)" - MOV reg8, imm8 (2 bytes)
-                # 8. rb"(?P<junk>\xC7[\xC0-\xC3\xC5-\xC7]....)" - MOV reg32, imm32 (5 bytes)
-                # Group MOV instructions by size, then use a guard.
-                case (capstone.x86.X86_INS_MOV, size, _, operands, _) if (
-                    size in (2, 5)
+                # 7. rb"(?P<junk>\xC6[\xC0-\xC3\xC5-\xC7].)" - MOV reg8, imm8 (3 bytes)
+                case (capstone.x86.X86_INS_MOV, 3, bytes_, operands, _) if (
+                    len(bytes_) >= 1
+                    and bytes_[0] == 0xC6  # Check opcode byte
+                    and is_allowed_reg(operands)  # Use updated helper
+                    and has_imm_operand(operands)
+                ):
+                    is_junk = True
+                    junk_description = "MOV reg8, imm8"
+
+                # 8. rb"(?P<junk>\xC7[\xC0-\xC3\xC5-\xC7]....)" - MOV reg32, imm32 (6 bytes)
+                case (capstone.x86.X86_INS_MOV, 6, bytes_, operands, _) if (
+                    bytes_[0] == 0xC7
                     and is_allowed_reg(operands)
                     and has_imm_operand(operands)
                 ):
-                    junk_description = (
-                        f"MOV reg{32 if size==5 else 8}, imm{32 if size==5 else 8}"
-                    )
                     is_junk = True
+                    junk_description = "MOV reg32, imm32"
 
                 # 9. rb"(?P<junk>\xF6[\xD8-\xDB\xDD-\xDF])" - NEG reg8 (2 bytes)
-                # \xF6 is opcode, /3 in ModR/M is NEG. [\xD8-\xDB\xDD-\xDF] is ModR/M for reg8, MOD=11, R/M=0-3,5-7
-                # Match on ID and size, then use a guard to check register operand.
-                case (capstone.x86.X86_INS_NEG, 2, _, operands, _) if is_allowed_reg(
-                    operands
-                ):
+                case (capstone.x86.X86_INS_NEG, 2, bytes_, operands, _) if bytes_[
+                    0
+                ] == 0xF6 and is_allowed_reg(operands):
                     is_junk = True
                     junk_description = "NEG reg8"
 
                 # 10. rb"(?P<junk>\x80[\xE8-\xEB\xED-\xEF].)" - AND reg8, imm8 (3 bytes)
-                # 11. rb"(?P<junk>\x81[\xE8-\xEB\xED-\xEF]....)" - AND reg32, imm32 (6 bytes)
-                # Group AND instructions by size, then use a guard.
-                case (capstone.x86.X86_INS_AND, size, _, operands, _) if (
-                    size in (3, 6)
+                case (capstone.x86.X86_INS_AND, 3, bytes_, operands, _) if (
+                    bytes_[0] == 0x80
                     and is_allowed_reg(operands)
                     and has_imm_operand(operands)
                 ):
-                    junk_description = (
-                        f"AND reg{32 if size==6 else 8}, imm{32 if size==6 else 8}"
-                    )
                     is_junk = True
+                    junk_description = "AND reg8, imm8"
+
+                # 11. rb"(?P<junk>\x81[\xE8-\xEB\xED-\xEF]....)" - SUB reg32, imm32 (6 bytes)
+                case (capstone.x86.X86_INS_SUB, 6, bytes_, operands, _) if (
+                    bytes_[0] == 0x81
+                    and is_allowed_reg(operands)
+                    and has_imm_operand(operands)
+                ):
+                    is_junk = True
+                    junk_description = "SUB reg32, imm32"
 
                 # 12. rb"(?P<junk>\x68....)" - PUSH imm32 (5 bytes)
                 # 13. rb"(?P<junk>\x6A.)" - PUSH imm8 (2 bytes)
-                # Group PUSH instructions by size, then use a guard.
-                case (capstone.x86.X86_INS_PUSH, size, _, operands, _) if size in (
+                # Combine PUSH size 2/5, differentiate with guard on opcode byte
+                case (capstone.x86.X86_INS_PUSH, size, bytes_, operands, _) if size in (
                     2,
                     5,
                 ) and has_imm_operand(operands):
-                    junk_description = f"PUSH imm{32 if size==5 else 8}"
-                    is_junk = True
+                    if size == 5 and bytes_[0] == 0x68:
+                        is_junk = True
+                        junk_description = "PUSH imm32"
+                    elif size == 2 and bytes_[0] == 0x6A:
+                        is_junk = True
+                        junk_description = "PUSH imm8"
 
                 # 14. rb"(?P<junk>[\x70-\x7F].)" - 2-byte Conditional Jump (Short)
-                # These are the opcodes for JO, JNO, JB, JNB, JBE, JNBE, JP, JNP, JL, JNL, JLE, JNLE
-                # followed by a 1-byte displacement.
                 case (_, 2, bytes_, _, groups) if (
-                    len(bytes_) >= 2
+                    len(bytes_) >= 1  # Need at least one byte for the check
                     and 0x70 <= bytes_[0] <= 0x7F
                     and capstone.CS_GRP_JUMP in groups
                 ):
@@ -941,11 +1025,12 @@ def peel_junk(buf: bytes, is_64: bool) -> typing.List[MatchSegment]:
                     junk_description = "2-byte Conditional Jump"
 
                 # 15. rb"(?P<junk>[\x50-\x5F])" - Single-byte PUSH/POP reg (1 byte)
-                # These are PUSH reg (0x50-0x57) and POP reg (0x58-0x5F)
-                case (_, 1, bytes_, operands, _) if (
-                    len(bytes_) >= 1
+                # Capture the ID in the pattern to check it in the guard
+                case (push_pop_id, 1, bytes_, operands, _) if (
+                    len(bytes_) >= 1  # Need at least one byte for the check
                     and 0x50 <= bytes_[0] <= 0x5F
-                    and insn.id in (capstone.x86.X86_INS_PUSH, capstone.x86.X86_INS_POP)
+                    and push_pop_id
+                    in (capstone.x86.X86_INS_PUSH, capstone.x86.X86_INS_POP)
                     and operands
                     and operands[0].type == capstone.CS_OP_REG
                 ):
@@ -957,38 +1042,23 @@ def peel_junk(buf: bytes, is_64: bool) -> typing.List[MatchSegment]:
                     is_junk = False
                     # No need to set description, it won't be used if not junk
 
-            # --- End of match statement ---
-
-            if is_junk:
-                # Create a MatchSegment for this individual junk instruction
-                peeled_segments.append(
-                    MatchSegment(
-                        start=current_offset,  # Offset relative to the start of 'buf'
-                        length=insn.size,
-                        description=junk_description,
-                        matched_bytes=insn.bytes,
-                        segment_type=SegmentType.JUNK,
-                        # matched_groups=None # No regex groups here, can omit or set None
-                    )
-                )
-                current_offset += insn.size
-                # logger.debug(f"  Peeled junk: {junk_description} - {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset - insn.size}")
-            else:
+            if not is_junk:
                 # Stop at the first non-junk instruction
-                # logger.debug(f"  Non-junk instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset}. Stopping peeling.")
+                # logger.debug(f"  Non-junk instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset}. Stopping.")
                 break
 
-    except capstone.CsError as e:
-        logger.error(f"Capstone disassembly error at offset {current_offset}: {e}")
-        # Return segments found so far even on error
-        return peeled_segments
-    except Exception as e:
-        logger.error(
-            f"Unexpected error during junk peeling at offset {current_offset}: {e}"
-        )
-        return peeled_segments
-
-    return peeled_segments
+            # Append info about this specific junk instruction
+            peeled_instructions.append(
+                JunkInstruction(
+                    start_offset=current_offset,
+                    length=insn.size,
+                    description=junk_description,
+                    matched_bytes=insn.bytes,
+                )
+            )
+            current_offset += insn.size
+            # logger.debug(f"  Found junk: {junk_description} - {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset - insn.size}")
+    return peeled_instructions
 
 
 def find_junk_stage2_chain(
@@ -1027,17 +1097,17 @@ def find_junk_stage2_chain(
 
     # Use peel_junk to find the individual contiguous junk segments
     # The 'start' in these segments is relative to the start of 'sub_buffer'
-    individual_junk_segments_relative = peel_junk(sub_buffer, is_64)
+    js: list[JunkInstruction] = peel_junk(sub_buffer, is_64)
 
-    if individual_junk_segments_relative:
+    if js:
         logger.debug(
-            f"Found {len(individual_junk_segments_relative)} individual junk instructions after stage 1 match at EA 0x{stage1_end_ea:X}"
+            f"Found {len(js)} individual junk instructions after stage 1 match at EA 0x{stage1_end_ea:X}"
         )
 
         # Add each individual junk segment to the chain
-        for relative_seg in individual_junk_segments_relative:
+        for relative_seg in js:
             # Calculate the absolute start EA of this junk segment
-            absolute_start_ea = stage1_end_ea + relative_seg.start
+            absolute_start_ea = stage1_end_ea + relative_seg.start_offset
 
             # Calculate the start offset relative to the chain's base_address
             # This is what MatchSegment.start should store
@@ -1104,7 +1174,7 @@ def stage3_filter(chains, min_length=12, max_length=129):
 # ─── Stage 4: jump-chain + big-instr + overlap ──────────────────────────────
 
 
-@dataclass
+@dataclasses.dataclass
 class BasicDecodedInstruction:
     """Holds standardized information about a decoded instruction."""
 
@@ -1179,7 +1249,7 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         return decoded
 
 
-@dataclass
+@dataclasses.dataclass
 class JumpTargetAnalyzer:
     # Input parameters for processing jumps.
     match_bytes: bytes  # The bytes in which we're matching jump instructions.
@@ -1188,13 +1258,13 @@ class JumpTargetAnalyzer:
     start_ea: int  # Base address of the memory block (used for bounds checking).
 
     # Internal structures.
-    jump_targets: collections.Counter = field(
+    jump_targets: collections.Counter = dataclasses.field(
         init=False, default_factory=collections.Counter
     )
-    jump_details: list = field(
+    jump_details: list = dataclasses.field(
         init=False, default_factory=list
     )  # List of (jump_ea, final_target, stage1_type)
-    target_type: dict = field(
+    target_type: dict = dataclasses.field(
         init=False, default_factory=dict
     )  # final_target -> stage1_type
 
@@ -1783,7 +1853,7 @@ def log_execution_time(func, loglvl=logging.INFO):
     42
     """
 
-    @wraps(func)
+    @functools.wraps(func)
     async def wrapper(*args, **kwargs):
         start = time.perf_counter()
         result = await func(*args, **kwargs)
@@ -1797,7 +1867,7 @@ def log_execution_time(func, loglvl=logging.INFO):
 # ─── Async deobfuscator ───────────────────────────────────
 
 
-@dataclass
+@dataclasses.dataclass
 class AsyncDeobfuscator(AsyncEventEmitter):
     shm_name: str
     data_size: int
@@ -1810,8 +1880,8 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         self.pause_evt = asyncio.Event()
         self.stop_evt = asyncio.Event()
         self.max_workers = self.max_workers or max(1, multiprocessing.cpu_count())
-        ctx = get_context("spawn")
-        self.executor = ProcessPoolExecutor(
+        ctx = multiprocessing.get_context("spawn")
+        self.executor = concurrent.futures.ProcessPoolExecutor(
             max_workers=self.max_workers, mp_context=ctx
         )
         logger.info(f"executor pool created with {self.max_workers} workers")
@@ -1825,7 +1895,7 @@ class AsyncDeobfuscator(AsyncEventEmitter):
             async with self._get_buffer() as buf:
                 # use buf
         """
-        shm = shared_memory.SharedMemory(name=self.shm_name)
+        shm = multiprocessing.shared_memory.SharedMemory(name=self.shm_name)
         try:
             yield bytes(shm.buf[: self.data_size])
         finally:
@@ -2413,8 +2483,114 @@ def _wmain():
 
 
 # ─── IDA plugin entrypoint is no longer needed for console mode ─────────────
-WORKER_SCRIPT_PATH = pathlib.Path(__file__)
 
+
+class PatchManager:
+    """Manages deferred patch operations."""
+
+    class Mode(enum.Enum):
+        PATCH = enum.auto()  # Use ida_bytes.patch_bytes
+        PUT = enum.auto()  # Use ida_bytes.put_bytes
+
+    def __init__(
+        self,
+        patch_mode: Mode = Mode.PATCH,
+        dry_run: bool = False,
+        auto_clear: bool = True,
+    ):
+        self.dry_run = dry_run
+        self.patch_mode = patch_mode
+        self.pending_patches: list[DeferredPatchOp] = []
+        self.auto_clear = auto_clear
+        logger.info(
+            f"PatchManager initialized (dry_run={self.dry_run}, mode={self.patch_mode.name})"
+        )
+
+    def add_patch(self, address: int, byte_values: bytes):
+        """Creates and queues a DeferredPatchOp."""
+        op = DeferredPatchOp(address, byte_values, self.patch_mode)
+        self.pending_patches.append(op)
+        logger.debug(f"Queued patch operation: {op}")
+
+    def apply_all(self, dry_run_override: bool | None = None) -> bool:
+        """Applies all queued patch operations."""
+        logger.info(f"Applying {len(self)} queued patches...")
+        success_count = 0
+        fail_count = 0
+
+        if dry_run_override is None:
+            # None is a sentinel value here that represents "use the default"
+            dry_run_override = self.dry_run
+
+        for op in self.pending_patches:
+            if op.apply(dry_run_override):
+                success_count += 1
+            else:
+                fail_count += 1
+
+        logger.info(
+            f"Patch application complete. Success: {success_count}, Failed: {fail_count}"
+        )
+        if self.auto_clear:
+            self.pending_patches.clear()  # Clear the list after applying
+        return fail_count == 0  # Return True if all patches were applied successfully
+
+    def __len__(self) -> int:
+        return len(self.pending_patches)
+
+
+@dataclasses.dataclass(repr=False)
+class DeferredPatchOp:
+    """Class to store patch operations that will be applied later."""
+
+    address: int
+    byte_values: bytes
+    mode: PatchManager.Mode
+    dry_run: bool = False
+
+    @classmethod
+    def patch(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PATCH, dry_run)
+
+    @classmethod
+    def put(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PUT, dry_run)
+
+    def apply(self, dry_run_override: bool = False) -> bool:
+        """Apply the patch operation using either patch_bytes or put_bytes based on mode."""
+        is_dry_run = dry_run_override or self.dry_run
+        logger.info(
+            "[*] %sPatching decrypted chunk %s at 0x%X (size: %d)",
+            "(Dry Run) " if is_dry_run else "",
+            ("revertably" if self.mode == PatchManager.Mode.PATCH else "destructively"),
+            self.address,
+            len(self.byte_values),
+        )
+        success = True
+        if is_dry_run:
+            return success
+
+        func = (
+            idaapi.put_bytes
+            if self.mode == PatchManager.Mode.PUT
+            else idaapi.patch_bytes
+        )
+        try:
+            func(self.address, self.byte_values)
+        except Exception as e:
+            logger.error(f"Failed to apply patch {self}: {e}")
+            success = False
+        return success
+
+    def __str__(self):
+        """String representation with hex formatting."""
+        dry_run_str = " (dry run)" if self.dry_run else ""
+        return f"{self.__class__.__name__}({len(self.byte_values)} bytes, mode={self.mode.name}{dry_run_str} @ address=0x{self.address:X})"
+
+    __repr__ = __str__
+
+
+WORKER_SCRIPT_PATH = pathlib.Path(__file__)
 
 if is_ida():
     import json
@@ -2429,113 +2605,6 @@ if is_ida():
     import idaapi
 
     is_x64 = ida_ida.inf_is_64bit()
-
-    class PatchManager:
-        """Manages deferred patch operations."""
-
-        class Mode(Enum):
-            PATCH = auto()  # Use ida_bytes.patch_bytes
-            PUT = auto()  # Use ida_bytes.put_bytes
-
-        def __init__(
-            self,
-            patch_mode: Mode = Mode.PATCH,
-            dry_run: bool = False,
-            auto_clear: bool = True,
-        ):
-            self.dry_run = dry_run
-            self.patch_mode = patch_mode
-            self.pending_patches: list[DeferredPatchOp] = []
-            self.auto_clear = auto_clear
-            logger.info(
-                f"PatchManager initialized (dry_run={self.dry_run}, mode={self.patch_mode.name})"
-            )
-
-        def add_patch(self, address: int, byte_values: bytes):
-            """Creates and queues a DeferredPatchOp."""
-            op = DeferredPatchOp(address, byte_values, self.patch_mode)
-            self.pending_patches.append(op)
-            logger.debug(f"Queued patch operation: {op}")
-
-        def apply_all(self, dry_run_override: bool | None = None) -> bool:
-            """Applies all queued patch operations."""
-            logger.info(f"Applying {len(self)} queued patches...")
-            success_count = 0
-            fail_count = 0
-
-            if dry_run_override is None:
-                # None is a sentinel value here that represents "use the default"
-                dry_run_override = self.dry_run
-
-            for op in self.pending_patches:
-                if op.apply(dry_run_override):
-                    success_count += 1
-                else:
-                    fail_count += 1
-
-            logger.info(
-                f"Patch application complete. Success: {success_count}, Failed: {fail_count}"
-            )
-            if self.auto_clear:
-                self.pending_patches.clear()  # Clear the list after applying
-            return fail_count == 0  # Return True if all patches were applied successfully
-
-        def __len__(self) -> int:
-            return len(self.pending_patches)
-
-    @dataclass(repr=False)
-    class DeferredPatchOp:
-        """Class to store patch operations that will be applied later."""
-
-        address: int
-        byte_values: bytes
-        mode: PatchManager.Mode
-        dry_run: bool = False
-
-        @classmethod
-        def patch(cls, address: int, byte_values: bytes, dry_run: bool = False):
-            return cls(address, byte_values, PatchManager.Mode.PATCH, dry_run)
-
-        @classmethod
-        def put(cls, address: int, byte_values: bytes, dry_run: bool = False):
-            return cls(address, byte_values, PatchManager.Mode.PUT, dry_run)
-
-        def apply(self, dry_run_override: bool = False) -> bool:
-            """Apply the patch operation using either patch_bytes or put_bytes based on mode."""
-            is_dry_run = dry_run_override or self.dry_run
-            logger.info(
-                "[*] %sPatching decrypted chunk %s at 0x%X (size: %d)",
-                "(Dry Run) " if is_dry_run else "",
-                (
-                    "revertably"
-                    if self.mode == PatchManager.Mode.PATCH
-                    else "destructively"
-                ),
-                self.address,
-                len(self.byte_values),
-            )
-            success = True
-            if is_dry_run:
-                return success
-
-            func = (
-                idaapi.put_bytes
-                if self.mode == PatchManager.Mode.PUT
-                else idaapi.patch_bytes
-            )
-            try:
-                func(self.address, self.byte_values)
-            except Exception as e:
-                logger.error(f"Failed to apply patch {self}: {e}")
-                success = False
-            return success
-
-        def __str__(self):
-            """String representation with hex formatting."""
-            dry_run_str = " (dry run)" if self.dry_run else ""
-            return f"{self.__class__.__name__}({len(self.byte_values)} bytes, mode={self.mode.name}{dry_run_str} @ address=0x{self.address:X})"
-
-        __repr__ = __str__
 
     class WorkerLauncher(QtCore.QProcess):
         """
@@ -2934,10 +3003,10 @@ if is_ida():
 
             data_size = len(bytes_to_process)
             # create shared memory & copy
-            self._shared_memory = shared_memory.SharedMemory(
+            self._shared_memory = multiprocessing.shared_memory.SharedMemory(
                 create=True, size=data_size
             )
-            self._shared_memory.buf[:data_size] = bytes_to_process
+            self._multiprocessing.shared_memory.buf[:data_size] = bytes_to_process
 
             # launch worker
             self.proc = WorkerLauncher()
@@ -2945,7 +3014,7 @@ if is_ida():
             self.proc.processing_results.connect(self._handle_worker_results)
             self.proc.error_occurred_msg.connect(self._handle_worker_error)
             if not self.proc.launch_worker(
-                start_ea, self._shared_memory.name, data_size
+                start_ea, self._multiprocessing.shared_memory.name, data_size
             ):
                 self.terminate()
                 logger.error(f"Failed to start worker process: {self.errorString()}")
@@ -2958,16 +3027,16 @@ if is_ida():
 
             try:
                 logger.info(
-                    f"Unlinking shared memory segment: {self._shared_memory.name}"
+                    f"Unlinking shared memory segment: {self._multiprocessing.shared_memory.name}"
                 )
-                self._shared_memory.close()  # Close parent's view
-                shared_memory.SharedMemory(
-                    self._shared_memory.name
+                self._multiprocessing.shared_memory.close()  # Close parent's view
+                multiprocessing.shared_memory.SharedMemory(
+                    self._multiprocessing.shared_memory.name
                 ).unlink()  # Unlink the segment
                 logger.info("Shared memory unlinked.")
             except FileNotFoundError:
                 logger.warning(
-                    f"Shared memory segment {self._shared_memory.name} already unlinked."
+                    f"Shared memory segment {self._multiprocessing.shared_memory.name} already unlinked."
                 )
             except Exception as e:
                 logger.error(f"Error unlinking shared memory: {e}", exc_info=True)
