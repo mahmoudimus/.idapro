@@ -1,4 +1,5 @@
 import argparse
+import functools
 import json
 import logging
 import pathlib
@@ -688,16 +689,20 @@ class KeyLengthProcessor:
             return None
 
 
-class NumLengthProcessor:
-    name = "NumLengthProcessor"
+class NumKeysProcessor:
+    name = "NumKeysProcessor"
 
     def signatures(self):
-        return [
-            BytePattern("33 D2 48 8B 5C 24"),
-            BytePattern("33 D2 48 ? ? 24"),
-            BytePattern("8B B4 24 ? ? ? ? 33 D2 48 ? ? 24"),
-            BytePattern("8B B4 24 ? ? ? ? 33 D2 48 ? ? 24"),
-        ]
+
+        return map(
+            BytePattern,
+            [
+                "33 D2 48 8B ? 24",  # 32-bit
+                "33 D2 48 89 ? 24",  # 64-bit
+                "33 D2 4C 8B ? 24",  # 64-bit
+                "33 D2 4C 89 ? 24",  # 32-bit
+            ],
+        )
 
     def is_valid(self, x):
         return isinstance(x, int) and 0x1E <= x < 0x100
@@ -710,18 +715,18 @@ class NumLengthProcessor:
         """Creates Searcher instances to find the anchor."""
 
         # Search forward from the location found by the initial signature scan ('ea')
-        finder = ByteSequenceFinder(
-            ea, pattern="F7 F1 48 C7", max_distance=max_distance
-        )
+        pats = ["F7 F1 48 C7", "F7 F1 48 C7 ? 24"]
 
         def search():
-            for anchor_ea in finder.find_iter():
-                if abs(anchor_ea - ea) > max_distance:
-                    continue
-                logger.debug("Found possible anchor at 0x%X", anchor_ea)
-                insn = ida_ua.insn_t()
-                if ida_ua.decode_insn(insn, anchor_ea) > 0:
-                    return anchor_ea
+            for pat in pats:
+                finder = ByteSequenceFinder(ea, pat, max_distance=max_distance)
+                for anchor_ea in finder.find_iter():
+                    if abs(anchor_ea - ea) > max_distance:
+                        continue
+                    logger.debug("Found possible anchor at 0x%X", anchor_ea)
+                    insn = ida_ua.insn_t()
+                    if ida_ua.decode_insn(insn, anchor_ea) > 0:
+                        return anchor_ea
 
         return [search]
 
@@ -854,7 +859,7 @@ def find_crypto_key():
     segment = ida_segment.get_segm_by_name(".text")
     crypto_key_info = [0, 0, 0]  # key_addr, num_keys, per_key_length
     for idx, processor in enumerate(
-        [KeyOffsetProcessor(), NumLengthProcessor(), KeyLengthProcessor()]
+        [KeyOffsetProcessor(), NumKeysProcessor(), KeyLengthProcessor()]
     ):
         logger.info("Starting processor: %s", processor.name)
         for ea in processor.find(ByteSequenceFinder(segment).with_pattern):
