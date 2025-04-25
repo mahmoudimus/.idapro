@@ -12,13 +12,6 @@ import typing
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-import mutilz.actions as actions
-import mutilz.helpers.ida as ida_helpers
-import mutilz.settings
-from mutilz.actions.force_analyze import ForceAnalyzeActionHandler
-from mutilz.helpers.ida import format_addr
-from mutilz.logconf import configure_logging
-
 import ida_allins
 import ida_auto
 import ida_bytes
@@ -33,10 +26,17 @@ import idautils
 import idc
 
 import capstone
+import mutilz.actions as actions
+import mutilz.helpers.ida as ida_helpers
+import mutilz.settings
+from mutilz.actions.force_analyze import ForceAnalyzeActionHandler
+from mutilz.helpers.ida import format_addr
+from mutilz.logconf import configure_logging
 
 logger = logging.getLogger("mutilz.actions.remove_anti_disassembly")
 md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
 md.detail = True
+
 
 class ThreadUtils:
     @staticmethod
@@ -923,16 +923,20 @@ class MatchChains:
 @dataclasses.dataclass
 class BasicDecodedInstruction:
     """Holds standardized information about a decoded instruction."""
+
     address: int
     size: int
     is_jump: bool = False
     jump_target: typing.Optional[int] = None
     is_nop: bool = False
 
-    
+
 class InstructionDecoder(typing.Protocol):
     """Protocol defining the expected signature for decoder functions."""
-    def decode(self, ea: int, mem_bytes_at_ea: bytes) -> typing.Optional[BasicDecodedInstruction]:
+
+    def decode(
+        self, ea: int, mem_bytes_at_ea: bytes
+    ) -> typing.Optional[BasicDecodedInstruction]:
         """
         Decodes the instruction at virtual address 'ea' using the provided memory bytes.
 
@@ -949,8 +953,10 @@ class InstructionDecoder(typing.Protocol):
 
 
 class IdaInstructionDecoder(InstructionDecoder):
-    
-    def decode(self, ea: int, mem_bytes_at_ea: bytes) -> typing.Optional[BasicDecodedInstruction]:
+
+    def decode(
+        self, ea: int, mem_bytes_at_ea: bytes
+    ) -> typing.Optional[BasicDecodedInstruction]:
         """
         Decodes instruction at ea using IDA's disassembler.
         Ignores mem_bytes_at_ea, uses IDA's database.
@@ -970,13 +976,14 @@ class IdaInstructionDecoder(InstructionDecoder):
         elif insn.itype in ALL_JUMPS and insn.Op1.type == ida_ua.o_near:
             decoded.is_jump = True
             decoded.jump_target = insn.Op1.addr
-        return decoded        
-    
-    
+        return decoded
+
 
 class CapstoneInstructionDecoder(InstructionDecoder):
 
-    def decode(self, ea: int, mem_bytes_at_ea: bytes) -> typing.Optional[BasicDecodedInstruction]:
+    def decode(
+        self, ea: int, mem_bytes_at_ea: bytes
+    ) -> typing.Optional[BasicDecodedInstruction]:
         """
         Decodes instruction at ea using IDA's disassembler.
         Ignores mem_bytes_at_ea, uses IDA's database.
@@ -985,25 +992,25 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         # Decode using Capstone
         try:
             # Use list comprehension and next to get the first instruction or None
-            insn = next(
-                md.disasm(mem_bytes_at_ea, ea, count=1), None
-            )
+            insn = next(md.disasm(mem_bytes_at_ea, ea, count=1), None)
         except capstone.CsError as e:
             logger.error(f"Capstone decoding error at 0x{ea:X}: {e}")
             return None
-        
+
         if insn is None:
             return None
-        
+
         decoded = BasicDecodedInstruction(address=ea, size=insn.size)
         if insn.id == capstone.x86.X86_INS_NOP:
             decoded.is_nop = True
         elif capstone.CS_GRP_JUMP in insn.groups:
-            if len(insn.operands) > 0 and insn.operands[0].type == capstone.x86.X86_OP_IMM:
+            if (
+                len(insn.operands) > 0
+                and insn.operands[0].type == capstone.x86.X86_OP_IMM
+            ):
                 decoded.is_jump = True
                 decoded.jump_target = insn.operands[0].imm
-        return decoded   
-
+        return decoded
 
 
 @dataclass
@@ -1035,10 +1042,10 @@ class JumpTargetAnalyzer:
     target_type: dict = field(
         init=False, default_factory=dict
     )  # final_target -> stage1_type
-            
+
     def follow_jump_chain(
         self,
-        mem: Memory, # Expect a Memory object
+        mem: Memory,  # Expect a Memory object
         current_ea: int,
         match_end: int,
         decoder: InstructionDecoder,
@@ -1066,19 +1073,21 @@ class JumpTargetAnalyzer:
 
         # Get an efficient view of the memory buffer
         mem_view = mem.view
-        mem_start_ea = mem.base # Absolute start address of the buffer
+        mem_start_ea = mem.base  # Absolute start address of the buffer
         mem_len = len(mem_view)
-        mem_end_ea = mem_start_ea + mem_len # Absolute end address (exclusive)
+        mem_end_ea = mem_start_ea + mem_len  # Absolute end address (exclusive)
 
         if current_ea in visited:
-            logger.debug(f"{indent}Jump chain stopped: Already visited 0x{current_ea:X}")
+            logger.debug(
+                f"{indent}Jump chain stopped: Already visited 0x{current_ea:X}"
+            )
             return None
         # Check if start address is within the bounds defined by the Memory object
         if not (mem_start_ea <= current_ea < mem_end_ea):
-             logger.debug(
+            logger.debug(
                 f"{indent}Jump chain stopped: Start address 0x{current_ea:X} is outside Memory bounds [0x{mem_start_ea:X}, 0x{mem_end_ea:X})"
-             )
-             return None
+            )
+            return None
 
         visited.add(current_ea)
 
@@ -1086,8 +1095,10 @@ class JumpTargetAnalyzer:
         while True:
             # Check if the current tracing address is still within the Memory bounds
             if not (mem_start_ea <= trace_ea < mem_end_ea):
-                 logger.debug(f"{indent}Stopping trace: Address 0x{trace_ea:X} is outside Memory bounds [0x{mem_start_ea:X}, 0x{mem_end_ea:X}). Returning last valid start: 0x{current_ea:X}")
-                 return current_ea # Return the start address of the sequence that led out of bounds
+                logger.debug(
+                    f"{indent}Stopping trace: Address 0x{trace_ea:X} is outside Memory bounds [0x{mem_start_ea:X}, 0x{mem_end_ea:X}). Returning last valid start: 0x{current_ea:X}"
+                )
+                return current_ea  # Return the start address of the sequence that led out of bounds
 
             decoded_insn = None
             # Calculate offset relative to the start of the Memory object's buffer
@@ -1098,36 +1109,48 @@ class JumpTargetAnalyzer:
             # Get bytes starting from the offset using the memoryview slice
             # Convert the slice to bytes for the decoder interface
             bytes_for_decoder = mem_view[offset:].tobytes()
-            if not bytes_for_decoder: # Should not happen if bounds check is correct, but defensive check
-                 logger.warning(f"{indent}No bytes available for decoding at offset {offset} (address 0x{trace_ea:X}). Stopping trace.")
-                 return current_ea
+            if (
+                not bytes_for_decoder
+            ):  # Should not happen if bounds check is correct, but defensive check
+                logger.warning(
+                    f"{indent}No bytes available for decoding at offset {offset} (address 0x{trace_ea:X}). Stopping trace."
+                )
+                return current_ea
 
             try:
                 # Call the passed-in decoder function
                 decoded_insn = decoder.decode(trace_ea, bytes_for_decoder)
             except Exception as e:
-                logger.error(f"{indent}Decoder function raised exception at 0x{trace_ea:X}: {e}")
-                decoded_insn = None # Treat as decode failure
+                logger.error(
+                    f"{indent}Decoder function raised exception at 0x{trace_ea:X}: {e}"
+                )
+                decoded_insn = None  # Treat as decode failure
 
             # If decoding failed or decoder returned None
             if not decoded_insn:
-                logger.debug(f"{indent}Failed to decode instruction at 0x{trace_ea:X}. Stopping trace. Returning start: 0x{current_ea:X}")
-                return current_ea # Return start of the sequence
+                logger.debug(
+                    f"{indent}Failed to decode instruction at 0x{trace_ea:X}. Stopping trace. Returning start: 0x{current_ea:X}"
+                )
+                return current_ea  # Return start of the sequence
 
             # --- Process the decoded instruction ---
             if decoded_insn.is_nop:
-                logger.debug(f"{indent}NOP found at 0x{trace_ea:X} (size {decoded_insn.size}). Skipping.")
+                logger.debug(
+                    f"{indent}NOP found at 0x{trace_ea:X} (size {decoded_insn.size}). Skipping."
+                )
                 trace_ea += decoded_insn.size
-                continue # Continue the while loop to the next instruction
+                continue  # Continue the while loop to the next instruction
 
             if not decoded_insn.is_jump or decoded_insn.size != 2:
-                 logger.debug(f"{indent}Chain stopped at 0x{trace_ea:X}: Instruction is not a 2-byte jump. Returning start: 0x{current_ea:X}")
-                 return current_ea # Return the start address of the sequence that ended
+                logger.debug(
+                    f"{indent}Chain stopped at 0x{trace_ea:X}: Instruction is not a 2-byte jump. Returning start: 0x{current_ea:X}"
+                )
+                return current_ea  # Return the start address of the sequence that ended
 
             # --- We have a 2-byte jump ---
-            target = decoded_insn.jump_target # This is an absolute address
+            target = decoded_insn.jump_target  # This is an absolute address
             logger.debug(
-                 f"{indent}  -> Found 2-byte jump at 0x{trace_ea:X} targeting 0x{target:X}"
+                f"{indent}  -> Found 2-byte jump at 0x{trace_ea:X} targeting 0x{target:X}"
             )
 
             # --- Decide action based on the jump target (using absolute addresses) ---
@@ -1146,21 +1169,21 @@ class JumpTargetAnalyzer:
                 logger.debug(
                     f"{indent}Jump chain ends: Reached potential next stage start 0x{target:X}"
                 )
-                return target # Return the exact target address
+                return target  # Return the exact target address
 
             # 3. Target is within the overall Memory block, but *before* match_start.
             elif mem_start_ea <= target < self.match_start:
-                 logger.debug(
+                logger.debug(
                     f"{indent}Jump chain ends: Target 0x{target:X} is within Memory bounds [{mem_start_ea:X},{mem_end_ea:X}) but outside followable range [{self.match_start:X}, {match_end + 6:X}). Returning target."
-                 )
-                 return target # Return the target address itself
+                )
+                return target  # Return the target address itself
 
             # 4. Target is out of the overall Memory bounds or otherwise unexpected.
             else:
                 logger.debug(
                     f"{indent}Jump chain stopped: Target 0x{target:X} is outside allowed ranges. Returning start address 0x{current_ea:X}"
                 )
-                return current_ea # Return the start address of the sequence containing the invalid jump
+                return current_ea  # Return the start address of the sequence containing the invalid jump
 
     def process(self, mem, chain):
         """
@@ -1776,7 +1799,6 @@ def decompile_function(func_start: int):
     ida_auto.auto_wait()
 
 
-
 def get_garbage_blobs(text_seg: ida_segment.segment_t):
     """
     Yields pairs of (garbage_blog_ea, aligned)
@@ -1827,7 +1849,7 @@ def process(start_ea: int, end_ea: int, patch_manager: PatchManager):
     if not chains:
         logger.info("No stage1 matches found!")
         return
-    
+
     chains: MatchChains = find_junk_instructions_after_stage1(
         mem, chains, start_ea, end_ea
     )
@@ -1866,11 +1888,14 @@ def execute_action(
         logger.info("Force analysis completed.")
 
 
+ACTION_NAME = "mutilz:remove_anti_disassembly"
+
+
 @dataclasses.dataclass
 class RemoveAntiDisassemblyActionHandler(ida_helpers.BaseActionHandler):
     """Remove Anti Disassembly"""
 
-    action_name: str = "mutilz:remove_anti_disassembly"
+    action_name: str = ACTION_NAME
     action_label: str = "Remove Anti Disassembly"
     icon: int = 19
 
@@ -1898,10 +1923,20 @@ class RemoveAntiDisassemblyActionHandler(ida_helpers.BaseActionHandler):
             return start_ea, None
         return start_ea, end_ea
 
-    def settings(self) -> mutilz.settings.ActionSettings:
+    @staticmethod
+    def settings() -> mutilz.settings.ActionSettings:
         mutilz.settings.reload()
-        return mutilz.settings.get_action_config(self.action_name)
+        return mutilz.settings.get_action_config(ACTION_NAME)
 
+    @staticmethod
+    def patch_manager(dry_run: bool = False) -> PatchManager:
+        settings = RemoveAntiDisassemblyActionHandler.settings()
+        patch_mode_name = settings.get("patch_mode", "put")
+        patch_mode = PatchManager.Mode._member_map_.get(
+            patch_mode_name.upper(), PatchManager.Mode.PUT
+        )
+        return PatchManager(patch_mode=patch_mode, dry_run=dry_run)
+    
     def activate(self, ctx):
         ea = idaapi.get_screen_ea()
         settings = self.settings()
@@ -1912,11 +1947,7 @@ class RemoveAntiDisassemblyActionHandler(ida_helpers.BaseActionHandler):
         configure_logging(log=logger, level=log_level)
 
         dry_run = settings.getboolean("dry_run", True)
-        patch_mode_name = settings.get("patch_mode", "put")
-        patch_mode = PatchManager.Mode._member_map_.get(
-            patch_mode_name.upper(), PatchManager.Mode.PUT
-        )
-        patch_manager = PatchManager(patch_mode=patch_mode, dry_run=dry_run)
+        patch_manager = self.patch_manager(dry_run=dry_run)
 
         func = ida_funcs.get_func(ea)
         if func:
