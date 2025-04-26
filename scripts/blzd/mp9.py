@@ -14,6 +14,8 @@ import json
 import logging
 import math
 import multiprocessing
+import multiprocessing.connection
+import multiprocessing.shared_memory
 import os
 import pathlib
 import platform
@@ -152,7 +154,7 @@ def get_logger(name=None):
 
 
 logger = get_logger()
-configure_logging(logger, level=logging.DEBUG)
+configure_logging(logger)
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -502,13 +504,11 @@ class MatchChains:
         return "\n".join(lines)
 
 
-# fmt: off
-PADDING_PATTERN = rb"(?:\xC0[\xE0-\xFF]\x00|(?:\x86|\x8A)[\xC0\xC9\xD2\xDB\xE4\xED\xF6\xFF])"
-
 class PatternCategory(enum.Enum):
     MULTI_PART = enum.auto()
     SINGLE_PART = enum.auto()
     JUNK = enum.auto()
+
 
 @dataclasses.dataclass
 class RegexPatternMetadata:
@@ -528,9 +528,12 @@ class RegexPatternMetadata:
         """Return the dictionary mapping group names to their indices."""
         return self.compile().groupindex
 
+
 @dataclasses.dataclass
 class MultiPartPatternMetadata(RegexPatternMetadata):
-    category: PatternCategory = dataclasses.field(default=PatternCategory.MULTI_PART, init=False)
+    category: PatternCategory = dataclasses.field(
+        default=PatternCategory.MULTI_PART, init=False
+    )
 
     def __post_init__(self):
         # Compile to ensure group names are available.
@@ -538,13 +541,14 @@ class MultiPartPatternMetadata(RegexPatternMetadata):
         required_groups = {"first_jump", "padding", "second_jump"}
         missing = required_groups - set(self.group_names)
         if missing:
-            raise ValueError(
-                f"MultiPart pattern is missing required groups: {missing}"
-            )
+            raise ValueError(f"MultiPart pattern is missing required groups: {missing}")
+
 
 @dataclasses.dataclass
 class SinglePartPatternMetadata(RegexPatternMetadata):
-    category: PatternCategory = dataclasses.field(default=PatternCategory.SINGLE_PART, init=False)
+    category: PatternCategory = dataclasses.field(
+        default=PatternCategory.SINGLE_PART, init=False
+    )
 
     def __post_init__(self):
         _ = self.compile(re.DOTALL)
@@ -555,9 +559,12 @@ class SinglePartPatternMetadata(RegexPatternMetadata):
                 f"SinglePart pattern is missing required groups: {missing}"
             )
 
+
 @dataclasses.dataclass
 class JunkPatternMetadata(RegexPatternMetadata):
-    category: PatternCategory = dataclasses.field(default=PatternCategory.JUNK, init=False)
+    category: PatternCategory = dataclasses.field(
+        default=PatternCategory.JUNK, init=False
+    )
 
     def __post_init__(self):
         _ = self.compile(re.DOTALL)
@@ -565,7 +572,11 @@ class JunkPatternMetadata(RegexPatternMetadata):
         missing = required_groups - set(self.group_names)
         if missing:
             raise ValueError("Junk pattern must have a 'junk' group.")
-    
+
+
+# fmt: off
+PADDING_PATTERN = rb"(?:\xC0[\xE0-\xFF]\x00|(?:\x86|\x8A)[\xC0\xC9\xD2\xDB\xE4\xED\xF6\xFF])"
+
 # Multi-part jump patterns: pairs of conditional jumps with optional padding
 MULTI_PART_PATTERNS = [
     MultiPartPatternMetadata(rb"(?P<first_jump>\x70.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x71.)", "JO ... JNO"),
@@ -657,8 +668,8 @@ def _stage1_scan_one(job):
     job = (pattern_bytes, description, segment_type, base_ea, buf)
     returns MatchChains
     """
-    pat_bytes, desc, segtype, base_ea, buf = job
-    prog = re.compile(pat_bytes, re.DOTALL)
+    rgx, base_ea, buf = job
+    prog = rgx.compile()
     hits = MatchChains()
 
     for m in prog.finditer(buf):
@@ -687,9 +698,13 @@ def _stage1_scan_one(job):
         seg = MatchSegment(
             start=s,
             length=match_len,
-            description=desc,
+            description=rgx.description,
             matched_bytes=mb,
-            segment_type=segtype,
+            segment_type=(
+                SegmentType.STAGE1_MULTIPLE
+                if rgx.category == PatternCategory.MULTI_PART
+                else SegmentType.STAGE1_SINGLE
+            ),
             matched_groups=groups,
         )
         hits.add_chain(MatchChain(base_address=base_ea, segments=[seg]))
@@ -701,20 +716,7 @@ def stage1_find_patterns(buf: bytes, base_ea: int):
     """
     Parallel regex-based Stage 1. Returns List[MatchChain].
     """
-    jobs = [
-        (
-            rgx.pattern,
-            rgx.description,
-            (
-                SegmentType.STAGE1_MULTIPLE
-                if rgx.category == PatternCategory.MULTI_PART
-                else SegmentType.STAGE1_SINGLE
-            ),
-            base_ea,
-            buf,
-        )
-        for rgx in (MULTI_PART_PATTERNS + SINGLE_PART_PATTERNS)
-    ]
+    jobs = [(rgx, base_ea, buf) for rgx in (MULTI_PART_PATTERNS + SINGLE_PART_PATTERNS)]
 
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(mp_context=ctx) as exe:
@@ -841,14 +843,18 @@ class CapstoneDisasmContext:
         # Instead, handle exceptions by logging them if present.
         PROPOGATE = False
         SUPPRESS = True
+
         match exc_type:
             case None:
                 return PROPOGATE
             case capstone.CsError:
-                logger.error(f"Capstone disassembly error: {exc_val}")
+                logger.error(f"Capstone disassembly error: {exc_val}", exc_info=True)
                 return SUPPRESS
             case _:
-                logger.error(f"Unexpected error during Capstone disassembly: {exc_val}")
+                logger.error(
+                    f"Unexpected {exc_type.__name__} during Capstone disassembly: {exc_val}",
+                    exc_info=True,
+                )
                 return SUPPRESS
 
     def disasm(self, buf: bytes, start_ea: int, **kwargs):
@@ -885,9 +891,11 @@ def peel_junk(buf: bytes, is_64: bool) -> typing.List[JunkInstruction]:
         return peeled_instructions
 
     current_offset = 0
-
+    stop_disasm = False
     with CapstoneDisasmContext(is_64) as disasm_ctx:
         for insn in disasm_ctx.disasm(buf, 0):
+            if stop_disasm:
+                break
             logger.debug(
                 f"Disassembled instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset} - bytes: {insn.bytes.hex()}"
             )
@@ -898,164 +906,31 @@ def peel_junk(buf: bytes, is_64: bool) -> typing.List[JunkInstruction]:
                 )
                 break
 
-            is_junk = False
             junk_description = "Unknown Junk"  # Default description
 
-            # Uses guard clauses (if ...) for complex conditions.
-            match (insn.id, insn.size, insn.bytes, insn.operands, insn.groups):
+            # Check if the instruction's bytes match any junk regex pattern *exactly*
+            for rgx in JUNK_PATTERNS:
+                # Use match() to check from the beginning of the instruction bytes
+                match = rgx.compile().match(insn.bytes)
 
-                # 1. rb"(?P<junk>\x0F\x31)" - RDTSC (2 bytes)
-                case (capstone.x86.X86_INS_RDTSC, 2, _, _, _):
-                    is_junk = True
-                    junk_description = "RDTSC"
+                # Check if a match occurred AND it consumed the *entire* instruction
+                if match and match.end() == insn.size:
+                    junk_description = rgx.description or "Junk"
 
-                # 2. rb"(?P<junk>\x0F[\x80-\x8F]..[\x00\x01]\x00)" - 6-byte Conditional Jump
-                case (_, 6, bytes_, _, groups) if (
-                    len(bytes_) >= 6
-                    and bytes_[0] == 0x0F
-                    and 0x80 <= bytes_[1] <= 0x8F
-                    and (bytes_[4:6] == b"\x00\x00" or bytes_[4:6] == b"\x01\x00")
-                    and (
-                        capstone.CS_GRP_JUMP in groups or capstone.CS_GRP_CALL in groups
+                    # logger.debug(f"  Instruction bytes {instruction_bytes.hex()} matched regex: {junk_meta.pattern.decode('latin-1')}")
+                    peeled_instructions.append(
+                        JunkInstruction(
+                            start_offset=current_offset,
+                            length=insn.size,
+                            description=junk_description,
+                            matched_bytes=insn.bytes,
+                        )
                     )
-                ):
-                    is_junk = True
-                    junk_description = "Specific 6-byte Conditional Jump"
-
-                # 3. rb"(?P<junk>\xE8..[\x00\x01]\x00)" - 5-byte CALL
-                case (capstone.x86.X86_INS_CALL, 5, bytes_, operands, _) if (
-                    len(bytes_) >= 5
-                    and (bytes_[3:5] == b"\x00\x00" or bytes_[3:5] == b"\x01\x00")
-                    and has_imm_operand(operands)
-                ):
-                    is_junk = True
-                    junk_description = "Specific 5-byte CALL"
-
-                # 4. rb"(?P<junk>\x81[\xC0-\xC3\xC5-\xC7]....)" - ADD reg32, imm32 (6 bytes)
-                case (capstone.x86.X86_INS_ADD, 6, bytes_, operands, _) if (
-                    bytes_[0] == 0x81
-                    and is_allowed_reg(operands)
-                    and has_imm_operand(operands)
-                ):
-                    is_junk = True
-                    junk_description = "ADD reg32, imm32"
-
-                # 5. rb"(?P<junk>\x80[\xC0-\xC3\xC5-\xC7].)" - ADD reg8, imm8 (3 bytes)
-                # 6. rb"(?P<junk>\x83[\xC0-\xC3\xC5-\xC7].)" - ADD reg32, imm8 (3 bytes)
-                # Combine ADD size 3, differentiate with guard on opcode byte
-                case (
-                    capstone.x86.X86_INS_ADD,
-                    3,
-                    bytes_,
-                    operands,
-                    _,
-                ) if is_allowed_reg(operands) and has_imm_operand(operands):
-                    if bytes_[0] == 0x80:
-                        is_junk = True
-                        junk_description = "ADD reg8, imm8"
-                    elif bytes_[0] == 0x83:
-                        is_junk = True
-                        junk_description = "ADD reg32, imm8"
-
-                # 7. rb"(?P<junk>\xC6[\xC0-\xC3\xC5-\xC7].)" - MOV reg8, imm8 (3 bytes)
-                case (capstone.x86.X86_INS_MOV, 3, bytes_, operands, _) if (
-                    len(bytes_) >= 1
-                    and bytes_[0] == 0xC6  # Check opcode byte
-                    and is_allowed_reg(operands)  # Use updated helper
-                    and has_imm_operand(operands)
-                ):
-                    is_junk = True
-                    junk_description = "MOV reg8, imm8"
-
-                # 8. rb"(?P<junk>\xC7[\xC0-\xC3\xC5-\xC7]....)" - MOV reg32, imm32 (6 bytes)
-                case (capstone.x86.X86_INS_MOV, 6, bytes_, operands, _) if (
-                    bytes_[0] == 0xC7
-                    and is_allowed_reg(operands)
-                    and has_imm_operand(operands)
-                ):
-                    is_junk = True
-                    junk_description = "MOV reg32, imm32"
-
-                # 9. rb"(?P<junk>\xF6[\xD8-\xDB\xDD-\xDF])" - NEG reg8 (2 bytes)
-                case (capstone.x86.X86_INS_NEG, 2, bytes_, operands, _) if bytes_[
-                    0
-                ] == 0xF6 and is_allowed_reg(operands):
-                    is_junk = True
-                    junk_description = "NEG reg8"
-
-                # 10. rb"(?P<junk>\x80[\xE8-\xEB\xED-\xEF].)" - AND reg8, imm8 (3 bytes)
-                case (capstone.x86.X86_INS_AND, 3, bytes_, operands, _) if (
-                    bytes_[0] == 0x80
-                    and is_allowed_reg(operands)
-                    and has_imm_operand(operands)
-                ):
-                    is_junk = True
-                    junk_description = "AND reg8, imm8"
-
-                # 11. rb"(?P<junk>\x81[\xE8-\xEB\xED-\xEF]....)" - SUB reg32, imm32 (6 bytes)
-                case (capstone.x86.X86_INS_SUB, 6, bytes_, operands, _) if (
-                    bytes_[0] == 0x81
-                    and is_allowed_reg(operands)
-                    and has_imm_operand(operands)
-                ):
-                    is_junk = True
-                    junk_description = "SUB reg32, imm32"
-
-                # 12. rb"(?P<junk>\x68....)" - PUSH imm32 (5 bytes)
-                # 13. rb"(?P<junk>\x6A.)" - PUSH imm8 (2 bytes)
-                # Combine PUSH size 2/5, differentiate with guard on opcode byte
-                case (capstone.x86.X86_INS_PUSH, size, bytes_, operands, _) if size in (
-                    2,
-                    5,
-                ) and has_imm_operand(operands):
-                    if size == 5 and bytes_[0] == 0x68:
-                        is_junk = True
-                        junk_description = "PUSH imm32"
-                    elif size == 2 and bytes_[0] == 0x6A:
-                        is_junk = True
-                        junk_description = "PUSH imm8"
-
-                # 14. rb"(?P<junk>[\x70-\x7F].)" - 2-byte Conditional Jump (Short)
-                case (_, 2, bytes_, _, groups) if (
-                    len(bytes_) >= 1  # Need at least one byte for the check
-                    and 0x70 <= bytes_[0] <= 0x7F
-                    and capstone.CS_GRP_JUMP in groups
-                ):
-                    is_junk = True
-                    junk_description = "2-byte Conditional Jump"
-
-                # 15. rb"(?P<junk>[\x50-\x5F])" - Single-byte PUSH/POP reg (1 byte)
-                # Capture the ID in the pattern to check it in the guard
-                case (push_pop_id, 1, bytes_, operands, _) if (
-                    len(bytes_) >= 1  # Need at least one byte for the check
-                    and 0x50 <= bytes_[0] <= 0x5F
-                    and push_pop_id
-                    in (capstone.x86.X86_INS_PUSH, capstone.x86.X86_INS_POP)
-                    and operands
-                    and operands[0].type == capstone.CS_OP_REG
-                ):
-                    is_junk = True
-                    junk_description = "Single-byte PUSH/POP reg"
-
-                # Wildcard case: If none of the above patterns match
-                case _:
-                    is_junk = False
-                    # No need to set description, it won't be used if not junk
-
-            if not is_junk:
+                    break
+            else:
                 # Stop at the first non-junk instruction
                 # logger.debug(f"  Non-junk instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset}. Stopping.")
-                break
-
-            # Append info about this specific junk instruction
-            peeled_instructions.append(
-                JunkInstruction(
-                    start_offset=current_offset,
-                    length=insn.size,
-                    description=junk_description,
-                    matched_bytes=insn.bytes,
-                )
-            )
+                stop_disasm = True
             current_offset += insn.size
             # logger.debug(f"  Found junk: {junk_description} - {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset - insn.size}")
     return peeled_instructions
@@ -1235,7 +1110,9 @@ class CapstoneInstructionDecoder(InstructionDecoder):
 
         if insn is None:
             return None
-
+        logger.debug(
+            f"Decoded instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {hex(ea)} - bytes: {insn.bytes.hex()}"
+        )
         decoded = BasicDecodedInstruction(address=ea, size=insn.size)
         if insn.id == capstone.x86.X86_INS_NOP:
             decoded.is_nop = True
@@ -1271,7 +1148,6 @@ class JumpTargetAnalyzer:
     def follow_jump_chain(
         self,
         mem: bytes,
-        mem_base: int,
         current_ea: int,
         match_end: int,
         decoder: InstructionDecoder,
@@ -1299,7 +1175,7 @@ class JumpTargetAnalyzer:
 
         # Get an efficient view of the memory buffer
         mem_view = mem
-        mem_start_ea = mem_base  # Absolute start address of the buffer
+        mem_start_ea = self.start_ea  # Absolute start address of the buffer
         mem_len = len(mem_view)
         mem_end_ea = mem_start_ea + mem_len  # Absolute end address (exclusive)
 
@@ -1329,6 +1205,7 @@ class JumpTargetAnalyzer:
             decoded_insn = None
             # Calculate offset relative to the start of the Memory object's buffer
             offset = trace_ea - mem_start_ea
+            logger.debug(f"offset: {offset}")
             # We already know offset is >= 0 because trace_ea >= mem_start_ea
             # We need to ensure we have enough bytes left for *potential* instructions
 
@@ -1428,9 +1305,7 @@ class JumpTargetAnalyzer:
         ):
             jump_offset = jump_match.start()
             jump_ea = self.match_start + jump_offset
-            final_target = self.follow_jump_chain(
-                mem, self.match_start, jump_ea, match_end, decoder
-            )
+            final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
             if not final_target:
                 logger.debug(
                     f"  Skipping jump at 0x{jump_ea:X}: Invalid final target 0x{final_target if final_target else 0:X}"
@@ -1650,7 +1525,7 @@ def _stage4_is_chain_valid(
     match_start = chain.overall_start()
     chain_end = match_start + max_size
 
-    logger.info(f"Analyzing match: {chain.description} @ 0x{match_start:X}")
+    logger.debug(f"Analyzing match: {chain.description} @ 0x{match_start:X}")
 
     # Determine possible jump targets - using your existing code
     jump_targets = JumpTargetAnalyzer(
@@ -1740,9 +1615,7 @@ def _stage4_is_chain_valid(
             )
 
 
-def resolve_overlaps(
-    start_ea: int, chains: typing.List[MatchChain]
-) -> typing.List[MatchChain]:
+def resolve_overlaps(chains: typing.List[MatchChain]) -> typing.List[MatchChain]:
     """
     Resolves overlaps among validated chains.
 
@@ -1763,19 +1636,7 @@ def resolve_overlaps(
     for chain in sorted_chains:
         chain_start = chain.overall_start()
         # Calculate chain end including the big instruction
-        big_instr_segments = [
-            seg
-            for seg in chain.segments
-            if seg.segment_type == SegmentType.BIG_INSTRUCTION
-        ]
-        if big_instr_segments:
-            # Use the end of the big instruction as the chain end
-            big_instr = big_instr_segments[-1]
-            offset_in_mem = big_instr.start
-            chain_end = start_ea + offset_in_mem + big_instr.length
-        else:
-            # Fallback to overall length if no big instruction (shouldn't happen at this point)
-            chain_end = chain_start + chain.overall_length()
+        chain_end = chain_start + chain.overall_length()
         # Check if this chain overlaps with an already accepted chain
         is_covered = False
         for start, end in covered_ranges:
@@ -1977,8 +1838,7 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         valid_chains = [c for chunk_result in results_from_chunks for c in chunk_result]
 
         # resolve overlaps & emit
-        final = resolve_overlaps(self.start_ea, valid_chains)
-
+        final = resolve_overlaps(valid_chains)
         await self.emit("stage4_finished", final)
         return final
 
@@ -2275,7 +2135,7 @@ def process(deob, pipe_name, authkey):
         return ctrl.join()  # join now handles the not-started case internally
 
 
-def _wmain():
+def worker_main():
     p = argparse.ArgumentParser()
     p.add_argument("--shm_name", required=True)
     p.add_argument("--data_size", type=int, required=True)
@@ -2293,7 +2153,6 @@ def _wmain():
             data_size=args.data_size,
             start_ea=args.start_ea,
             is_64bit=bool(args.is64),
-            max_workers=1,
         )
         results = process(deob, args.pipe_name, args.authkey)
         logger.info("Pipeline finished.")
@@ -2301,185 +2160,22 @@ def _wmain():
             logger.info("No results generated or retrieved from pipeline.")
             return
 
-        # --- Print results to stdout for IDA ---
-
-        out = [
+        asjson = [
             {
-                "offset": c.overall_start() - args.start_ea,
+                "address": c.overall_start(),
                 "length": c.overall_length(),
-                "description": c.segments[
-                    0
-                ].description,  # Use the first segment's description
+                "end": c.overall_start() + c.overall_length(),
             }
             for c in results
         ]
-        logger.info("results_start")
-        print("results_start", flush=True)  # Also print sentinel to stdout
-        print(json.dumps(out), flush=True)
-        print("results_end", flush=True)
-        logger.info("results_end")
+        logger.info("results: ")
+        print("<|RESULTS_START|>", flush=True, end="")  # Also print sentinel to stdout
+        print(json.dumps(asjson), flush=True, end="")
+        print("<|RESULTS_END|>", flush=True, end="")
     except Exception as e:
         logger.error(f"Unhandled exception in worker_main: {e}", exc_info=True)
     finally:
         logger.info("Worker finished.")
-    # listener = None
-    # conn = None
-    # try:
-    #     authkey_bytes = bytes.fromhex(args.authkey)
-    #     logger.info(f"Setting up Listener on pipe: {args.pipe_name}")
-    #     # Ensure the socket file doesn't exist on Unix before listening
-    #     if platform.system() != "Windows":
-    #         socket_path = pathlib.Path(args.pipe_name)
-    #         if socket_path.exists():
-    #             logger.warning(f"Removing existing socket file: {socket_path}")
-    #             socket_path.unlink()
-
-    #     listener = multiprocessing.connection.Listener(
-    #         args.pipe_name, authkey=authkey_bytes
-    #     )
-    #     logger.info("Listener created.")
-
-    #     # --- Signal IDA that we are ready BEFORE blocking on accept ---
-    #     print("LISTENER_READY", flush=True)
-    #     logger.info("Signaled LISTENER_READY to parent. Waiting for connection...")
-
-    #     conn = listener.accept()  # Blocks until IDA connects
-    #     logger.info(f"Connection accepted from: {listener.last_accepted}")
-    #     listener.close()  # Close listener immediately after accepting one connection
-    #     listener = None  # Clear listener reference
-
-    #     # --- Deobfuscator and Controller setup (can stay here) ---
-    #     deob = AsyncDeobfuscator(
-    #         shm_name=args.shm_name,
-    #         data_size=args.data_size,
-    #         start_ea=args.start_ea,
-    #         is_64bit=bool(args.is64),
-    #         max_workers=1,
-    #     )
-
-    #     @deob.on("run_started")
-    #     def on_run_started():
-    #         logger.info("▶️  Pipeline starting")
-
-    #     @deob.on("stage1_finished")
-    #     def on_stage1_finished(ch):
-    #         logger.info(f"✅ Stage1: {len(ch)} stubs")
-
-    #     @deob.on("stage2_finished")
-    #     def on_stage2_finished(ch):
-    #         logger.info(f"✅ Stage2: {len(ch)} junk appended")
-
-    #     @deob.on("stage3_finished")
-    #     def on_stage3_finished(ch):
-    #         logger.info(f"✅ Stage3: {len(ch)} remaining")
-
-    #     @deob.on("stage4_finished")
-    #     def on_stage4_finished(ch):
-    #         logger.info(f"✅ Stage4: {len(ch)} final")
-
-    #     @deob.on("stopped")
-    #     def on_stopped():
-    #         logger.info("🛑 Worker shutting down")
-
-    #     ctrl = WorkerController(deob)
-    #     # --- End Deobfuscator/Controller ---
-
-    #     # ——— command loop using the connection object ———
-    #     logger.info("Starting command loop (reading from connection)...")
-    #     try:
-    #         while cmd := conn.recv():
-    #             logger.debug(f"← Received raw command obj: {cmd}")
-    #             # Commands should be sent as strings
-    #             if not isinstance(cmd, str):
-    #                 logger.warning(f"Received non-string command: {type(cmd)} - {cmd}")
-    #                 continue
-
-    #             payload = json.loads(cmd.strip())
-    #             logger.info(f"← Received command: {payload}")
-    #             match payload["cmd"]:
-    #                 case "stop" | "exit" | "shutdown":
-    #                     logger.info("Received exit command.")
-    #                     ctrl.stop()  # Tell the controller to stop the pipeline
-    #                     break
-    #                 case "ping":
-    #                     logger.info("pong")
-    #                     # Optional: Send pong back? conn.send("pong_ack")
-    #                 case "pause":
-    #                     ctrl.pause()
-    #                 case "resume":
-    #                     ctrl.resume()
-    #                 case "start":
-    #                     ctrl.start()
-    #                 case "set_log_level":
-    #                     logger.setLevel(payload["level"])
-    #                     logger.info(f"Worker log level set to {payload['level']}")
-    #                 case _:
-    #                     logger.warning(f"Unknown command received: {payload}")
-
-    #     except EOFError:
-    #         logger.error("EOFError on connection recv. Connection closed by parent.")
-    #         ctrl.stop()  # Ensure pipeline stops if connection breaks
-    #     except Exception as e:
-    #         logger.error(f"Error processing command: {e}", exc_info=True)
-    #         # Decide whether to break or continue on other errors
-
-    #     # wait for the pipeline to complete
-    #     logger.info("Waiting for pipeline to finish...")
-    #     results = ctrl.join()  # join now handles the not-started case internally
-    #     if results is not None:  # Check if join returned actual results
-    #         logger.info("Pipeline finished.")
-    #     # else: join logged a warning if not started
-
-    #     # --- Print results to stdout for IDA ---
-    #     if results:  # Only process if results is not None
-    #         out = [
-    #             {
-    #                 "offset": c.overall_start() - args.start_ea,
-    #                 "length": c.overall_length(),
-    #                 "description": c.segments[
-    #                     0
-    #                 ].description,  # Use the first segment's description
-    #             }
-    #             for c in results
-    #         ]
-    #         logger.info("results_start")
-    #         print("results_start", flush=True)  # Also print sentinel to stdout
-    #         print(json.dumps(out), flush=True)
-    #         print("results_end", flush=True)
-    #         logger.info("results_end")
-    #     else:
-    #         logger.info("No results generated or retrieved from pipeline.")
-
-    # except Exception as e:
-    #     logger.error(f"Unhandled exception in worker_main: {e}", exc_info=True)
-    # finally:
-    #     if conn:
-    #         try:
-    #             logger.info("Closing worker-side connection.")
-    #             conn.close()
-    #         except Exception as e_close:
-    #             logger.error(f"Error closing connection: {e_close}")
-    #     if (
-    #         listener
-    #     ):  # Should be None if accept succeeded, but handle potential error case
-    #         try:
-    #             logger.warning("Closing listener (should have been closed earlier).")
-    #             listener.close()
-    #         except Exception as e_close_listener:
-    #             logger.error(f"Error closing listener: {e_close_listener}")
-    #     # Clean up socket file on Unix
-    #     if platform.system() != "Windows":
-    #         socket_path = pathlib.Path(args.pipe_name)
-    #         if socket_path.exists():
-    #             try:
-    #                 logger.info(f"Removing socket file: {socket_path}")
-    #                 socket_path.unlink()
-    #             except Exception as e_unlink:
-    #                 logger.error(
-    #                     f"Error removing socket file {socket_path}: {e_unlink}"
-    #                 )
-
-    #     logger.info("Worker finished.")
 
 
 # ─── IDA plugin entrypoint is no longer needed for console mode ─────────────
@@ -2570,15 +2266,15 @@ class DeferredPatchOp:
         if is_dry_run:
             return success
 
-        func = (
-            idaapi.put_bytes
-            if self.mode == PatchManager.Mode.PUT
-            else idaapi.patch_bytes
-        )
         try:
+            func = (
+                idaapi.put_bytes
+                if self.mode == PatchManager.Mode.PUT
+                else idaapi.patch_bytes
+            )
             func(self.address, self.byte_values)
         except Exception as e:
-            logger.error(f"Failed to apply patch {self}: {e}")
+            logger.error(f"Failed to apply patch {self}: {e}", exc_info=True)
             success = False
         return success
 
@@ -2617,8 +2313,8 @@ if is_ida():
         #: For simple status updates like "ping", "results_ready"
         status_message = QtCore.pyqtSignal(str)
 
-        #: For structured results (assuming list)
-        processing_results = QtCore.pyqtSignal(list)
+        #: For structured results (assuming dict)
+        processing_results = QtCore.pyqtSignal(dict)
 
         #: For errors reported by the worker
         error_occurred_msg = QtCore.pyqtSignal(str)
@@ -2788,7 +2484,7 @@ if is_ida():
 
             processed_stdout = ""  # Accumulate non-signal output
             listener_ready_found = False
-
+            rez = ""
             for line in out.splitlines():
                 if line.strip() == "LISTENER_READY":
                     if not self.client_connection and not self.listener_ready:
@@ -2797,11 +2493,10 @@ if is_ida():
                     elif self.listener_ready:
                         logger.warning("Received duplicate LISTENER_READY signal.")
                     # else: connection already exists? should not happen ideally
-                elif line.strip().startswith("results_start"):
+                elif line.strip().startswith("<|RESULTS_START|>"):
                     # Handle results block separately if needed or let it pass through
                     processed_stdout += line + "\n"
-                elif line.strip().startswith("results_end"):
-                    processed_stdout += line + "\n"
+                    rez = line
                 else:
                     # Accumulate other output
                     processed_stdout += line + "\n"
@@ -2827,20 +2522,35 @@ if is_ida():
                     self.stop_worker()
 
             # --- Results parsing (can stay the same, operates on the full 'out') ---
-            m = re.search(r"results_start\n(.*?)results_end", out, re.DOTALL | re.S)
+            m = re.search(
+                r"<|RESULTS_START|>(.*?)<|RESULTS_END|>", out, re.DOTALL | re.S
+            )
+            if not m:
+                return
+
             if m:
-                results_json = m.group(1).strip()
-                try:
-                    results = json.loads(results_json)
-                    results.append("results-ready")
-                    self.processing_results.emit(results)
-                    logger.info("Emitted processing_results.")
-                except json.JSONDecodeError as e:
-                    logger.error(
-                        f"Failed to decode JSON results from worker stdout: {e}"
-                    )
-                    logger.error(f"Invalid JSON content: {results_json}")
-                    self.processing_results.emit(["error-decoding-json"])
+                print(m.groups())
+            
+            if not rez:
+                return
+
+            results_json = rez.strip()
+            try:
+                results = json.loads(results_json)
+                results = {
+                    "results": results,
+                    "status": "success",
+                }
+                logger.info("Emitted processing_results.")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to decode JSON results from worker stdout: {e}")
+                logger.error(f"Invalid JSON content: {results_json}")
+                results = {
+                    "results": results_json,
+                    "status": "error",
+                    "error": "error-decoding-json",
+                }
+            self.processing_results.emit(results)
 
         def _on_stderr(self):
             """Reads and logs data from the worker's standard error."""
@@ -2906,8 +2616,17 @@ if is_ida():
         def _handle_worker_status(self, status: str):
             logger.info(f"Worker status: {status}")
 
-        def _handle_worker_results(self, results: list):
+        def _handle_worker_results(self, results: dict):
             logger.info(f"Worker results: {results}")
+            if results["status"] == "success":
+                for patch_instructions in results["results"]:
+                    self.patch_manager.add_patch(
+                        patch_instructions["address"],
+                        patch_instructions["length"] * "\x90",
+                    )
+                self.patch_manager.apply_patches()
+            else:
+                logger.error(f"Worker reported an error: {results['error']}")
 
         def _handle_worker_error(self, error: str):
             """Handles error messages originating from the worker process."""
@@ -3006,7 +2725,7 @@ if is_ida():
             self._shared_memory = multiprocessing.shared_memory.SharedMemory(
                 create=True, size=data_size
             )
-            self._multiprocessing.shared_memory.buf[:data_size] = bytes_to_process
+            self._shared_memory.buf[:data_size] = bytes_to_process
 
             # launch worker
             self.proc = WorkerLauncher()
@@ -3014,7 +2733,7 @@ if is_ida():
             self.proc.processing_results.connect(self._handle_worker_results)
             self.proc.error_occurred_msg.connect(self._handle_worker_error)
             if not self.proc.launch_worker(
-                start_ea, self._multiprocessing.shared_memory.name, data_size
+                start_ea, self._shared_memory.name, data_size
             ):
                 self.terminate()
                 logger.error(f"Failed to start worker process: {self.errorString()}")
@@ -3027,16 +2746,16 @@ if is_ida():
 
             try:
                 logger.info(
-                    f"Unlinking shared memory segment: {self._multiprocessing.shared_memory.name}"
+                    f"Unlinking shared memory segment: {self._shared_memory.name}"
                 )
-                self._multiprocessing.shared_memory.close()  # Close parent's view
+                self._shared_memory.close()  # Close parent's view
                 multiprocessing.shared_memory.SharedMemory(
-                    self._multiprocessing.shared_memory.name
+                    self._shared_memory.name
                 ).unlink()  # Unlink the segment
                 logger.info("Shared memory unlinked.")
             except FileNotFoundError:
                 logger.warning(
-                    f"Shared memory segment {self._multiprocessing.shared_memory.name} already unlinked."
+                    f"Shared memory segment {self._shared_memory.name} already unlinked."
                 )
             except Exception as e:
                 logger.error(f"Error unlinking shared memory: {e}", exc_info=True)
@@ -3125,7 +2844,7 @@ if is_ida():
 
 if __name__ == "__main__":
     if not is_ida():
-        _wmain()
+        worker_main()
     else:
         print("Running Taskr().get().run(*Taskr().get().get_section_data('.text'))")
         Taskr().get().run(*Taskr().get().get_section_data(".text"))

@@ -12,7 +12,11 @@ You are an expert in Python, C, and C++, with deep knowledge of Windows reverse 
 - Prefer `dataclass`, `Enum`, and `NamedTuple` over raw data structures for clarity.
 - Use encapsulation and namespaces to group configuration with related logic. Prefer `dataclass`, `Enum`, `NamedTuple`, or nested class objects to avoid excessive top-level constants.
 - Limit functions to 5 parameters. If more are needed, group them into a configuration object.
+
+### Logging
+
 - Use logging module over print(), replace all print() with logging.
+- When using the logging module, use format specifiers NOT f-strings. f-string are evaluated even if the log message is not emitted, but format specifiers are lazily rendered *ONLY* when the log level filter passes
 
 ### Python Comments
 
