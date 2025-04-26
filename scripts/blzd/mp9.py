@@ -19,7 +19,10 @@ import multiprocessing.shared_memory
 import os
 import pathlib
 import platform
+import queue
+import random
 import re
+import select
 import stat
 import struct
 import sys
@@ -148,13 +151,16 @@ def configure_logging(
         log.addHandler(handler)
 
 
-def get_logger(name=None):
+def get_logger(name=None, configurer=None):
+    if not configurer:
+        configurer = configure_logging
     name = name or f"{"ida." if is_ida() else "worker."}{__name__}"
-    return logging.getLogger(name)
+    logger = logging.getLogger(name)
+    configurer(logger)
+    return logger
 
 
 logger = get_logger()
-configure_logging(logger)
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -926,6 +932,7 @@ def peel_junk(buf: bytes, is_64: bool) -> typing.List[JunkInstruction]:
                             matched_bytes=insn.bytes,
                         )
                     )
+                    # found a junk instruction, break out of the loop
                     break
             else:
                 # Stop at the first non-junk instruction
@@ -1857,8 +1864,12 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         await self.emit("stopped")
 
 
-# ─── WorkerController: wrap AsyncDeobfuscator in its own event loop ───────
+# ─── Standalone worker entrypoint ───────────────────────────────────────────
+
+
 class WorkerController:
+    """Wrap AsyncDeobfuscator in its own event loop"""
+
     def __init__(self, deob: AsyncDeobfuscator):
         self.deob = deob
         self.loop = asyncio.new_event_loop()
@@ -1931,85 +1942,20 @@ class WorkerController:
         self._started = False
         return self._result
 
-
-# ─── Standalone worker entrypoint ───────────────────────────────────────────
-
-
-def generate_pipe_name():
-    """Generates a unique, platform-specific pipe name."""
-    pid = os.getpid()
-    # Add a UUID component for extra uniqueness, especially if multiple IDA instances run
-    unique_id = str(uuid.uuid4()).split("-")[0]  # Short UUID part
-    pipe_base = f"ida_worker_pipe_{pid}_{unique_id}"
-    if platform.system() == "Windows":
-        return f"\\\\.\\pipe\\{pipe_base}"
-    else:
-        # Use /tmp or a similar directory for Unix domain sockets
-        # Ensure the path is not too long for socket names
-        tmp_dir = pathlib.Path("/tmp")
-        socket_path = tmp_dir / pipe_base
-        # Basic length check (common limit is around 108 bytes)
-        if len(str(socket_path)) > 100:
-            # Fallback to shorter name if path gets too long
-            pipe_base = f"iwp_{pid}_{unique_id}"
-            socket_path = tmp_dir / pipe_base
-        return str(socket_path)
-
-
-class UnixSocketCleaner:
-    """
-    Context manager to ensure the Unix socket file is removed before and after use.
-    On Windows, this is a no-op.
-    """
-
-    def __init__(self, pipe_name):
-        self.pipe_name = pipe_name
-        self.is_unix = platform.system() != "Windows"
-        self.socket_path = pathlib.Path(pipe_name) if self.is_unix else None
-
     def __enter__(self):
-        if self.is_unix and self.socket_path.exists():
-            logger.warning(f"Removing existing socket file: {self.socket_path}")
-            try:
-                self.socket_path.unlink()
-            except Exception as e:
-                logger.error(f"Error removing socket file {self.socket_path}: {e}")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.is_unix and self.socket_path.exists():
-            try:
-                logger.info(f"Removing socket file: {self.socket_path}")
-                self.socket_path.unlink()
-            except Exception as e:
-                logger.error(f"Error removing socket file {self.socket_path}: {e}")
+        PROPOGATE = False
+        SUPPRESS = True
+        if not exc_type:
+            return SUPPRESS
 
-
-class ListenerContext:
-    """
-    Context manager for multiprocessing.connection.Listener.
-    Ensures the listener is closed on exit.
-    """
-
-    def __init__(self, pipe_name, authkey):
-        self.pipe_name = pipe_name
-        self.authkey = authkey
-        self.listener = None
-
-    def __enter__(self):
-        self.listener = multiprocessing.connection.Listener(
-            self.pipe_name, authkey=self.authkey
+        logger.error(
+            "Worker thread raised an exception: %s %s %s", exc_type, exc_val, exc_tb
         )
-        logger.info("Listener created.")
-        return self.listener
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.listener is not None:
-            try:
-                logger.info("Closing listener.")
-                self.listener.close()
-            except Exception as e:
-                logger.error(f"Error closing listener: {e}")
+        self.stop()
+        return PROPOGATE
 
 
 class ConnectionContext:
@@ -2018,121 +1964,264 @@ class ConnectionContext:
     Ensures the connection is closed on exit.
     """
 
-    def __init__(self, conn):
-        self.conn = conn
+    def __init__(self, address: str, authkey: bytes | str):
+        host, port_str = address.split(":")
+        self.host = host
+        self.port = int(port_str)
+
+        if isinstance(authkey, str):
+            authkey = bytes.fromhex(authkey)
+
+        assert isinstance(authkey, bytes), f"Invalid authkey type: {type(authkey)}"
+        self.authkey = authkey
+        self._conn = None
+
+    @property
+    def address(self) -> tuple[str, int]:
+        return (self.host, self.port)
+
+    @property
+    def conn(self) -> multiprocessing.connection.Client:
+        if self._conn is None:
+            self._conn = multiprocessing.connection.Client(
+                self.address, family="AF_INET", authkey=self.authkey  # Force TCP socket
+            )
+            logger.info(f"Connected to {self.address}")
+        return self._conn
+
+    def send_message(self, msg_type, data, **kwargs) -> bool:
+        """
+        Send a structured message through the connection.
+
+        Args:
+            conn: The connection object
+            msg_type: Type of message (status, result, error, etc.)
+            data: The payload data
+            **kwargs: Additional message attributes
+        """
+        message = {"type": msg_type, "data": data, "timestamp": time.time(), **kwargs}
+        success = True
+        try:
+            self.conn.send(message)  # Uses Python's native serialization
+            logger.debug(f"→ Sent message: {msg_type}")
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}")
+            success = False
+
+        return success
+
+    @property
+    def closed(self):
+        """True if the connection is closed"""
+        return self.conn.closed
+
+    @property
+    def readable(self):
+        """True if the connection is readable"""
+        return self.conn.readable
+
+    @property
+    def writable(self):
+        """True if the connection is writable"""
+        return self.conn.writable
+
+    def fileno(self):
+        """File descriptor or handle of the connection"""
+        return self.conn.fileno()
+
+    def recv(self):
+        """Receive a (picklable) object"""
+        return self.conn.recv()
+
+    def poll(self, timeout=0.0):
+        """Whether there is any input available to be read"""
+        return self.conn.poll(timeout)
 
     def __enter__(self):
-        return self.conn
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        PROPOGATE = False
+        SUPPRESS = True
+        if exc_type:
+            logger.error("Connection closed by parent")
+            return PROPOGATE
+
         if self.conn is not None:
             try:
                 logger.info("Closing worker-side connection.")
                 self.conn.close()
             except Exception as e:
                 logger.error(f"Error closing connection: {e}")
+        return SUPPRESS
 
 
-@contextlib.contextmanager
-def worker_setup(pipe_name, authkey):
+def process(deob, address, authkey):
     """
-    Context manager that sets up the worker listener and yields the accepted connection.
-    Signals readiness to the parent process before blocking on accept.
+    Main processing function that sets up event handlers and handles communication.
 
-    Yields:
-        multiprocessing.connection.Connection: The accepted connection object.
+    Args:
+        deob: The deobfuscator instance
+        address: Address of the parent process
+        authkey: Authentication key in hex format
 
-    Example:
-        with setup_worker_listener(args) as conn:
-            # ... use conn ...
+    Returns:
+        The results from the deobfuscator process
     """
-    authkey_bytes = bytes.fromhex(authkey)
-    logger.info(f"Setting up Listener on pipe: {pipe_name}")
+    # Set up progress tracking
+    progress_state = {
+        "current": 0.0,
+        "status": "initializing",
+        "last_sent": 0.0,  # Track when we last sent a progress update
+    }
 
-    with UnixSocketCleaner(pipe_name):
-        with ListenerContext(pipe_name, authkey=authkey_bytes) as listener:
-            # --- Signal IDA that we are ready BEFORE blocking on accept ---
-            print("LISTENER_READY", flush=True)
-            logger.info("Signaled LISTENER_READY to parent. Waiting for connection...")
-
-            conn = listener.accept()  # Blocks until IDA connects
-            logger.info(f"Connection accepted from: {listener.last_accepted}")
-
-            with ConnectionContext(conn):
-                yield conn
-
-
-def process(deob, pipe_name, authkey):
-
+    # Register event handlers with progress reporting
     @deob.on("run_started")
     def on_run_started():
         logger.info("▶️  Pipeline starting")
+        progress_state["status"] = "running"
+        progress_state["current"] = 0.0
+        if "conn" in progress_state:
+            progress_state["conn"].send_message(
+                "progress",
+                progress_state["current"],
+                status="running",
+                stage="starting",
+            )
 
     @deob.on("stage1_finished")
     def on_stage1_finished(ch):
         logger.info(f"✅ Stage1: {len(ch)} stubs")
+        progress_state["current"] = 0.25
+        progress_state["status"] = "running"
+        if "conn" in progress_state:
+            progress_state["conn"].send_message(
+                "progress",
+                progress_state["current"],
+                status="running",
+                stage="stage1_complete",
+                stubs_count=len(ch),
+            )
 
     @deob.on("stage2_finished")
     def on_stage2_finished(ch):
         logger.info(f"✅ Stage2: {len(ch)} junk appended")
+        progress_state["current"] = 0.50
+        progress_state["status"] = "running"
+        if "conn" in progress_state:
+            progress_state["conn"].send_message(
+                "progress",
+                progress_state["current"],
+                status="running",
+                stage="stage2_complete",
+                chunks_count=len(ch),
+            )
 
     @deob.on("stage3_finished")
     def on_stage3_finished(ch):
         logger.info(f"✅ Stage3: {len(ch)} remaining")
+        progress_state["current"] = 0.75
+        progress_state["status"] = "running"
+        if "conn" in progress_state:
+            progress_state["conn"].send_message(
+                "progress",
+                progress_state["current"],
+                status="running",
+                stage="stage3_complete",
+                chunks_count=len(ch),
+            )
 
     @deob.on("stage4_finished")
     def on_stage4_finished(ch):
         logger.info(f"✅ Stage4: {len(ch)} final")
+        progress_state["current"] = 0.95
+        progress_state["status"] = "finalizing"
+        if "conn" in progress_state:
+            progress_state["conn"].send_message(
+                "progress",
+                progress_state["current"],
+                status="finalizing",
+                stage="stage4_complete",
+                chunks_count=len(ch),
+            )
 
     @deob.on("stopped")
     def on_stopped():
         logger.info("🛑 Worker shutting down")
+        progress_state["status"] = "stopped"
+        if "conn" in progress_state:
+            progress_state["conn"].send_message("status", "stopped", status="stopped")
 
-    ctrl = WorkerController(deob)
-
-    with worker_setup(pipe_name, authkey) as conn:
+    with WorkerController(deob) as ctrl, ConnectionContext(address, authkey) as conn:
+        # Store connection in progress_state for event handlers
+        progress_state["conn"] = conn
+        # Send initial ready message
+        conn.send_message("status", "connected", status="ready")
         logger.info("Starting command loop (reading from connection)...")
         try:
-            while cmd := conn.recv():
-                logger.debug(f"← Received raw command obj: {cmd}")
-                # Commands should be sent as strings
-                if not isinstance(cmd, str):
-                    logger.warning(f"Received non-string command: {type(cmd)} - {cmd}")
-                    continue
+            while True:
+                try:
+                    # Poll for commands with timeout
+                    if not conn.closed and not conn.poll(timeout=0.5):
+                        continue
+                    # Connection has data
+                    cmd = conn.recv()
+                    logger.debug(f"← Received command: {cmd}")
+                except EOFError:
+                    logger.error("Connection closed by parent")
+                    break
 
-                payload = json.loads(cmd.strip())
-                logger.info(f"← Received command: {payload}")
-                match payload["cmd"]:
-                    case "stop" | "exit" | "shutdown":
-                        logger.info("Received exit command.")
-                        ctrl.stop()  # Tell the controller to stop the pipeline
+                # Process command
+                if isinstance(cmd, dict):
+                    cmd_type = cmd.get("command")
+                    if cmd_type in ["stop", "exit", "shutdown"]:
+                        logger.info("Received exit command")
+                        ctrl.stop()
                         break
-                    case "ping":
-                        logger.info("pong")
-                        # Optional: Send pong back? conn.send("pong_ack")
-                    case "pause":
+                    elif cmd_type == "ping":
+                        conn.send_message("status", "pong", status="running")
+                    elif cmd_type == "pause":
                         ctrl.pause()
-                    case "resume":
+                        conn.send_message("status", "paused", status="paused")
+                    elif cmd_type == "resume":
                         ctrl.resume()
-                    case "start":
+                        conn.send_message("status", "resumed", status="running")
+                    elif cmd_type == "start":
                         ctrl.start()
-                    case "set_log_level":
-                        logger.setLevel(payload["level"])
-                        ctrl.set_log_level(payload["level"])
-                        logger.info(f"Worker log level set to {payload['level']}")
-                    case _:
-                        logger.warning(f"Unknown command received: {payload}")
+                        conn.send_message("status", "started", status="running")
+                    elif cmd_type == "set_log_level":
+                        level = cmd.get("level")
+                        logger.setLevel(level)
+                        ctrl.set_log_level(level)
+                        logger.info(f"Worker log level set to {level}")
+                        conn.send_message(
+                            "status",
+                            f"log_level_set:{level}",
+                            status="running",
+                        )
+                    else:
+                        logger.warning(f"Unknown command type: {cmd_type}")
+                        conn.send_message(
+                            "error",
+                            f"Unknown command: {cmd_type}",
+                            status="error",
+                        )
+                else:
+                    logger.warning(f"Received unexpected command type: {type(cmd)}")
+                    conn.send_message(
+                        "error",
+                        f"Expected dict command, got {type(cmd)}",
+                        status="error",
+                    )
+            # Ensure pipeline stops if we exit the loop
+            ctrl.stop()
+        finally:
+            # Remove connection from progress_state
+            progress_state.pop("conn", None)
 
-        except EOFError:
-            logger.error("EOFError on connection recv. Connection closed by parent.")
-            ctrl.stop()  # Ensure pipeline stops if connection breaks
-        except Exception as e:
-            logger.error(f"Error processing command: {e}", exc_info=True)
-            # Decide whether to break or continue on other errors
-
-        # wait for the pipeline to complete
+        # Wait for pipeline completion
         logger.info("Waiting for pipeline to finish...")
-        return ctrl.join()  # join now handles the not-started case internally
+        return ctrl.join()
 
 
 def worker_main():
@@ -2141,12 +2230,10 @@ def worker_main():
     p.add_argument("--data_size", type=int, required=True)
     p.add_argument("--start_ea", type=lambda x: int(x, 0), required=True)
     p.add_argument("--is64", type=int, default=1)
-    # --- New arguments for connection ---
-    p.add_argument("--pipe-name", required=True, help="Named pipe/socket path for IPC")
-    p.add_argument(
-        "--authkey", required=True, help="Hex-encoded authkey for IPC connection"
-    )
+    p.add_argument("--address", required=True, help="Parent address (host:port)")
+    p.add_argument("--authkey", required=True, help="Auth key in hex format")
     args = p.parse_args()
+
     try:
         deob = AsyncDeobfuscator(
             shm_name=args.shm_name,
@@ -2154,12 +2241,16 @@ def worker_main():
             start_ea=args.start_ea,
             is_64bit=bool(args.is64),
         )
-        results = process(deob, args.pipe_name, args.authkey)
+
+        # Run the deobfuscation process
+        results = process(deob, args.address, args.authkey)
         logger.info("Pipeline finished.")
-        if not results:  # Check if join returned actual results
+
+        if not results:
             logger.info("No results generated or retrieved from pipeline.")
             return
 
+        # Format results
         asjson = [
             {
                 "address": c.overall_start(),
@@ -2168,10 +2259,14 @@ def worker_main():
             }
             for c in results
         ]
-        logger.info("results: ")
-        print("<|RESULTS_START|>", flush=True, end="")  # Also print sentinel to stdout
-        print(json.dumps(asjson), flush=True, end="")
-        print("<|RESULTS_END|>", flush=True, end="")
+
+        logger.info(f"Processed {len(asjson)} results.")
+
+        # Try to send results via connection
+        with ConnectionContext(args.address, args.authkey) as conn:
+            conn.send_message("result", asjson, status="success", count=len(asjson))
+            logger.info("Results sent via IPC connection.")
+
     except Exception as e:
         logger.error(f"Unhandled exception in worker_main: {e}", exc_info=True)
     finally:
@@ -2293,7 +2388,7 @@ if is_ida():
     import re
 
     from PyQt5 import QtCore
-    from PyQt5.QtCore import QProcess, QProcessEnvironment
+    from PyQt5.QtCore import QProcessEnvironment
 
     import ida_bytes
     import ida_ida
@@ -2302,22 +2397,149 @@ if is_ida():
 
     is_x64 = ida_ida.inf_is_64bit()
 
+    class TemporarilyDisableNotifier:
+        """Context manager to temporarily disable a QSocketNotifier."""
+
+        def __init__(self, notifier):
+            self.notifier = notifier
+            self.was_enabled = False
+
+        def __enter__(self):
+            # Save current enabled state
+            self.was_enabled = self.notifier.isEnabled()
+            # Disable the notifier
+            self.notifier.setEnabled(False)
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            # Re-enable only if it was enabled before
+            if self.was_enabled:
+                self.notifier.setEnabled(True)
+
+    class ConnectionReader(QtCore.QThread):
+        """Thread that safely reads from a multiprocessing connection when notified"""
+
+        message_received = QtCore.pyqtSignal(object)
+        connection_closed = QtCore.pyqtSignal()
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.connection = None
+            self.running = False
+            self.message_queue = queue.Queue()
+
+        def set_connection(self, connection):
+            self.connection = connection
+
+        def queue_read_request(self):
+            """Queue a request to read from the connection"""
+            self.message_queue.put(True)
+
+        def stop(self):
+            self.running = False
+            self.message_queue.put(False)  # Wake up the thread
+            self.wait()
+
+        def run(self):
+            self.running = True
+            while self.running:
+                # Wait for notification to read
+                try:
+                    should_read = self.message_queue.get(timeout=0.5)
+                    if not should_read or not self.running:
+                        break
+                    if self.connection.poll(timeout=0.5):
+                        # Read the message (this could block, which is why it's in a thread)
+                        message = self.connection.recv()
+                        self.message_received.emit(message)
+                except queue.Empty:
+                    continue  # Timeout, check if running
+                except EOFError:
+                    self.connection_closed.emit()
+                    break
+
+    class QtListener(QtCore.QObject):
+        """Qt-friendly wrapper for multiprocessing.connection.Listener with non-blocking SOCKET connection handling"""
+
+        # hardcode family to AF_INET since we're only socket listeners are supported.
+        family = "AF_INET"
+
+        # Signal emitted when a connection is accepted
+        connection_accepted = QtCore.pyqtSignal(object)  # Passes the Connection object
+        connection_error = QtCore.pyqtSignal(str)
+
+        def __init__(self, address=None, backlog=1, authkey=None, parent=None):
+            super().__init__(parent)
+
+            # Create the standard listener
+            self._listener = multiprocessing.connection.Listener(
+                address, self.family, backlog, authkey
+            )
+
+            # Get the underlying socket from the SocketListener
+            self._socket = self._listener._listener._socket
+            # Create a socket notifier to monitor for incoming connections
+            self._notifier = QtCore.QSocketNotifier(
+                self._socket.fileno(), QtCore.QSocketNotifier.Read, self
+            )
+            self._notifier.activated.connect(self._on_connection_ready)
+            self._notifier.setEnabled(True)
+
+        def _on_connection_ready(self):
+            """Called when the socket notifier detects the socket is readable"""
+            with TemporarilyDisableNotifier(self._notifier):
+                try:
+                    # Verify socket is readable with select (non-blocking)
+                    ready, _, _ = select.select([self._socket], [], [], 0)
+
+                    if not ready:
+                        return
+
+                    # Socket is ready, so accept() won't block
+                    conn = self.accept()
+                    # Emit signal with the connection
+                    self.connection_accepted.emit(conn)
+                except Exception as e:
+                    logger.error(f"Error accepting connection: {e}")
+                    self.connection_error.emit(str(e))
+
+        def accept(self):
+            """Original blocking accept method (avoid using in Qt apps)"""
+            return self._listener.accept()
+
+        def close(self):
+            """Close the listener and clean up resources"""
+            self._notifier.setEnabled(False)
+            self._notifier.deleteLater()
+            self._listener.close()
+
+        @property
+        def address(self):
+            return self._listener.address
+
     class WorkerLauncher(QtCore.QProcess):
         """
         Manages the external worker process using QProcess for command/status.
         Relies on shared memory for large data transfer.
+        Uses asynchronous bidirectional IPC for structured communication.
         """
 
         ## Signals emitted by the broker
-
-        #: For simple status updates like "ping", "results_ready"
-        status_message = QtCore.pyqtSignal(str)
 
         #: For structured results (assuming dict)
         processing_results = QtCore.pyqtSignal(dict)
 
         #: For errors reported by the worker
         error_occurred_msg = QtCore.pyqtSignal(str)
+
+        #: When worker sends a message via IPC
+        worker_message = QtCore.pyqtSignal(object)
+
+        #: When worker connection is established
+        worker_connected = QtCore.pyqtSignal()
+
+        #: When worker connection is closed
+        worker_disconnected = QtCore.pyqtSignal()
 
         def __init__(self, parent=None):
             super(WorkerLauncher, self).__init__(parent)
@@ -2326,29 +2548,181 @@ if is_ida():
             self.errorOccurred.connect(self._on_error)
             self.stateChanged.connect(self._on_state_changed)
             self.python_interpreter = MultiprocessingHelper.get_python_interpreter()
-            # --- Connection attributes ---
-            self.pipe_name = None
-            self.authkey = None
-            self.client_connection = None
-            self.listener_ready = False  # Flag to indicate worker is ready
 
-        @property
-        def cmd_queue(self):
-            return self.cmd_manager.get_cmd_queue() if self.cmd_manager else None
+            # --- Connection attributes ---
+            self.listener = None
+            self.connection = None
+            self.authkey = None
+            self.socket_notifier = None  # Socket notifier for the connection
+
+            # Setup reader thread for non-blocking IPC reads
+            self.reader_thread = ConnectionReader(self)
+            self.reader_thread.message_received.connect(self._on_worker_message)
+            self.reader_thread.connection_closed.connect(self._on_connection_closed)
+
+            # Connection retry timer
+            # self.connection_timer = QtCore.QTimer(self)
+            # self.connection_timer.setSingleShot(True)
+            self.connection_attempts = 0
+            self.max_connection_attempts = 10
 
         def is_not_running(self):
             return self.state() == QtCore.QProcess.NotRunning
 
+        def _setup_socket_notifier(self):
+            """Setup socket notifier for the connection"""
+            if not self.connection:
+                return
+
+            # Get file descriptor for the connection
+            fileno = self.connection.fileno()
+
+            # Create socket notifier for read events
+            self.socket_notifier = QtCore.QSocketNotifier(
+                fileno, QtCore.QSocketNotifier.Read
+            )
+            self.socket_notifier.activated.connect(self._on_data_available)
+            self.socket_notifier.setEnabled(True)
+
+        def _on_data_available(self, socket):
+            """Called when data is available on the connection"""
+            with TemporarilyDisableNotifier(self.socket_notifier):
+                # Queue a read request to the reader thread
+                self.reader_thread.queue_read_request()
+
+        def _on_worker_message(self, message):
+            """Process messages from the worker"""
+            logger.debug(f"← Received message from worker: {message}")
+
+            # Emit the message for external handlers
+            self.worker_message.emit(message)
+
+            # Process specific message types if needed
+            if isinstance(message, dict):
+                msg_type = message.get("type")
+                if msg_type == "error":
+                    error_msg = message.get("error", "Unknown error")
+                    self.error_occurred_msg.emit(error_msg)
+                elif msg_type == "result":
+                    # Format results in the expected structure
+                    results = {
+                        "results": message.get("data"),
+                        "status": message.get("status", "success"),
+                    }
+                    logger.info("Emitted processing_results via IPC.")
+                    self.processing_results.emit(results)
+
+        def _on_connection_closed(self):
+            """Handle connection closed by worker"""
+            logger.info("Worker IPC connection closed.")
+
+            if self.socket_notifier:
+                self.socket_notifier.setEnabled(False)
+                self.socket_notifier.deleteLater()
+                self.socket_notifier = None
+
+            if self.connection:
+                try:
+                    self.connection.close()
+                except:
+                    pass
+                self.connection = None
+            self.worker_disconnected.emit()
+
+        def _on_connection_accepted(self, conn):
+            """Handle a new connection"""
+            self.connection = conn
+            logger.info("Connection from worker accepted")
+            # self.connection_timer.stop()
+
+            # Set up communication
+            self.reader_thread.set_connection(self.connection)
+            if not self.reader_thread.isRunning():
+                self.reader_thread.start()
+            self._setup_socket_notifier()
+            self.worker_connected.emit()
+
+        def _on_connection_error(self, error_msg):
+            """Handle connection errors"""
+            logger.error(f"Connection error: {error_msg}")
+            self.connection_attempts += 1
+
+            if self.connection_attempts < self.max_connection_attempts:
+                # Schedule another check with exponential backoff
+                base_delay = min(1000, 100 * (2 ** (self.connection_attempts - 1)))
+                jitter = random.uniform(0.5, 1.5)
+                delay = int(base_delay * jitter)
+                # self.connection_timer.start(delay)
+            else:
+                self.error_occurred_msg.emit(
+                    f"Failed to connect to worker after {self.max_connection_attempts} attempts"
+                )
+                self.stop_worker()
+
+        # def _check_for_connection(self):
+        #     """Attempt to connect to the worker's IPC pipe with exponential backoff"""
+        #     if self.connection or self.is_not_running() or not self.listener:
+        #         return  # Already connected or process is not running
+
+        #     self.connection_attempts += 1
+        #     logger.info(
+        #         f"Connection check {self.connection_attempts}/{self.max_connection_attempts}"
+        #     )
+
+        #     def schedule_another_check():
+        #         # Calculate backoff delay: exponential with some randomness (50-150% of base time)
+        #         base_delay = min(
+        #             1000, 100 * (2 ** (self.connection_attempts - 1))
+        #         )  # Cap at 1000ms
+        #         jitter = random.uniform(0.5, 1.5)
+        #         delay = int(base_delay * jitter)
+        #         logger.debug("Scheduling another connection check in %dms", delay)
+        #         self.connection_timer.start(delay)
+
+        #     if not self.listener.poll(0.1):
+        #         schedule_another_check()
+        #         return
+
+        #     try:
+        #         # Accept the connection
+        #         self.connection = self.listener.accept()
+        #     except Exception as e:
+        #         logger.debug(f"Connection attempt failed: {e}")
+        #         if self.connection_attempts < self.max_connection_attempts:
+        #             schedule_another_check()
+        #         else:
+        #             logger.error(
+        #                 "Maximum connection attempts reached. Stopping worker."
+        #             )
+        #             self.error_occurred_msg.emit(
+        #                 f"Failed to connect to worker after {self.max_connection_attempts} attempts"
+        #             )
+        #             self.stop_worker()
+        #     else:
+        #         logger.info("Connection from worker accepted")
+        #         self.connection_timer.stop()  # Stop the timer
+        #         # Set up the bidirectional communication
+        #         self.reader_thread.set_connection(self.connection)
+        #         if not self.reader_thread.isRunning():
+        #             self.reader_thread.start()
+        #         self._setup_socket_notifier()
+        #         self.worker_connected.emit()
+
         def launch_worker(self, start_ea: int, shm_name: str, data_size: int):
             """Starts the worker script, passing connection details."""
-            # --- Generate connection details ---
-            self.pipe_name = generate_pipe_name()
+            self._cleanup_resources()
+            # Create a TCP socket listener
             self.authkey = os.urandom(32)  # Use a reasonably strong key
-            self.client_connection = None  # Reset connection state
-            self.listener_ready = False
-
-            logger.info(f"Generated Pipe Name: {self.pipe_name}")
             logger.info(f"Generated Authkey: {self.authkey.hex()}")
+            self.listener = QtListener(
+                ("localhost", 0),  # Let OS assign port
+                authkey=self.authkey,
+                parent=self,
+            )
+            address = self.listener.address  # (host, port) tuple
+            logger.info(f"Created listener on {address}")
+            self.listener.connection_accepted.connect(self._on_connection_accepted)
+            self.listener.connection_error.connect(self._on_connection_error)
 
             # --- Prepare QProcess ---
             env = QProcessEnvironment.systemEnvironment()
@@ -2367,8 +2741,8 @@ if is_ida():
                 hex(start_ea),
                 "--is64",
                 "1" if is_x64 else "0",
-                "--pipe-name",
-                self.pipe_name,
+                "--address",
+                f"{address[0]}:{address[1]}",
                 "--authkey",
                 self.authkey.hex(),
             ]
@@ -2377,20 +2751,52 @@ if is_ida():
             self.start(str(self.python_interpreter), args)
             if not self.waitForStarted(5000):
                 logger.error(f"Worker process failed to start: {self.errorString()}")
-                # Clean up pipe file if on Unix and it exists?
-                if platform.system() != "Windows":
-                    socket_path = pathlib.Path(self.pipe_name)
-                    if socket_path.exists():
-                        socket_path.unlink()
+                self._cleanup_resources()
                 return False
 
-            # Don't try to connect here, wait for LISTENER_READY in _on_stdout
-            logger.info("Worker process started. Waiting for LISTENER_READY signal...")
+            # Begin checking for connections
+            self.connection_attempts = 0
+            # Begin connection attempts with backoff strategy
+            logger.info("Worker process started. Beginning connection attempts...")
+            # First attempt after a short delay to give worker time to initialize
+            # self.connection_timer.start(200)  # Initial 200ms delay before first attempt
             return True  # Indicates process started, connection pending
+
+        def _cleanup_resources(self):
+            """Clean up connection resources."""
+            # Stop connection timer
+            # if self.connection_timer.isActive():
+            #     self.connection_timer.stop()
+
+            # Stop reader thread
+            if self.reader_thread.isRunning():
+                self.reader_thread.stop()
+
+            # Clean up socket notifier
+            if self.socket_notifier:
+                self.socket_notifier.setEnabled(False)
+                self.socket_notifier.deleteLater()
+                self.socket_notifier = None
+
+            # Close connection
+            if self.connection:
+                try:
+                    self.connection.close()
+                except:
+                    pass
+                self.connection = None
+
+            # Close listener
+            if self.listener:
+                try:
+                    self.listener.close()
+                except:
+                    pass
+                self.listener = None
 
         def stop_worker(self):
             """Attempts to terminate the worker process gracefully, then kills."""
-            if self.is_not_running() and not self.client_connection:
+            if self.is_not_running() and not self.connection:
                 logger.debug(
                     "Worker process was already stopped and connection closed."
                 )
@@ -2398,159 +2804,63 @@ if is_ida():
 
             logger.info("Attempting to stop worker process...")
 
-            # 1. Close the client-side connection first
-            if self.client_connection:
-                logger.info("Closing client-side IPC connection.")
+            # Try to send exit command if connected
+            if self.connection:
                 try:
-                    # Optionally send "exit" command first if worker handles it gracefully
-                    if self.state() == QtCore.QProcess.Running:
-                        logger.info("Sending 'exit' command over IPC connection.")
-                        self.send_command("exit")
-                    self.client_connection.close()
+                    logger.info("Sending exit command...")
+                    self.send_command({"command": "exit"})
+                    # Give a moment for clean shutdown
+                    if self.waitForFinished(1000):
+                        logger.info("Worker exited gracefully.")
+                        self._cleanup_resources()
+                        return
                 except Exception as e:
-                    logger.error(f"Error closing client connection: {e}")
-                finally:
-                    self.client_connection = None
-                    self.listener_ready = False  # Reset flag
+                    logger.error(f"Error sending exit command: {e}")
 
-            # 2. If process is still running, wait for it to finish or terminate
+            # Terminate if still running
             if not self.is_not_running():
-                # Give worker a moment to process 'exit' command if sent
-                if self.waitForFinished(1000):
-                    logger.info(
-                        "Worker process exited gracefully after closing connection/sending exit."
-                    )
-                    return  # Worker exited
-
-                logger.warning(
-                    "Worker did not exit gracefully after closing connection, attempting QProcess terminate."
-                )
+                logger.warning("Worker did not exit gracefully, terminating...")
                 self.terminate()
                 if not self.waitForFinished(2000):
-                    logger.warning(
-                        "Worker did not terminate gracefully, killing process."
-                    )
+                    logger.warning("Worker did not terminate, killing...")
                     self.kill()
-                    if not self.waitForFinished(1000):
-                        logger.error("Worker process failed to stop even after kill().")
+                    self.waitForFinished(1000)
 
-            # 3. Clean up socket file on Unix if it still exists
-            if platform.system() != "Windows":
-                socket_path = pathlib.Path(self.pipe_name)
-                if socket_path.exists():
-                    try:
-                        logger.info(f"Cleaning up socket file: {socket_path}")
-                        socket_path.unlink()
-                    except Exception as e_unlink:
-                        logger.error(
-                            f"Error removing socket file {socket_path}: {e_unlink}"
-                        )
+            # Clean up resources
+            self._cleanup_resources()
+            logger.info("Worker process shutdown complete.")
 
-            logger.info("Worker process stop sequence complete.")
-
-        def send_command(self, command: dict):
+        def send_command(self, command):
             """Sends a command object via the client connection."""
-            if not self.client_connection:
+            if not self.connection:
                 logger.warning(
                     f"Cannot send command '{command}', IPC connection not established or closed."
                 )
-                if not self.listener_ready and self.state() == QtCore.QProcess.Running:
-                    logger.warning("Worker listener might not be ready yet.")
-                elif self.state() != QtCore.QProcess.Running:
+                if self.state() != QtCore.QProcess.Running:
                     logger.warning("Worker process is not running.")
-                return
+                return False
 
-            logger.debug(f"→ Sending command via connection: {command}")
+            logger.debug(f"→ Sending command: {command}")
             try:
-                self.client_connection.send(json.dumps(command))  # Sends pickled object
+                self.connection.send(command)
                 logger.debug(f"→ Successfully sent command: {command}")
+                return True
             except Exception as e:
                 # Handle broken pipe errors, etc.
-                logger.error(f"Failed to send command '{command}' via connection: {e}")
-                # Consider closing the connection here if it's broken
-                try:
-                    self.client_connection.close()
-                except Exception:
-                    pass
-                self.client_connection = None
-                self.listener_ready = False
+                logger.error(f"Failed to send command '{command}': {e}")
+                self._on_connection_closed()
+                return False
 
         def _on_stdout(self):
-            """Reads worker stdout, primarily looking for LISTENER_READY signal."""
+            """Reads and logs worker stdout."""
             out_bytes = self.readAllStandardOutput()
             if not out_bytes:
                 return
             out = out_bytes.data().decode("utf-8", errors="replace")
 
-            processed_stdout = ""  # Accumulate non-signal output
-            listener_ready_found = False
-            rez = ""
-            for line in out.splitlines():
-                if line.strip() == "LISTENER_READY":
-                    if not self.client_connection and not self.listener_ready:
-                        logger.info("Received LISTENER_READY signal from worker.")
-                        listener_ready_found = True
-                    elif self.listener_ready:
-                        logger.warning("Received duplicate LISTENER_READY signal.")
-                    # else: connection already exists? should not happen ideally
-                elif line.strip().startswith("<|RESULTS_START|>"):
-                    # Handle results block separately if needed or let it pass through
-                    processed_stdout += line + "\n"
-                    rez = line
-                else:
-                    # Accumulate other output
-                    processed_stdout += line + "\n"
-
-            # Print accumulated non-signal output
-            if processed_stdout.strip():
-                print(processed_stdout.strip(), flush=True)
-
-            # Attempt connection if signal received and not already connected
-            if listener_ready_found:
-                logger.info(f"Attempting to connect to pipe: {self.pipe_name}")
-                try:
-                    self.client_connection = multiprocessing.connection.Client(
-                        self.pipe_name, authkey=self.authkey
-                    )
-                    self.listener_ready = True  # Set flag *after* successful connection
-                    logger.info("Successfully connected to worker IPC pipe.")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to connect to worker pipe '{self.pipe_name}': {e}",
-                        exc_info=True,
-                    )
-                    self.stop_worker()
-
-            # --- Results parsing (can stay the same, operates on the full 'out') ---
-            m = re.search(
-                r"<|RESULTS_START|>(.*?)<|RESULTS_END|>", out, re.DOTALL | re.S
-            )
-            if not m:
-                return
-
-            if m:
-                print(m.groups())
-            
-            if not rez:
-                return
-
-            results_json = rez.strip()
-            try:
-                results = json.loads(results_json)
-                results = {
-                    "results": results,
-                    "status": "success",
-                }
-                logger.info("Emitted processing_results.")
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to decode JSON results from worker stdout: {e}")
-                logger.error(f"Invalid JSON content: {results_json}")
-                results = {
-                    "results": results_json,
-                    "status": "error",
-                    "error": "error-decoding-json",
-                }
-            self.processing_results.emit(results)
+            # Just log stdout, no special handling
+            if out.strip():
+                print(out.strip(), flush=True)
 
         def _on_stderr(self):
             """Reads and logs data from the worker's standard error."""
@@ -2589,7 +2899,10 @@ if is_ida():
             state_str = state_map.get(state, f"UnknownState({state})")
             logger.info(f"Worker process state changed: {state_str}")
 
-            if state == QtCore.QProcess.NotRunning:
+            if self.is_not_running():
+                # Clean up resources if the process has stopped
+                self._cleanup_resources()
+
                 exit_code = self.exitCode()
                 exit_status = self.exitStatus()
                 exit_status_str = (
@@ -2612,63 +2925,6 @@ if is_ida():
             self.patch_manager = PatchManager(dry_run=True)
             self.proc = None
             atexit.register(self.terminate)
-
-        def _handle_worker_status(self, status: str):
-            logger.info(f"Worker status: {status}")
-
-        def _handle_worker_results(self, results: dict):
-            logger.info(f"Worker results: {results}")
-            if results["status"] == "success":
-                for patch_instructions in results["results"]:
-                    self.patch_manager.add_patch(
-                        patch_instructions["address"],
-                        patch_instructions["length"] * "\x90",
-                    )
-                self.patch_manager.apply_patches()
-            else:
-                logger.error(f"Worker reported an error: {results['error']}")
-
-        def _handle_worker_error(self, error: str):
-            """Handles error messages originating from the worker process."""
-            logger.error(f"Worker reported an error: {error}")
-
-            # Consider stopping the worker and cleaning up shared memory on error
-            self.proc.stop_worker()
-            self._cleanup_shared_memory()
-
-        def terminate(self):
-            """Terminate the plugin, stopping the broker and cleaning up shared memory."""
-            logger.info("Terminating...")
-            # Stop the broker process (sends 'exit' command)
-            if self.proc and not self.proc.is_not_running():
-                self.proc.stop_worker()
-                self.proc = None  # Clear reference
-            self._cleanup_shared_memory()
-            logger.info("Terminated.")
-
-        def pause(self):
-            self.proc.send_command({"cmd": "pause"})
-
-        def resume(self):
-            self.proc.send_command({"cmd": "resume"})
-
-        def stop(self):
-            self.proc.send_command({"cmd": "stop"})
-
-        def start(self):
-            self.proc.send_command({"cmd": "start"})
-
-        def ping(self):
-            self.proc.send_command({"cmd": "ping"})
-
-        def set_log_level(self, level: int):
-            """
-            Dynamically request the worker process switch its logger level.
-            Example:
-                import logging
-                Taskr().get().log_level(logging.DEBUG)
-            """
-            self.proc.send_command({"cmd": "set_log_level", "level": level})
 
         @staticmethod
         def get_section_data(
@@ -2714,6 +2970,63 @@ if is_ida():
             data_bytes = ida_bytes.get_bytes(start_ea, end_ea - start_ea)
             return start_ea, data_bytes
 
+        def pause(self):
+            self.proc.send_command({"command": "pause"})
+
+        def resume(self):
+            self.proc.send_command({"command": "resume"})
+
+        def stop(self):
+            self.proc.send_command({"command": "stop"})
+
+        def start(self):
+            self.proc.send_command({"command": "start"})
+
+        def ping(self):
+            self.proc.send_command({"command": "ping"})
+
+        def set_log_level(self, level: int):
+            """
+            Dynamically request the worker process switch its logger level.
+            Example:
+                import logging
+                Taskr().get().log_level(logging.DEBUG)
+            """
+            self.proc.send_command({"command": "set_log_level", "level": level})
+
+        def terminate(self):
+            """Terminate the plugin, stopping the broker and cleaning up shared memory."""
+            logger.info("Terminating...")
+            # Stop the broker process (sends 'exit' command)
+            if self.proc and not self.proc.is_not_running():
+                self.proc.stop_worker()
+                self.proc = None  # Clear reference
+            self._cleanup_shared_memory()
+            logger.info("Terminated.")
+
+        def _handle_worker_message(self, msg: typing.Any):
+            logger.info(f"Worker message: {msg}")
+
+        def _handle_worker_results(self, results: dict):
+            logger.info(f"Worker results: {results}")
+            if results["status"] == "success":
+                for patch_instructions in results["results"]:
+                    self.patch_manager.add_patch(
+                        patch_instructions["address"],
+                        patch_instructions["length"] * "\x90",
+                    )
+                self.patch_manager.apply_patches()
+            else:
+                logger.error(f"Worker reported an error: {results['error']}")
+
+        def _handle_worker_error(self, error: str):
+            """Handles error messages originating from the worker process."""
+            logger.error(f"Worker reported an error: {error}")
+
+            # Consider stopping the worker and cleaning up shared memory on error
+            self.proc.stop_worker()
+            self._cleanup_shared_memory()
+
         def run(self, start_ea: int, bytes_to_process: bytes, **kwargs):
             """Run the main plugin logic when hotkey is pressed."""
             plugin_arg: typing.Any = kwargs.pop("plugin_arg", None)
@@ -2729,7 +3042,7 @@ if is_ida():
 
             # launch worker
             self.proc = WorkerLauncher()
-            self.proc.status_message.connect(self._handle_worker_status)
+            self.proc.worker_message.connect(self._handle_worker_message)
             self.proc.processing_results.connect(self._handle_worker_results)
             self.proc.error_occurred_msg.connect(self._handle_worker_error)
             if not self.proc.launch_worker(
