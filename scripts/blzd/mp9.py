@@ -17,6 +17,7 @@ import multiprocessing.connection
 import multiprocessing.shared_memory
 import os
 import pathlib
+import pickle
 import queue
 import random
 import re
@@ -27,10 +28,15 @@ import sys
 import threading
 import time
 import typing
+import uuid
 import warnings
 
 import capstone
 import capstone.x86
+
+# maximum length of any stage-1 pattern (you said 129 bytes)
+MAX_PATTERN_LEN = 129
+MIN_PATTERN_LEN = 12
 
 # PyQt 5.15/6.2/6.3/6.4:
 # https://riverbankcomputing.com/news/SIP_v6.7.12_Released
@@ -153,7 +159,7 @@ def get_logger(name=None, configurer=None):
         configurer = configure_logging
     name = name or f"{"ida." if is_ida() else "worker."}{__name__}"
     logger = logging.getLogger(name)
-    configurer(logger, level=logging.DEBUG)
+    configurer(logger)
     return logger
 
 
@@ -756,6 +762,17 @@ def stage1_find_patterns(buf: bytes, base_ea: int):
     out = [chain for group in all_groups for chain in group]
     out.sort(key=lambda c: c.overall_start())
     return out
+
+
+def stage1_find_patterns_sync(buf: bytes, base_ea: int):
+    chains: list[MatchChain] = []
+    for rgx in MULTI_PART_PATTERNS + SINGLE_PART_PATTERNS:
+        # each call returns a MatchChains iterable
+        hits = _stage1_scan_one((rgx, base_ea, buf))
+        chains.extend(hits)
+    # sort by start address and return
+    chains.sort(key=lambda c: c.overall_start())
+    return chains
 
 
 # ─── Stage 2: peel off junk via Capstone ────────────────────────────────────
@@ -1721,7 +1738,7 @@ def _stage4_is_chain_valid(
                 + len(result["junk_after"])
             )
             new_bytes = (
-                result["junk_before"]
+                bytes(result["junk_before"])
                 + bytes(result["instruction"])
                 + bytes(result["junk_after"])
             )
@@ -1832,8 +1849,70 @@ def _stage4_worker(
     return validated_in_chunk
 
 
-
 # ─── Async deobfuscator ───────────────────────────────────
+
+
+def make_chunks(buf_len: int, n_chunks: int, max_pat: int = MAX_PATTERN_LEN):
+    """
+    Yield (padded_start, padded_end, core_start, core_end) so that:
+      • [core_start, core_end) are equal-sized, non-overlapping “core” regions
+      • each chunk is expanded on both sides by (max_pat-1) bytes
+    """
+    chunk_size = math.ceil(buf_len / n_chunks)
+    for i in range(0, buf_len, chunk_size):
+        core_start = i
+        core_end = min(buf_len, i + chunk_size)
+        padded_start = max(0, core_start - (max_pat - 1))
+        padded_end = min(buf_len, core_end + (max_pat - 1))
+        yield padded_start, padded_end, core_start, core_end
+
+
+def process_chunk(args):
+    """
+    Entire 4-stage pipeline over one overlapping chunk.
+    Returns only those chains whose start is in the chunk's core region.
+    """
+    shm_name, padded_start, padded_end, core_start, core_end, base_ea, is_64 = args
+
+    # attach shared memory
+    shm = multiprocessing.shared_memory.SharedMemory(name=shm_name)
+    full_buf_mv = memoryview(shm.buf)[: shm.size]  # zero-copy view of entire buffer
+    sub_buf = full_buf_mv[padded_start:padded_end]
+    try:
+        # — Stage 1
+        sub_bytes = bytes(sub_buf)
+        s1_chains = stage1_find_patterns(sub_bytes, base_ea + padded_start)
+
+        # — Stage 2 + 3
+        s2_3 = []
+        for chain in s1_chains:
+            chain = find_junk_stage2_chain(chain, full_buf_mv, base_ea, is_64)
+            if (
+                MIN_PATTERN_LEN <= chain.overall_length() <= MAX_PATTERN_LEN
+                and chain.junk_length > 0
+            ):
+                s2_3.append(chain)
+
+        # — Stage 4
+        validated = []
+        for chain in s2_3:
+            seg = _stage4_is_chain_valid(chain, full_buf_mv, base_ea, is_64)
+            if seg:
+                chain.add_segment(seg)  # attach the BIG_INSTRUCTION
+                validated.append(chain)
+
+        # — Filter out duplicates from the overlap padding: only keep those
+        #    whose start-offset falls in [core_start, core_end)
+        core_valid = []
+        for c in validated:
+            rel_off = c.overall_start() - base_ea
+            if core_start <= rel_off < core_end:
+                core_valid.append(c)
+    finally:
+        del full_buf_mv
+        del sub_buf
+        shm.close()
+    return core_valid
 
 
 @dataclasses.dataclass
@@ -1951,14 +2030,48 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         await self.emit("stage4_finished", final)
         return final
 
+    # @log_execution_time
+    # async def run(self):
+    #     await self.emit("run_started")
+    #     s1 = await self.stage1()
+    #     s2 = await self.stage2(s1)
+    #     s3 = await self.stage3(s2)
+    #     final = await self.stage4(s3)
+    #     return final
     @log_execution_time
     async def run(self):
         await self.emit("run_started")
-        s1 = await self.stage1()
-        s2 = await self.stage2(s1)
-        s3 = await self.stage3(s2)
-        final = await self.stage4(s3)
-        return final
+
+        # 1) define chunks over the shared buffer
+        buf_len = self.data_size
+        chunks = make_chunks(buf_len, self.max_workers)
+
+        # 2) fire one full-pipeline task per chunk
+        loop = asyncio.get_running_loop()
+        jobs = (
+            (
+                self.shm_name,
+                padded_start,
+                padded_end,
+                core_start,
+                core_end,
+                self.start_ea,
+                self.is_64bit,
+            )
+            for padded_start, padded_end, core_start, core_end in chunks
+        )
+        futures = [
+            loop.run_in_executor(self.executor, process_chunk, job) for job in jobs
+        ]
+
+        # 3) wait, flatten, resolve overlaps globally
+        per_chunk = await asyncio.gather(*futures)
+        all_chains = [c for grp in per_chunk for c in grp]
+        sorted_chains: typing.List[MatchChain] = list(
+            sorted(all_chains, key=lambda c: c.overall_start())
+        )
+        await self.emit("run_finished", sorted_chains)
+        return sorted_chains
 
     async def shutdown(self):
         self.stop_evt.set()
@@ -2066,7 +2179,7 @@ class ConnectionContext:
     Ensures the connection is closed on exit.
     """
 
-    def __init__(self, address: str, authkey: bytes | str):
+    def __init__(self, address: str, authkey: bytes | str, chunk_size: int = 1024):
         host, port_str = address.split(":")
         self.host = host
         self.port = int(port_str)
@@ -2077,6 +2190,7 @@ class ConnectionContext:
         assert isinstance(authkey, bytes), f"Invalid authkey type: {type(authkey)}"
         self.authkey = authkey
         self._conn = None
+        self.chunk_size = chunk_size
 
     @property
     def address(self) -> tuple[str, int]:
@@ -2091,26 +2205,58 @@ class ConnectionContext:
             logger.info(f"Connected to {self.address}")
         return self._conn
 
-    def send_message(self, msg_type, data, **kwargs) -> bool:
+    def send_message(self, msg_type: str, data, **kwargs) -> bool:
         """
         Send a structured message through the connection.
 
+        If data is a long list, split it into chunks, each carrying:
+          - message_id: a unique UUID for this logical payload
+          - chunk_index: 0-based index
+          - total_chunks
+        Otherwise send a single message with no chunk metadata.
+
         Args:
-            conn: The connection object
             msg_type: Type of message (status, result, error, etc.)
             data: The payload data
             **kwargs: Additional message attributes
-        """
-        message = {"type": msg_type, "data": data, "timestamp": time.time(), **kwargs}
-        success = True
-        try:
-            self.conn.send(message)  # Uses Python's native serialization
-            logger.debug(f"→ Sent message: {msg_type}")
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}")
-            success = False
 
-        return success
+        """
+        try:
+            if isinstance(data, list) and len(data) > self.chunk_size:
+                message_id = uuid.uuid4().hex
+                total_chunks = math.ceil(len(data) / self.chunk_size)
+
+                for idx in range(total_chunks):
+                    part = data[idx * self.chunk_size : (idx + 1) * self.chunk_size]
+                    msg = {
+                        "type": msg_type,
+                        "data": part,
+                        "timestamp": time.time(),
+                        "message_id": message_id,
+                        "chunk_index": idx,
+                        "total_chunks": total_chunks,
+                        **kwargs,
+                    }
+                    self.conn.send(msg)
+                logger.debug(
+                    f"→ Streamed {len(data)} items in {total_chunks} chunks under id {message_id}"
+                )
+                return True
+
+            # small or non-list payload: single shot
+            msg = {
+                "type": msg_type,
+                "data": data,
+                "timestamp": time.time(),
+                **kwargs,
+            }
+            self.conn.send(msg)
+            logger.debug(f"→ Sent single message: {msg_type}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}", exc_info=True)
+            return False
 
     @property
     def closed(self):
@@ -2278,7 +2424,6 @@ def process(deob, address, authkey):
                     cmd_type = cmd.get("command")
                     if cmd_type in ["stop", "exit", "shutdown"]:
                         logger.info("Received exit command")
-                        ctrl.stop()
                         break
                     elif cmd_type == "ping":
                         conn.send_message("status", "pong", status="running")
@@ -2366,7 +2511,20 @@ def worker_main():
 
         # Try to send results via connection
         with ConnectionContext(args.address, args.authkey) as conn:
-            conn.send_message("result", asjson, status="success", count=len(asjson))
+            logger.info("Sending results via IPC connection in 5 seconds...")
+            if not conn.send_message(
+                "status", "sending_results", status="sending_results"
+            ):
+                logger.error("Failed to send status message")
+            time.sleep(5)
+            if not conn.send_message(
+                "result", asjson, status="success", count=len(asjson)
+            ):
+                logger.error("Failed to send results message")
+            if not conn.send_message(
+                "status", "results_sent", status="results_sent", count=len(asjson)
+            ):
+                logger.error("Failed to send results_sent message")
             logger.info("Results sent via IPC connection.")
 
     except Exception as e:
@@ -2519,46 +2677,38 @@ if is_ida():
                 self.notifier.setEnabled(True)
 
     class ConnectionReader(QtCore.QThread):
-        """Thread that safely reads from a multiprocessing connection when notified"""
-
         message_received = QtCore.pyqtSignal(object)
         connection_closed = QtCore.pyqtSignal()
 
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.connection = None
-            self.running = False
-            self.message_queue = queue.Queue()
+            self.connection: multiprocessing.connection.Connection | None = None
 
-        def set_connection(self, connection):
-            self.connection = connection
-
-        def queue_read_request(self):
-            """Queue a request to read from the connection"""
-            self.message_queue.put(True)
-
-        def stop(self):
-            self.running = False
-            self.message_queue.put(False)  # Wake up the thread
-            self.wait()
+        def set_connection(self, conn):
+            self.connection = conn
 
         def run(self):
-            self.running = True
-            while self.running:
-                # Wait for notification to read
+            if not self.connection:
+                return
+
+            try:
+                # Keep calling recv() until the pipe/socket dies.
+                while True:
+                    msg = (
+                        self.connection.recv()
+                    )  # blocks until a *full* pickled object arrives
+                    # emit every single message—status, result, results_sent, etc.
+                    self.message_received.emit(msg)
+            except (EOFError, OSError):
+                # clean shutdown when the other side closes
+                self.connection_closed.emit()
+            except pickle.PickleError as e:
+                logger.error(f"Pickle error: {e}")
+            finally:
                 try:
-                    should_read = self.message_queue.get(timeout=0.5)
-                    if not should_read or not self.running:
-                        break
-                    if self.connection.poll(timeout=0.5):
-                        # Read the message (this could block, which is why it's in a thread)
-                        message = self.connection.recv()
-                        self.message_received.emit(message)
-                except queue.Empty:
-                    continue  # Timeout, check if running
-                except EOFError:
-                    self.connection_closed.emit()
-                    break
+                    self.connection.close()
+                except Exception:
+                    pass
 
     class QtListener(QtCore.QObject):
         """Qt-friendly wrapper for multiprocessing.connection.Listener with non-blocking SOCKET connection handling"""
@@ -2655,47 +2805,68 @@ if is_ida():
             self.listener = None
             self.connection = None
             self.authkey = None
-            self.socket_notifier = None  # Socket notifier for the connection
 
             # Setup reader thread for non-blocking IPC reads
             self.reader_thread = ConnectionReader(self)
             self.reader_thread.message_received.connect(self._on_worker_message)
             self.reader_thread.connection_closed.connect(self._on_connection_closed)
 
-            # Connection retry timer
-            # self.connection_timer = QtCore.QTimer(self)
-            # self.connection_timer.setSingleShot(True)
             self.connection_attempts = 0
             self.max_connection_attempts = 10
+
+            # per-stream accumulators: prefix → {"chunks": [...], "total": int}
+            self._streams: dict[str, dict] = {}
 
         def is_not_running(self):
             return self.state() == QtCore.QProcess.NotRunning
 
-        def _setup_socket_notifier(self):
-            """Setup socket notifier for the connection"""
-            if not self.connection:
-                return
-
-            # Get file descriptor for the connection
-            fileno = self.connection.fileno()
-
-            # Create socket notifier for read events
-            self.socket_notifier = QtCore.QSocketNotifier(
-                fileno, QtCore.QSocketNotifier.Read
-            )
-            self.socket_notifier.activated.connect(self._on_data_available)
-            self.socket_notifier.setEnabled(True)
-
-        def _on_data_available(self, socket):
-            """Called when data is available on the connection"""
-            with TemporarilyDisableNotifier(self.socket_notifier):
-                # Queue a read request to the reader thread
-                self.reader_thread.queue_read_request()
-
         def _on_worker_message(self, message):
-            """Process messages from the worker"""
-            logger.debug(f"← Received message from worker: {message}")
+            """Process messages from the worker, including chunked streams."""
+            msg_type = message.get("type")
 
+            # 1) detect chunked stream
+            msg_id = message.get("message_id")
+            if msg_id:
+                idx = message["chunk_index"]
+                total = message["total_chunks"]
+
+                stream = self._streams.setdefault(
+                    msg_id, {"type": msg_type, "chunks": {}, "total": total}
+                )
+                stream["chunks"][idx] = message["data"]
+                logger.info(
+                    "Received chunk %d/%d for %r (id=%s)",
+                    idx + 1,
+                    total,
+                    msg_type,
+                    msg_id,
+                )
+
+                # once we have all chunks, reassemble and emit
+                if len(stream["chunks"]) == total:
+                    full = []
+                    for i in range(total):
+                        full.extend(stream["chunks"][i])
+                    # cleanup
+                    del self._streams[msg_id]
+                    logger.info(
+                        "%r streaming complete (id=%s, %d items)",
+                        msg_type,
+                        msg_id,
+                        len(full),
+                    )
+                    # emit exactly once as a single result
+                    self.processing_results.emit(
+                        {
+                            "type": "result",
+                            "results": full,
+                            "status": "success",
+                        }
+                    )
+                return  # done
+
+            # 2) non-chunked messages
+            logger.debug("← Received message from worker: %r", message)
             # Emit the message for external handlers
             self.worker_message.emit(message)
 
@@ -2718,11 +2889,6 @@ if is_ida():
             """Handle connection closed by worker"""
             logger.info("Worker IPC connection closed.")
 
-            if self.socket_notifier:
-                self.socket_notifier.setEnabled(False)
-                self.socket_notifier.deleteLater()
-                self.socket_notifier = None
-
             if self.connection:
                 try:
                     self.connection.close()
@@ -2730,85 +2896,6 @@ if is_ida():
                     pass
                 self.connection = None
             self.worker_disconnected.emit()
-
-        def _on_connection_accepted(self, conn):
-            """Handle a new connection"""
-            self.connection = conn
-            logger.info("Connection from worker accepted")
-            # self.connection_timer.stop()
-
-            # Set up communication
-            self.reader_thread.set_connection(self.connection)
-            if not self.reader_thread.isRunning():
-                self.reader_thread.start()
-            self._setup_socket_notifier()
-            self.worker_connected.emit()
-
-        def _on_connection_error(self, error_msg):
-            """Handle connection errors"""
-            logger.error(f"Connection error: {error_msg}")
-            self.connection_attempts += 1
-
-            if self.connection_attempts < self.max_connection_attempts:
-                # Schedule another check with exponential backoff
-                base_delay = min(1000, 100 * (2 ** (self.connection_attempts - 1)))
-                jitter = random.uniform(0.5, 1.5)
-                delay = int(base_delay * jitter)
-                # self.connection_timer.start(delay)
-            else:
-                self.error_occurred_msg.emit(
-                    f"Failed to connect to worker after {self.max_connection_attempts} attempts"
-                )
-                self.stop_worker()
-
-        # def _check_for_connection(self):
-        #     """Attempt to connect to the worker's IPC pipe with exponential backoff"""
-        #     if self.connection or self.is_not_running() or not self.listener:
-        #         return  # Already connected or process is not running
-
-        #     self.connection_attempts += 1
-        #     logger.info(
-        #         f"Connection check {self.connection_attempts}/{self.max_connection_attempts}"
-        #     )
-
-        #     def schedule_another_check():
-        #         # Calculate backoff delay: exponential with some randomness (50-150% of base time)
-        #         base_delay = min(
-        #             1000, 100 * (2 ** (self.connection_attempts - 1))
-        #         )  # Cap at 1000ms
-        #         jitter = random.uniform(0.5, 1.5)
-        #         delay = int(base_delay * jitter)
-        #         logger.debug("Scheduling another connection check in %dms", delay)
-        #         self.connection_timer.start(delay)
-
-        #     if not self.listener.poll(0.1):
-        #         schedule_another_check()
-        #         return
-
-        #     try:
-        #         # Accept the connection
-        #         self.connection = self.listener.accept()
-        #     except Exception as e:
-        #         logger.debug(f"Connection attempt failed: {e}")
-        #         if self.connection_attempts < self.max_connection_attempts:
-        #             schedule_another_check()
-        #         else:
-        #             logger.error(
-        #                 "Maximum connection attempts reached. Stopping worker."
-        #             )
-        #             self.error_occurred_msg.emit(
-        #                 f"Failed to connect to worker after {self.max_connection_attempts} attempts"
-        #             )
-        #             self.stop_worker()
-        #     else:
-        #         logger.info("Connection from worker accepted")
-        #         self.connection_timer.stop()  # Stop the timer
-        #         # Set up the bidirectional communication
-        #         self.reader_thread.set_connection(self.connection)
-        #         if not self.reader_thread.isRunning():
-        #             self.reader_thread.start()
-        #         self._setup_socket_notifier()
-        #         self.worker_connected.emit()
 
         def launch_worker(self, start_ea: int, shm_name: str, data_size: int):
             """Starts the worker script, passing connection details."""
@@ -2860,25 +2947,37 @@ if is_ida():
             self.connection_attempts = 0
             # Begin connection attempts with backoff strategy
             logger.info("Worker process started. Beginning connection attempts...")
-            # First attempt after a short delay to give worker time to initialize
-            # self.connection_timer.start(200)  # Initial 200ms delay before first attempt
             return True  # Indicates process started, connection pending
+
+        def _on_connection_accepted(self, conn):
+            """Handle a new connection"""
+            logger.info("Connection from worker accepted")
+            # Set up communication
+            # Give the new Connection to our reader thread
+            #    (this atomically replaces its internal .connection)
+            self.reader_thread.set_connection(conn)
+            if not self.reader_thread.isRunning():
+                self.reader_thread.start()
+            self.connection = conn
+            self.worker_connected.emit()
+
+        def _on_connection_error(self, error_msg):
+            """Handle connection errors"""
+            logger.error(f"Connection error: {error_msg}")
+            self.connection_attempts += 1
+
+            if self.connection_attempts >= self.max_connection_attempts:
+                self.error_occurred_msg.emit(
+                    f"Failed to connect to worker after {self.max_connection_attempts} attempts"
+                )
+                self.stop_worker()
 
         def _cleanup_resources(self):
             """Clean up connection resources."""
-            # Stop connection timer
-            # if self.connection_timer.isActive():
-            #     self.connection_timer.stop()
 
             # Stop reader thread
             if self.reader_thread.isRunning():
                 self.reader_thread.stop()
-
-            # Clean up socket notifier
-            if self.socket_notifier:
-                self.socket_notifier.setEnabled(False)
-                self.socket_notifier.deleteLater()
-                self.socket_notifier = None
 
             # Close connection
             if self.connection:
@@ -3117,7 +3216,7 @@ if is_ida():
                         patch_instructions["address"],
                         patch_instructions["length"] * "\x90",
                     )
-                self.patch_manager.apply_patches()
+                self.patch_manager.apply_all()
             else:
                 logger.error(f"Worker reported an error: {results['error']}")
 
@@ -3263,3 +3362,6 @@ if __name__ == "__main__":
     else:
         print("Running Taskr().get().run(*Taskr().get().get_section_data('.text'))")
         Taskr().get().run(*Taskr().get().get_section_data(".text"))
+
+        time.sleep(5)
+        Taskr().get().start()
