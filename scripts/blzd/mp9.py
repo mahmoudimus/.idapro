@@ -10,7 +10,6 @@ import dataclasses
 import enum
 import functools
 import itertools
-import json
 import logging
 import math
 import multiprocessing
@@ -18,7 +17,6 @@ import multiprocessing.connection
 import multiprocessing.shared_memory
 import os
 import pathlib
-import platform
 import queue
 import random
 import re
@@ -29,7 +27,6 @@ import sys
 import threading
 import time
 import typing
-import uuid
 import warnings
 
 import capstone
@@ -156,7 +153,7 @@ def get_logger(name=None, configurer=None):
         configurer = configure_logging
     name = name or f"{"ida." if is_ida() else "worker."}{__name__}"
     logger = logging.getLogger(name)
-    configurer(logger)
+    configurer(logger, level=logging.DEBUG)
     return logger
 
 
@@ -275,6 +272,33 @@ class AsyncEventEmitter:
             res = h(*args)
             if asyncio.iscoroutine(res):
                 await res
+
+
+def log_execution_time(func, loglvl=logging.INFO):
+    """
+    Decorator to log the execution time of async stage methods.
+
+    >>> import asyncio, logging
+    >>> logging.basicConfig(level=logging.INFO)
+    >>> class Dummy:
+    ...     @log_execution_time
+    ...     async def foo(self):
+    ...         await asyncio.sleep(0.01)
+    ...         return 42
+    >>> d = Dummy()
+    >>> asyncio.run(d.foo())
+    42
+    """
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = await func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        logger.log(loglvl, f"{func.__qualname__} executed in {elapsed:.4f} seconds")
+        return result
+
+    return wrapper
 
 
 class MultiprocessingHelper:
@@ -920,7 +944,11 @@ def peel_junk(buf: bytes, is_64: bool) -> typing.List[JunkInstruction]:
                 match = rgx.compile().match(insn.bytes)
 
                 # Check if a match occurred AND it consumed the *entire* instruction
-                if match and match.end() == insn.size:
+                if match:
+                    if match.end() != insn.size:
+                        logger.warning(
+                            f"junk detected @ {insn.address} - {rgx.description} - matched {insn.bytes.hex()} and consumed {match.end()} bytes but expected {insn.size} bytes"
+                        )
                     junk_description = rgx.description or "Junk"
 
                     # logger.debug(f"  Instruction bytes {instruction_bytes.hex()} matched regex: {junk_meta.pattern.decode('latin-1')}")
@@ -1118,11 +1146,25 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         if insn is None:
             return None
         logger.debug(
-            f"Decoded instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {hex(ea)} - bytes: {insn.bytes.hex()}"
+            "Decoded instruction: %s %s (%X bytes) at offset %s - bytes: %s",
+            insn.mnemonic,
+            insn.op_str,
+            insn.size,
+            hex(ea),
+            insn.bytes.hex(),
         )
         decoded = BasicDecodedInstruction(address=ea, size=insn.size)
         if insn.id == capstone.x86.X86_INS_NOP:
             decoded.is_nop = True
+        # Check for 'xchg r8, r8' as a NOP pattern (0x90 is 'nop', i.e. 0x87 C9 is 'xchg cl, cl')
+        elif insn.id in (
+            capstone.x86.X86_INS_XCHG,
+            # capstone.x86.X86_INS_MOV,
+            # capstone.x86.X86_GRP_CMOV,
+        ):
+            op1, op2 = insn.operands
+            if op1.type == op2.type and op1.size == op2.size and op1.reg == op2.reg:
+                decoded.is_nop = True
         elif capstone.CS_GRP_JUMP in insn.groups:
             if (
                 len(insn.operands) > 0
@@ -1188,13 +1230,17 @@ class JumpTargetAnalyzer:
 
         if current_ea in visited:
             logger.debug(
-                f"{indent}Jump chain stopped: Already visited 0x{current_ea:X}"
+                "%sJump chain stopped: Already visited 0x%X", indent, current_ea
             )
             return None
         # Check if start address is within the bounds defined by the Memory object
         if not (mem_start_ea <= current_ea < mem_end_ea):
             logger.debug(
-                f"{indent}Jump chain stopped: Start address 0x{current_ea:X} is outside Memory bounds [0x{mem_start_ea:X}, 0x{mem_end_ea:X})"
+                "%sJump chain stopped: Start address 0x%X is outside Memory bounds [0x%X, 0x%X)",
+                indent,
+                current_ea,
+                mem_start_ea,
+                mem_end_ea,
             )
             return None
 
@@ -1205,14 +1251,19 @@ class JumpTargetAnalyzer:
             # Check if the current tracing address is still within the Memory bounds
             if not (mem_start_ea <= trace_ea < mem_end_ea):
                 logger.debug(
-                    f"{indent}Stopping trace: Address 0x{trace_ea:X} is outside Memory bounds [0x{mem_start_ea:X}, 0x{mem_end_ea:X}). Returning last valid start: 0x{current_ea:X}"
+                    "%sStopping trace: Address 0x%X is outside Memory bounds [0x%X, 0x%X). Returning last valid start: 0x%X",
+                    indent,
+                    trace_ea,
+                    mem_start_ea,
+                    mem_end_ea,
+                    current_ea,
                 )
                 return current_ea  # Return the start address of the sequence that led out of bounds
 
             decoded_insn = None
             # Calculate offset relative to the start of the Memory object's buffer
             offset = trace_ea - mem_start_ea
-            logger.debug(f"offset: {offset}")
+            logger.debug("%soffset: %X", indent, offset)
             # We already know offset is >= 0 because trace_ea >= mem_start_ea
             # We need to ensure we have enough bytes left for *potential* instructions
 
@@ -1223,7 +1274,10 @@ class JumpTargetAnalyzer:
                 not bytes_for_decoder
             ):  # Should not happen if bounds check is correct, but defensive check
                 logger.warning(
-                    f"{indent}No bytes available for decoding at offset {offset} (address 0x{trace_ea:X}). Stopping trace."
+                    "%sNo bytes available for decoding at offset %X (address 0x%X). Stopping trace.",
+                    indent,
+                    offset,
+                    trace_ea,
                 )
                 return current_ea
 
@@ -1232,42 +1286,60 @@ class JumpTargetAnalyzer:
                 decoded_insn = decoder.decode(trace_ea, bytes_for_decoder)
             except Exception as e:
                 logger.error(
-                    f"{indent}Decoder function raised exception at 0x{trace_ea:X}: {e}"
+                    "%sDecoder function raised exception at 0x%X: %s",
+                    indent,
+                    trace_ea,
+                    e,
                 )
                 decoded_insn = None  # Treat as decode failure
 
             # If decoding failed or decoder returned None
             if not decoded_insn:
                 logger.debug(
-                    f"{indent}Failed to decode instruction at 0x{trace_ea:X}. Stopping trace. Returning start: 0x{current_ea:X}"
+                    "%sFailed to decode instruction at 0x%X. Stopping trace. Returning start: 0x%X",
+                    indent,
+                    trace_ea,
+                    current_ea,
                 )
                 return current_ea  # Return start of the sequence
 
             # --- Process the decoded instruction ---
             if decoded_insn.is_nop:
                 logger.debug(
-                    f"{indent}NOP found at 0x{trace_ea:X} (size {decoded_insn.size}). Skipping."
+                    "%sNOP found at 0x%X (size %X). Skipping.",
+                    indent,
+                    trace_ea,
+                    decoded_insn.size,
                 )
                 trace_ea += decoded_insn.size
                 continue  # Continue the while loop to the next instruction
 
             if not decoded_insn.is_jump or decoded_insn.size != 2:
                 logger.debug(
-                    f"{indent}Chain stopped at 0x{trace_ea:X}: Instruction is not a 2-byte jump. Returning start: 0x{current_ea:X}"
+                    "%sChain stopped at 0x%X: Instruction is not a 2-byte jump. Returning start: 0x%X",
+                    indent,
+                    trace_ea,
+                    current_ea,
                 )
                 return current_ea  # Return the start address of the sequence that ended
 
             # --- We have a 2-byte jump ---
             target = decoded_insn.jump_target  # This is an absolute address
             logger.debug(
-                f"{indent}  -> Found 2-byte jump at 0x{trace_ea:X} targeting 0x{target:X}"
+                "%s  -> Found 2-byte jump at 0x%X targeting 0x%X",
+                indent,
+                trace_ea,
+                target,
             )
 
             # --- Decide action based on the jump target (using absolute addresses) ---
             # 1. Target is within the 'followable' range [match_start, match_end + 6)
             if self.match_start <= target < match_end + 6:
                 logger.debug(
-                    f"{indent}Following jump from 0x{trace_ea:X} to 0x{target:X} (recursive call)"
+                    "%sFollowing jump from 0x%X to 0x%X (recursive call)",
+                    indent,
+                    trace_ea,
+                    target,
                 )
                 # Pass the same Memory object and decoder down recursively
                 return self.follow_jump_chain(
@@ -1277,23 +1349,52 @@ class JumpTargetAnalyzer:
             # 2. Target lands exactly at the potential start of the next stage
             elif target == match_end + 6:
                 logger.debug(
-                    f"{indent}Jump chain ends: Reached potential next stage start 0x{target:X}"
+                    "%sJump chain ends: Reached potential next stage start 0x%X",
+                    indent,
+                    target,
                 )
                 return target  # Return the exact target address
 
             # 3. Target is within the overall Memory block, but *before* match_start.
             elif mem_start_ea <= target < self.match_start:
                 logger.debug(
-                    f"{indent}Jump chain ends: Target 0x{target:X} is within Memory bounds [{mem_start_ea:X},{mem_end_ea:X}) but outside followable range [{self.match_start:X}, {match_end + 6:X}). Returning target."
+                    "%sJump chain ends: Target 0x%X is within Memory bounds [0x%X,0x%X) but outside followable range [0x%X, 0x%X). Returning target.",
+                    indent,
+                    target,
+                    mem_start_ea,
+                    mem_end_ea,
+                    self.match_start,
+                    match_end + 6,
                 )
                 return target  # Return the target address itself
 
             # 4. Target is out of the overall Memory bounds or otherwise unexpected.
             else:
                 logger.debug(
-                    f"{indent}Jump chain stopped: Target 0x{target:X} is outside allowed ranges. Returning start address 0x{current_ea:X}"
+                    "%sJump chain stopped: Target 0x%X is outside allowed ranges. Returning start address 0x%X",
+                    indent,
+                    target,
+                    current_ea,
                 )
                 return current_ea  # Return the start address of the sequence containing the invalid jump
+
+    def _decode_stream(self, decoder, start, match_bytes):
+        offset = 0
+        n = len(match_bytes)
+
+        while offset < n:
+            try:
+                # hand the decoder only the bytes we haven’t consumed yet
+                insn = decoder.decode(start + offset, match_bytes[offset:])
+            except Exception as e:
+                logger.error("Decode error @0x%X: %s", start + offset, e)
+                return
+
+            if not insn:
+                return
+
+            yield insn
+            offset += insn.size
 
     def process(self, mem, chain, is_x64: bool):
         """
@@ -1305,34 +1406,60 @@ class JumpTargetAnalyzer:
         decoder = CapstoneInstructionDecoder(is_x64)
         match_end = chain.overall_start() + chain.overall_length()
         logger.debug(
-            f"Processing jumps for chain @ 0x{chain.overall_start():X}, match_end=0x{match_end:X}"
+            "Processing jumps for chain @ 0x%X, match_end=0x%X",
+            chain.overall_start(),
+            match_end,
         )
-        for jump_match in re.finditer(
-            rb"[\xEB\x70-\x7F].", self.match_bytes, re.DOTALL
+
+        for insn in self._decode_stream(
+            decoder, chain.overall_start(), self.match_bytes
         ):
-            jump_offset = jump_match.start()
-            jump_ea = self.match_start + jump_offset
-            final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
-            if not final_target:
-                logger.debug(
-                    f"  Skipping jump at 0x{jump_ea:X}: Invalid final target 0x{final_target if final_target else 0:X}"
-                )
+            # 1) filter out non jumps or non 2-byte jumps
+            if not insn.is_jump or insn.size != 2:
                 continue
 
-            # Adjusted condition: Target must be *after* the match end and within 6 bytes
-            if abs(final_target - match_end) > 6:
-                logger.debug(
-                    f"  Skipping jump at 0x{jump_ea:X}: Final target 0x{final_target:X} not within [(0x{match_end - 6:X}, 0x{match_end:X}) or (0x{match_end:X}, 0x{match_end + 6:X}]"
-                )
+            final_target = self.follow_jump_chain(mem, insn.address, match_end, decoder)
+            if not final_target:
+                logger.debug("Bad target @0x%X", insn.address)
                 continue
+
+            if abs(final_target - match_end) > 6:
+                logger.debug("Out of range @0x%X", insn.address)
+                continue
+
+            # 2) process the hit
             self.jump_targets[final_target] += 1
-            # Record the stage1_type on the first occurrence.
             if final_target not in self.target_type:
                 self.target_type[final_target] = chain.stage1_type
-            self.jump_details.append((jump_ea, final_target, chain.stage1_type))
-            logger.debug(
-                f"  Found {jump_match.group().hex()} @ 0x{jump_ea:X} targeting 0x{final_target:X}"
-            )
+            self.jump_details.append((insn.address, final_target, chain.stage1_type))
+            logger.debug("Found jump @0x%X → 0x%X", insn.address, final_target)
+
+        # for jump_match in re.finditer(
+        #     rb"[\xEB\x70-\x7F].", self.match_bytes, re.DOTALL
+        # ):
+        #     jump_offset = jump_match.start()
+        #     jump_ea = self.match_start + jump_offset
+        #     final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
+        #     if not final_target:
+        #         logger.debug(
+        #             f"  Skipping jump at 0x{jump_ea:X}: Invalid final target 0x{final_target if final_target else 0:X}"
+        #         )
+        #         continue
+
+        #     # Adjusted condition: Target must be *after* the match end and within 6 bytes
+        #     if abs(final_target - match_end) > 6:
+        #         logger.debug(
+        #             f"  Skipping jump at 0x{jump_ea:X}: Final target 0x{final_target:X} not within [(0x{match_end - 6:X}, 0x{match_end:X}) or (0x{match_end:X}, 0x{match_end + 6:X}]"
+        #         )
+        #         continue
+        #     self.jump_targets[final_target] += 1
+        #     # Record the stage1_type on the first occurrence.
+        #     if final_target not in self.target_type:
+        #         self.target_type[final_target] = chain.stage1_type
+        #     self.jump_details.append((jump_ea, final_target, chain.stage1_type))
+        #     logger.debug(
+        #         f"  Found {jump_match.group().hex()} @ 0x{jump_ea:X} targeting 0x{final_target:X}"
+        #     )
         return self
 
     def __iter__(self):
@@ -1705,32 +1832,6 @@ def _stage4_worker(
     return validated_in_chunk
 
 
-def log_execution_time(func, loglvl=logging.INFO):
-    """
-    Decorator to log the execution time of async stage methods.
-
-    >>> import asyncio, logging
-    >>> logging.basicConfig(level=logging.INFO)
-    >>> class Dummy:
-    ...     @log_execution_time
-    ...     async def foo(self):
-    ...         await asyncio.sleep(0.01)
-    ...         return 42
-    >>> d = Dummy()
-    >>> asyncio.run(d.foo())
-    42
-    """
-
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        result = await func(*args, **kwargs)
-        elapsed = time.perf_counter() - start
-        logger.log(loglvl, f"{func.__qualname__} executed in {elapsed:.4f} seconds")
-        return result
-
-    return wrapper
-
 
 # ─── Async deobfuscator ───────────────────────────────────
 
@@ -1742,6 +1843,7 @@ class AsyncDeobfuscator(AsyncEventEmitter):
     start_ea: int
     is_64bit: bool
     max_workers: int = None
+    executor: concurrent.futures.Executor | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -1749,7 +1851,7 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         self.stop_evt = asyncio.Event()
         self.max_workers = self.max_workers or max(1, multiprocessing.cpu_count())
         ctx = multiprocessing.get_context("spawn")
-        self.executor = concurrent.futures.ProcessPoolExecutor(
+        self.executor = self.executor or concurrent.futures.ProcessPoolExecutor(
             max_workers=self.max_workers, mp_context=ctx
         )
         logger.info(f"executor pool created with {self.max_workers} workers")
