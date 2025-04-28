@@ -1722,7 +1722,7 @@ def resolve_overlaps(chains: list[MatchChain]) -> list[MatchChain]:
 # ─── Async deobfuscator ───────────────────────────────────
 
 
-def make_chunks(buf_len: int, n_chunks: int, max_pat: int = MAX_PATTERN_LEN):
+def make_chunks(buf_len: int, n_chunks: int, max_pat: int = MAX_PATTERN_LEN * 2):
     """
     Yield exactly n_chunks tuples of
       (padded_start, padded_end, core_start, core_end).
@@ -1742,7 +1742,7 @@ def make_chunks(buf_len: int, n_chunks: int, max_pat: int = MAX_PATTERN_LEN):
         padded_end = min(buf_len, core_end + (max_pat - 1))
         padded_len = padded_end - padded_start
 
-        logger.info(
+        logger.debug(
             "Chunk %2d/%d: "
             "core=[%#x-%#x) (%d bytes), "
             "padded=[%#x-%#x) (%d bytes)",
@@ -1776,23 +1776,101 @@ def process_chunk(args):
             # — Stage 1
             s1_chains = stage1_find_patterns(full_buf_mv, base_ea + padded_start)
 
+            # ─── TRACEPOINT: Stage 1 ───────────────────────────────────
+            TARGET_EA = 0x14032B4B1
+            for chain in s1_chains:
+                s = chain.overall_start()
+                e = s + chain.overall_length()
+                if s <= TARGET_EA < e:
+                    logger.warning("[TRACE][Stage1] covers 0x%X: %s", TARGET_EA, chain)
+                    for seg in chain.segments:
+                        abs_s = chain.base_address + seg.start
+                        logger.warning(
+                            "    seg @0x%X len=%d desc=%s",
+                            abs_s,
+                            seg.length,
+                            seg.description,
+                        )
+                    break
+            # ────────────────────────────────────────────────────────────
+
             # — Stage 2 + 3
             s2_3 = []
-            for chain in s1_chains:
-                chain = find_junk_stage2_chain(chain, full_buf_mv, base_ea, is_64)
-                if (
+            for orig in s1_chains:
+                # IMPORTANT: buf starts at padded_start, so bump base_ea accordingly
+                chain = find_junk_stage2_chain(
+                    orig, full_buf_mv, base_ea + padded_start, is_64
+                )
+                kept = (
                     MIN_PATTERN_LEN <= chain.overall_length() <= MAX_PATTERN_LEN
                     and chain.junk_length > 0
-                ):
+                )
+                if kept:
                     s2_3.append(chain)
+                # ─── TRACEPOINT: Stage 2/3 drop ────────────────────────
+                if (
+                    orig.overall_start()
+                    <= TARGET_EA
+                    < orig.overall_start() + orig.overall_length()
+                    and not kept
+                ):
+                    logger.warning(
+                        "[TRACE][Stage2/3 DROP] 0x%X dropped: length=%d junk_length=%d",
+                        orig.overall_start(),
+                        chain.overall_length(),
+                        chain.junk_length,
+                    )
+                # ────────────────────────────────────────────────────────
+
+            # ─── TRACEPOINT: Stage 2/3 ──────────────────────────────────
+            for chain in s2_3:
+                s = chain.overall_start()
+                e = s + chain.overall_length()
+                if s <= TARGET_EA < e:
+                    logger.warning(f"[TRACE][Stage2/3] covers 0x{TARGET_EA:X}: {chain}")
+                    for seg in chain.segments:
+                        abs_s = chain.base_address + seg.start
+                        logger.warning(
+                            f"    seg @0x{abs_s:X} len={seg.length} desc={seg.description}"
+                        )
+                    break
+            # ────────────────────────────────────────────────────────────
 
             # — Stage 4
             validated = []
             for chain in s2_3:
-                seg = _stage4_is_chain_valid(chain, full_buf_mv, base_ea, is_64)
+                # Same deal here: real EA base needs the padded_start offset
+                seg = _stage4_is_chain_valid(
+                    chain, full_buf_mv, base_ea + padded_start, is_64
+                )
                 if seg:
-                    chain.add_segment(seg)  # attach the BIG_INSTRUCTION
+                    chain.add_segment(seg)
                     validated.append(chain)
+                # ─── TRACEPOINT: Stage 4 drop ─────────────────────────
+                elif (
+                    chain.overall_start()
+                    <= TARGET_EA
+                    < chain.overall_start() + chain.overall_length()
+                ):
+                    logger.warning(
+                        "[TRACE][Stage4 DROP] 0x%X dropped: no BIG_INSTR segment",
+                        chain.overall_start(),
+                    )
+                # ────────────────────────────────────────────────────────
+
+            # ─── TRACEPOINT: Stage 4 ───────────────────────────────────
+            for chain in validated:
+                s = chain.overall_start()
+                e = s + chain.overall_length()
+                if s <= TARGET_EA < e:
+                    logger.warning(f"[TRACE][Stage4] covers 0x{TARGET_EA:X}: {chain}")
+                    for seg in chain.segments:
+                        abs_s = chain.base_address + seg.start
+                        logger.warning(
+                            f"    seg @0x{abs_s:X} len={seg.length} type={seg.segment_type}"
+                        )
+                    break
+            # ────────────────────────────────────────────────────────────
 
             # — Filter out duplicates from the overlap padding: only keep those
             #    whose start-offset falls in [core_start, core_end)
@@ -1825,7 +1903,7 @@ def shm_buffer(name: str, buf_len: int | None = None):
     context manager to access the shared memory buffer.
     if buf_len is not provided, then the buffer will be the raw shm memory
     buffer else it will be a byte slice of the shm memory buffer.
-    
+
     Usage:
         with shm_buffer(name=..) as buf:
             # use buf
@@ -1868,8 +1946,13 @@ class AsyncDeobfuscator(AsyncEventEmitter):
             "Splitting buffer of %d bytes into %d chunks:", buf_len, len(chunks)
         )
         for idx, (ps, pe, cs, ce) in enumerate(chunks):
-            logger.debug(
-                "  chunk %2d: core=[%d..%d) padded=[%d..%d)", idx, cs, ce, ps, pe
+            logger.info(
+                "  chunk %2d: core=[0x%X..0x%X) padded=[0x%X..0x%X)",
+                idx,
+                cs + self.start_ea,
+                ce + self.start_ea,
+                ps + self.start_ea,
+                pe + self.start_ea,
             )
 
         # 2) fire one full-pipeline task per chunk
@@ -2166,51 +2249,9 @@ def process(deob, address, authkey):
                 stage="starting",
             )
 
-    @deob.on("stage1_finished")
-    def on_stage1_finished(ch):
-        logger.info(f"✅ Stage1: {len(ch)} stubs")
-        progress_state["current"] = 0.25
-        progress_state["status"] = "running"
-        if "conn" in progress_state:
-            progress_state["conn"].send_message(
-                "progress",
-                progress_state["current"],
-                status="running",
-                stage="stage1_complete",
-                stubs_count=len(ch),
-            )
-
-    @deob.on("stage2_finished")
-    def on_stage2_finished(ch):
-        logger.info(f"✅ Stage2: {len(ch)} junk appended")
-        progress_state["current"] = 0.50
-        progress_state["status"] = "running"
-        if "conn" in progress_state:
-            progress_state["conn"].send_message(
-                "progress",
-                progress_state["current"],
-                status="running",
-                stage="stage2_complete",
-                chunks_count=len(ch),
-            )
-
-    @deob.on("stage3_finished")
-    def on_stage3_finished(ch):
-        logger.info(f"✅ Stage3: {len(ch)} remaining")
-        progress_state["current"] = 0.75
-        progress_state["status"] = "running"
-        if "conn" in progress_state:
-            progress_state["conn"].send_message(
-                "progress",
-                progress_state["current"],
-                status="running",
-                stage="stage3_complete",
-                chunks_count=len(ch),
-            )
-
-    @deob.on("stage4_finished")
-    def on_stage4_finished(ch):
-        logger.info(f"✅ Stage4: {len(ch)} final")
+    @deob.on("run_finished")
+    def on_run_finished(ch):
+        logger.info("✅ Processed %d chunks", len(ch))
         progress_state["current"] = 0.95
         progress_state["status"] = "finalizing"
         if "conn" in progress_state:
@@ -2383,18 +2424,20 @@ class PatchManager:
         self.pending_patches: list[DeferredPatchOp] = []
         self.auto_clear = auto_clear
         logger.info(
-            f"PatchManager initialized (dry_run={self.dry_run}, mode={self.patch_mode.name})"
+            "PatchManager initialized (dry_run=%s, mode=%s)",
+            self.dry_run,
+            self.patch_mode.name,
         )
 
     def add_patch(self, address: int, byte_values: bytes):
         """Creates and queues a DeferredPatchOp."""
         op = DeferredPatchOp(address, byte_values, self.patch_mode)
         self.pending_patches.append(op)
-        logger.debug(f"Queued patch operation: {op}")
+        logger.debug("Queued patch operation: %s", op)
 
     def apply_all(self, dry_run_override: bool | None = None) -> bool:
         """Applies all queued patch operations."""
-        logger.info(f"Applying {len(self)} queued patches...")
+        logger.info("Applying %d queued patches...", len(self))
         success_count = 0
         fail_count = 0
 
@@ -2409,7 +2452,9 @@ class PatchManager:
                 fail_count += 1
 
         logger.info(
-            f"Patch application complete. Success: {success_count}, Failed: {fail_count}"
+            "Patch application complete. Success: %d, Failed: %d",
+            success_count,
+            fail_count,
         )
         if self.auto_clear:
             self.pending_patches.clear()  # Clear the list after applying
@@ -2713,7 +2758,6 @@ if is_ida():
                     }
                     logger.info("Emitted processing_results via IPC.")
                     self.processing_results.emit(results)
-                # Worker message: {'type': 'status', 'data': 'connected', 'timestamp': 1745800440.6233163, 'status': 'ready'}
                 elif msg_type == "status" and message.get("status") == "ready":
                     self.send_command({"command": "start"})
 
@@ -2954,8 +2998,8 @@ if is_ida():
         # Store shared memory object as a class attribute
         _shared_memory = None
 
-        def __init__(self):
-            self.patch_manager = PatchManager(dry_run=True)
+        def __init__(self, dry_run: bool = False):
+            self.patch_manager = PatchManager(dry_run=dry_run)
             self.proc = None
             atexit.register(self.terminate)
 
@@ -3038,23 +3082,23 @@ if is_ida():
             logger.info("Terminated.")
 
         def _handle_worker_message(self, msg: typing.Any):
-            logger.info(f"Worker message: {msg}")
+            logger.info("Worker message: %s", msg)
 
         def _handle_worker_results(self, results: dict):
-            logger.info(f"Worker results: {results}")
             if results["status"] == "success":
+                NOP = b"\x90"
                 for patch_instructions in results["results"]:
                     self.patch_manager.add_patch(
                         patch_instructions["address"],
-                        patch_instructions["length"] * "\x90",
+                        patch_instructions["length"] * NOP,
                     )
                 self.patch_manager.apply_all()
             else:
-                logger.error(f"Worker reported an error: {results['error']}")
+                logger.error("Worker reported an error: %s", results["error"])
 
         def _handle_worker_error(self, error: str):
             """Handles error messages originating from the worker process."""
-            logger.error(f"Worker reported an error: {error}")
+            logger.error("Worker reported an error: %s", error)
 
             # Consider stopping the worker and cleaning up shared memory on error
             self.proc.stop_worker()
@@ -3064,7 +3108,7 @@ if is_ida():
             """Run the main plugin logic when hotkey is pressed."""
             plugin_arg: typing.Any = kwargs.pop("plugin_arg", None)
             if plugin_arg is not None:
-                logger.info(f"Received plugin arg: {plugin_arg}")
+                logger.info("Received plugin arg: %s", plugin_arg)
 
             data_size = len(bytes_to_process)
             # create shared memory & copy
@@ -3108,6 +3152,37 @@ if is_ida():
             finally:
                 self._shared_memory = None  # Clear reference
 
+    class DataProcessorPlugin(idaapi.plugin_t):
+        """
+        IDA Pro multiprocessing plugin with a worker
+        using shared memory for large data and QProcess pipes for signaling.
+        """
+
+        flags = idaapi.PLUGIN_PROC
+        comment = "Deobfuscation via Shared Memory, Multiprocessing and QProcess"
+        help = "Press Alt-Shift-P to start data deobfuscation"
+        wanted_name = "FastDeobfuscator"
+        wanted_hotkey = "Alt-Shift-P"
+        _core = None
+
+        # --- Plugin Lifecycle ---
+        def init(self):
+            self._core = DataProcessorCore(dry_run=False)
+            return idaapi.PLUGIN_KEEP
+
+        def term(self):
+            """Terminate the plugin, stopping the broker and cleaning up shared memory."""
+            logger.info("Terminating plugin.")
+            self._core.terminate()
+            logger.info("Plugin terminated.")
+
+        def run(self, arg):
+            data_ea, data_bytes = DataProcessorCore.get_section_data(".text")
+            self._core.run(data_ea, data_bytes, plugin_arg=arg)
+
+    def PLUGIN_ENTRY():
+        return DataProcessorPlugin()
+
     class Taskr:
         """
         Singleton wrapper for the DataProcessor instance.
@@ -3133,7 +3208,7 @@ if is_ida():
                 # Not thread-safe, but sufficient for plugin/IDA context
                 cls._instance = super().__new__(cls)
                 logger.info("Initializing DataProcessor")
-                cls._processor = DataProcessorCore()
+                cls._processor = DataProcessorCore(dry_run=False)
             return cls._instance
 
         def get(self):
@@ -3156,36 +3231,14 @@ if is_ida():
         def stop(self):
             self.get().stop()
 
-    class DataProcessorPlugin(idaapi.plugin_t):
-        """
-        IDA Pro multiprocessing plugin with a worker
-        using shared memory for large data and QProcess pipes for signaling.
-        """
+        def start(self):
+            self.get().start()
 
-        flags = idaapi.PLUGIN_PROC
-        comment = "Deobfuscation via Shared Memory, Multiprocessing and QProcess"
-        help = "Press Alt-Shift-P to start data deobfuscation"
-        wanted_name = "FastDeobfuscator"
-        wanted_hotkey = "Alt-Shift-P"
-        _core = None
+        def terminate(self):
+            self.get().terminate()
 
-        # --- Plugin Lifecycle ---
-        def init(self):
-            self._core = DataProcessorCore()
-            return idaapi.PLUGIN_KEEP
-
-        def term(self):
-            """Terminate the plugin, stopping the broker and cleaning up shared memory."""
-            logger.info("Terminating plugin.")
-            self._core.terminate()
-            logger.info("Plugin terminated.")
-
-        def run(self, arg):
-            data_ea, data_bytes = DataProcessorCore.get_section_data(".text")
-            self._core.run(data_ea, data_bytes, plugin_arg=arg)
-
-    def PLUGIN_ENTRY():
-        return DataProcessorPlugin()
+        def ping(self):
+            self.get().ping()
 
 
 if __name__ == "__main__":
