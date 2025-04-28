@@ -43,6 +43,11 @@ warnings.filterwarnings(
     ),
 )
 
+# maximum length of any stage-1 pattern (you said 129 bytes)
+MAX_PATTERN_LEN = 129
+MIN_PATTERN_LEN = 12
+LOG_LEVEL = logging.INFO
+
 
 def humanize_bytes(
     num_bytes: int, precision: int = 2, units: list[str] = ["B", "KB", "MB", "GB"]
@@ -124,7 +129,7 @@ else:
 
 def configure_logging(
     log,
-    level=logging.INFO,
+    level=LOG_LEVEL,
     handler_filters=None,
     fmt_str="[%(name)s:%(levelname)s:%(process)d:%(threadName)s] @ %(asctime)s %(message)s",
 ):
@@ -159,9 +164,6 @@ def get_logger(name=None, configurer=None):
 
 logger = get_logger()
 
-# maximum length of any stage-1 pattern (you said 129 bytes)
-MAX_PATTERN_LEN = 129
-MIN_PATTERN_LEN = 12
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1136,8 +1138,8 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         # Check for 'xchg r8, r8' as a NOP pattern (0x90 is 'nop', i.e. 0x87 C9 is 'xchg cl, cl')
         elif insn.id in (
             capstone.x86.X86_INS_XCHG,
-            # capstone.x86.X86_INS_MOV,
-            # capstone.x86.X86_GRP_CMOV,
+            capstone.x86.X86_INS_MOV,
+            capstone.x86.X86_GRP_CMOV,
         ):
             op1, op2 = insn.operands
             if op1.type == op2.type and op1.size == op2.size and op1.reg == op2.reg:
@@ -1777,7 +1779,7 @@ def process_chunk(args):
             s1_chains = stage1_find_patterns(full_buf_mv, base_ea + padded_start)
 
             # ─── TRACEPOINT: Stage 1 ───────────────────────────────────
-            TARGET_EA = 0x14032B4B1
+            TARGET_EA = 0x140005131
             for chain in s1_chains:
                 s = chain.overall_start()
                 e = s + chain.overall_length()
