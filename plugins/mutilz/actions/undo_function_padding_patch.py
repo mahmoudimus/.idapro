@@ -16,6 +16,7 @@ import ida_ua
 import idaapi
 import idautils
 import idc
+
 import mutilz.actions as actions
 import mutilz.helpers.ida as ida_helpers
 from mutilz.helpers.idare import MemHelper, PatternCategory, RegexPatternMetadata
@@ -274,9 +275,8 @@ class UndoFunctionPaddingPatchActionHandler(ida_helpers.BaseActionHandler):
 
     def activate(self, ctx):
         curr_ea = idaapi.get_screen_ea()
-        start_ea, end_ea = self.get_selected_addresses(ctx)
         try:
-            func = ida_funcs.get_func(start_ea)
+            func = ida_funcs.get_func(curr_ea)
             if not func:
                 # Consider using logger.error or raising an exception
                 logger.error(
@@ -284,7 +284,7 @@ class UndoFunctionPaddingPatchActionHandler(ida_helpers.BaseActionHandler):
                 )  # Kept print for initial error before logging might be set up
                 return
             end = func.end_ea
-            execute_action(start_ea, end, dry_run=False)
+            execute_action(curr_ea, end, dry_run=False)
         finally:
             idc.jumpto(curr_ea)
 

@@ -170,13 +170,12 @@ class RecursivelyRemoveAntiDisassemblyActionHandler(ida_helpers.BaseActionHandle
 
     def activate(self, ctx):
         curr_ea = idaapi.get_screen_ea()
-        start_ea, end_ea = self.get_selected_addresses(ctx)
         try:
             patch_manager = RemoveAntiDisassemblyActionHandler.patch_manager(
                 dry_run=False
             )
             recursively_remove_anti_disassembly(
-                start_ea, max_depth=10, patch_manager=patch_manager
+                curr_ea, max_depth=10, patch_manager=patch_manager
             )
         finally:
             idc.jumpto(curr_ea)

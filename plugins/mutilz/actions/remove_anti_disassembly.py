@@ -1895,14 +1895,11 @@ def execute_action(
         logger.info("Force analysis completed.")
 
 
-ACTION_NAME = "mutilz:remove_anti_disassembly"
-
-
 @dataclasses.dataclass
 class RemoveAntiDisassemblyActionHandler(ida_helpers.BaseActionHandler):
     """Remove Anti Disassembly"""
 
-    action_name: str = ACTION_NAME
+    action_name: str = "mutilz:remove_anti_disassembly"
     action_label: str = "Remove Anti Disassembly"
     icon: int = 19
 
@@ -1930,14 +1927,14 @@ class RemoveAntiDisassemblyActionHandler(ida_helpers.BaseActionHandler):
             return start_ea, None
         return start_ea, end_ea
 
-    @staticmethod
-    def settings() -> mutilz.settings.ActionSettings:
+    @classmethod
+    def settings(cls) -> mutilz.settings.ActionSettings:
         mutilz.settings.reload()
-        return mutilz.settings.get_action_config(ACTION_NAME)
+        return mutilz.settings.get_action_config(cls.action_name)
 
-    @staticmethod
-    def patch_manager(dry_run: bool = False) -> PatchManager:
-        settings = RemoveAntiDisassemblyActionHandler.settings()
+    @classmethod
+    def patch_manager(cls, dry_run: bool = False) -> PatchManager:
+        settings = cls.settings()
         patch_mode_name = settings.get("patch_mode", "put")
         patch_mode = PatchManager.Mode._member_map_.get(
             patch_mode_name.upper(), PatchManager.Mode.PUT

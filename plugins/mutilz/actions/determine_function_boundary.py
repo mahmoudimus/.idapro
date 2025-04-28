@@ -19,6 +19,7 @@ import ida_ua
 import idaapi
 import idautils
 import idc
+
 import mutilz.actions as actions
 import mutilz.helpers.ida as ida_helpers
 from mutilz.logconf import configure_debug_logging
@@ -768,8 +769,8 @@ def undefine_and_align_adjacent_cc_padding(
 
 
 # --- Main Orchestration Function ---
-def find_and_define_function_boundary():
-    cursor_ea = idaapi.get_screen_ea()
+def find_and_define_function_boundary(cursor_ea: int):
+    cursor_ea = cursor_ea if cursor_ea else idaapi.get_screen_ea()
     if cursor_ea == idaapi.BADADDR:
         log_boundary.error("Invalid cursor position.")
         ida_kernwin.warning(
@@ -1026,11 +1027,11 @@ def find_and_define_function_boundary():
         log_boundary.info("User cancelled.")
 
 
-def execute_action(start_ea: int, end_ea: int):
+def execute_action(start_ea: int):
     # print(f"Hello! Called execute_action with range 0x{start_ea:X} - 0x{end_ea:X}")
     idaapi.auto_wait()
     # print("--- Function Boundary Finder ---")
-    find_and_define_function_boundary()
+    find_and_define_function_boundary(start_ea)
     # print("--- Search Complete ---")
 
 
@@ -1086,9 +1087,8 @@ class DetermineFunctionBoundaryActionHandler(ida_helpers.BaseActionHandler):
 
     def activate(self, ctx):
         curr_ea = idaapi.get_screen_ea()
-        start_ea, end_ea = self.get_selected_addresses(ctx)
         try:
-            execute_action(start_ea, end_ea)
+            execute_action(curr_ea)
         finally:
             idc.jumpto(curr_ea)
 

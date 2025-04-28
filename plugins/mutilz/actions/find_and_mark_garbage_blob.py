@@ -3,20 +3,20 @@ import dataclasses
 import functools
 import logging
 import sys
-import time
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 
+import ida_allins
 import ida_bytes
 import ida_funcs
 import ida_kernwin
-import ida_segment
 import ida_typeinf
 import ida_ua
 import idaapi
 import idautils
 import idc
+
 import mutilz.actions as actions
 import mutilz.helpers.ida as ida_helpers
 
@@ -220,7 +220,7 @@ def set_type(ea, type_str, name):
     logger.debug(f"Setting type at 0x{ea:X}: '{type_str}' name '{name}' (PUBLIC)")
     tif = ida_typeinf.tinfo_t()
     if not idaapi.parse_decl(
-        tif, None, type_str, ida_typeinf.PT_SILENT
+        tif, None, type_str, idc.PT_SILENT
     ):  # Use PT_SILENT
         logger.error(f"Error parsing type declaration: '{type_str}'")
         name_flags = idaapi.SN_NOCHECK | idaapi.SN_FORCE | idaapi.SN_PUBLIC
@@ -287,7 +287,7 @@ def apply_signature(ea, sig):
     logger.info(f"Applying signature to 0x{ea:x} ({name})")
     decl = "{} {}({})".format(ret, name, args)
     tif = ida_typeinf.tinfo_t()
-    if idaapi.parse_decl(tif, None, decl, ida_typeinf.PT_SILENT):  # Use PT_SILENT
+    if idaapi.parse_decl(tif, None, decl, idc.PT_SILENT):  # Use PT_SILENT
         if idaapi.apply_tinfo(ea, tif, idaapi.TINFO_DEFINITE):
             logger.info(f"Successfully applied signature to {name}")
             idaapi.set_name(ea, name, idaapi.SN_NOCHECK)
@@ -575,7 +575,7 @@ class FunctionPrologueDetector:
         cls, ea: int, insn: typing.Optional[ida_ua.insn_t], memo: list
     ) -> int:
         """Checks for ENDBR64 instruction. Ignores ea."""
-        if insn and insn.itype == ida_ua.NN_endbr64:
+        if insn and insn.itype == ida_allins.NN_endbr64:
             memo.append(f"Starts with ENDBR64 (weight +{cls.Cfg.WEIGHT_ENDBR64})")
             return cls.Cfg.WEIGHT_ENDBR64
         return 0
@@ -585,7 +585,7 @@ class FunctionPrologueDetector:
         cls, ea: int, insn: typing.Optional[ida_ua.insn_t], memo: list
     ) -> int:
         """Checks for 'push rbp'. Ignores ea."""
-        if insn and insn.itype == ida_ua.NN_push:
+        if insn and insn.itype == ida_allins.NN_push:
             op = insn.ops[0]
             if op.type == ida_ua.o_reg and op.reg == ida_ua.R_BP:
                 memo.append(f"Starts with PUSH RBP (weight +{cls.Cfg.WEIGHT_PUSH_RBP})")
@@ -597,7 +597,7 @@ class FunctionPrologueDetector:
         cls, ea: int, insn: typing.Optional[ida_ua.insn_t], memo: list
     ) -> int:
         """Checks for 'mov rbp, rsp' potentially preceded by 'push rbp'."""
-        if insn and insn.itype == ida_ua.NN_mov:
+        if insn and insn.itype == ida_allins.NN_mov:
             op0, op1 = insn.ops[0], insn.ops[1]
             if (
                 op0.type == ida_ua.o_reg
@@ -958,10 +958,12 @@ class FunctionPaddingFinder:
         print(
             f"\n[{heuristic_name}] Attempting to find next function before 0x{search_end_ea:X}..."
         )
-        next_func_ea = ida_funcs.get_next_func_ea(cursor_pos)  # Use ida_funcs
-        if next_func_ea == idaapi.BADADDR:
+        next_func = ida_funcs.get_next_func(cursor_pos)  # Use ida_funcs
+        if not next_func:
             print(f"[{heuristic_name}] No function found after cursor.")
             return None
+
+        next_func_ea = next_func.start_ea
         if next_func_ea >= search_end_ea:
             print(
                 f"[{heuristic_name}] Next function 0x{next_func_ea:X} is at or beyond max distance 0x{search_end_ea:X}."
@@ -1123,10 +1125,11 @@ class FunctionPaddingFinder:
         )
         candidate_func_ea = cursor_pos
         while True:
-            candidate_func_ea = ida_funcs.get_next_func_ea(candidate_func_ea)
-            if candidate_func_ea == idaapi.BADADDR:
+            candidate_func = ida_funcs.get_next_func(candidate_func_ea)
+            if not candidate_func:
                 print(f"[{heuristic_name}] No more functions found by IDA.")
                 break
+            candidate_func_ea = candidate_func.start_ea
             if candidate_func_ea >= extended_search_end_ea:
                 print(
                     f"[{heuristic_name}] Next candidate function 0x{candidate_func_ea:X} is beyond extended search range 0x{extended_search_end_ea:X}."
@@ -1363,7 +1366,7 @@ class FunctionPaddingFinder:
 
 
 # --- Main Execution Function ---
-def execute():
+def execute(current_ea: int):
     """
     Main execution function using shared state dictionary and finding lowest index.
     Handles both single and double blob definitions using CONFIG settings.
@@ -1382,7 +1385,6 @@ def execute():
         f"Attempting to find and define blob(s) starting with index: {current_blob_index}"
     )
     print("\n=== Function Padding/Blob Finder ===")
-    current_ea = idaapi.get_screen_ea()
     print(f"Processing relative to cursor: 0x{current_ea:X}")
     if not ida_bytes.is_loaded(current_ea):
         logger.error(f"Base address 0x{current_ea:X} not loaded.")
@@ -1526,11 +1528,10 @@ def execute():
     print("\nScript execution completed!")
 
 
-def execute_action(start_ea: int, end_ea: int):
-    print(f"Hello! Called execute_action with range 0x{start_ea:X} - 0x{end_ea:X}")
+def execute_action(start_ea: int):
     idaapi.auto_wait()
     clear_output()
-    execute()
+    execute(start_ea)
     idaapi.refresh_idaview_anyway()
 
 
@@ -1603,9 +1604,9 @@ class FindAndMarkGarbageBlobActionHandler(ida_helpers.BaseActionHandler):
 
     def activate(self, ctx):
         curr_ea = idaapi.get_screen_ea()
-        start_ea, end_ea = self.get_selected_addresses(ctx)
+
         try:
-            execute_action(start_ea, end_ea)
+            execute_action(curr_ea)
         finally:
             idc.jumpto(curr_ea)
 
