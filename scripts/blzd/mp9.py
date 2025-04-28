@@ -18,8 +18,6 @@ import multiprocessing.shared_memory
 import os
 import pathlib
 import pickle
-import queue
-import random
 import re
 import select
 import stat
@@ -33,10 +31,6 @@ import warnings
 
 import capstone
 import capstone.x86
-
-# maximum length of any stage-1 pattern (you said 129 bytes)
-MAX_PATTERN_LEN = 129
-MIN_PATTERN_LEN = 12
 
 # PyQt 5.15/6.2/6.3/6.4:
 # https://riverbankcomputing.com/news/SIP_v6.7.12_Released
@@ -164,6 +158,10 @@ def get_logger(name=None, configurer=None):
 
 
 logger = get_logger()
+
+# maximum length of any stage-1 pattern (you said 129 bytes)
+MAX_PATTERN_LEN = 129
+MIN_PATTERN_LEN = 12
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -696,87 +694,6 @@ MED_OPCODE_SET = {
     49, 50, 51, 56, 57, 58, 59, 143, 107, 246
 }
 BIG_OPCODE_SET = {128, 129, 192, 131, 193, 105, 107, 246}
-# fmt: on
-
-
-def _stage1_scan_one(job):
-    """
-    job = (pattern_bytes, description, segment_type, base_ea, buf)
-    returns MatchChains
-    """
-    rgx, base_ea, buf = job
-    prog = rgx.compile()
-    hits = MatchChains()
-
-    for m in prog.finditer(buf):
-        s = m.start()
-        e = m.end()
-        mb = buf[s:e]
-        match_len = e - s
-
-        groups = {
-            k: v.hex()
-            for k, v in m.groupdict().items()
-            if (v is not None and k != "padding")
-        }
-
-        # compute jump targets
-        if "jump" in groups:
-            offset = struct.unpack("<b", mb[-1:])[0]
-            tgt = base_ea + s + match_len + offset
-            groups["target"] = hex(tgt)
-        elif "first_jump" in groups:
-            off1 = struct.unpack("<b", mb[1:2])[0]
-            groups["first_target"] = hex(base_ea + s + 2 + off1)
-            off2 = struct.unpack("<b", mb[-1:])[0]
-            groups["second_target"] = hex(base_ea + s + match_len + off2)
-
-        seg = MatchSegment(
-            start=s,
-            length=match_len,
-            description=rgx.description,
-            matched_bytes=mb,
-            segment_type=(
-                SegmentType.STAGE1_MULTIPLE
-                if rgx.category == PatternCategory.MULTI_PART
-                else SegmentType.STAGE1_SINGLE
-            ),
-            matched_groups=groups,
-        )
-        hits.add_chain(MatchChain(base_address=base_ea, segments=[seg]))
-
-    return hits
-
-
-def stage1_find_patterns(buf: bytes, base_ea: int):
-    """
-    Parallel regex-based Stage 1. Returns List[MatchChain].
-    """
-    jobs = [(rgx, base_ea, buf) for rgx in (MULTI_PART_PATTERNS + SINGLE_PART_PATTERNS)]
-
-    ctx = multiprocessing.get_context("spawn")
-    with concurrent.futures.ProcessPoolExecutor(mp_context=ctx) as exe:
-        all_groups = exe.map(_stage1_scan_one, jobs)
-
-    # flatten & sort
-    out = [chain for group in all_groups for chain in group]
-    out.sort(key=lambda c: c.overall_start())
-    return out
-
-
-def stage1_find_patterns_sync(buf: bytes, base_ea: int):
-    chains: list[MatchChain] = []
-    for rgx in MULTI_PART_PATTERNS + SINGLE_PART_PATTERNS:
-        # each call returns a MatchChains iterable
-        hits = _stage1_scan_one((rgx, base_ea, buf))
-        chains.extend(hits)
-    # sort by start address and return
-    chains.sort(key=lambda c: c.overall_start())
-    return chains
-
-
-# ─── Stage 2: peel off junk via Capstone ────────────────────────────────────
-
 
 # Helper sets for checking specific registers based on the regex patterns
 # These patterns [\xC0-\xC3\xC5-\xC7] and [\xD8-\xDB\xDD-\xDF] and [\xE8-\xEB\xED-\xEF]
@@ -813,7 +730,6 @@ REG_8_SET = {
     # the specific ModR/M bytes in the regexes when MOD=11.
 }
 
-
 # Helper to check if the first operand is a register from the allowed set
 # based on the ModR/M ranges implied by the regexes.
 # Assumes no REX prefixes are used with these specific junk patterns,
@@ -827,10 +743,95 @@ def is_allowed_reg(operands):
     # which is the set derived from ModR/M=11 ranges
     return reg in REG_8_SET or reg in REG_32_SET
 
-
 # Helper to check if there's an immediate operand
 def has_imm_operand(operands):
     return any(op.type == capstone.CS_OP_IMM for op in operands)
+
+# Function to check if a byte is a valid REX prefix (0x40-0x4F)
+def is_rex_prefix(byte):
+    return 0x40 <= byte <= 0x4F
+
+# Function to check if a byte is a valid ModR/M byte (0x80-0xBF)
+def is_valid_modrm(byte):
+    return 0x80 <= byte <= 0xBF
+# fmt: on
+
+
+def _stage1_scan_one(job: tuple[RegexPatternMetadata, int, memoryview]) -> MatchChains:
+    """
+    job = (pattern_bytes, description, segment_type, base_ea, buf)
+    returns MatchChains
+    """
+    rgx, base_ea, buf = job
+    prog = rgx.compile()
+    hits = MatchChains()
+
+    for m in prog.finditer(buf):
+        s = m.start()
+        e = m.end()
+        mb = buf[s:e]
+        match_len = e - s
+
+        groups = {
+            k: v.hex()
+            for k, v in m.groupdict().items()
+            if (v is not None and k != "padding")
+        }
+
+        # compute jump targets
+        if "jump" in groups:
+            offset = struct.unpack("<b", mb[-1:])[0]
+            tgt = base_ea + s + match_len + offset
+            groups["target"] = hex(tgt)
+        elif "first_jump" in groups:
+            off1 = struct.unpack("<b", mb[1:2])[0]
+            groups["first_target"] = hex(base_ea + s + 2 + off1)
+            off2 = struct.unpack("<b", mb[-1:])[0]
+            groups["second_target"] = hex(base_ea + s + match_len + off2)
+
+        seg = MatchSegment(
+            start=s,
+            length=match_len,
+            description=rgx.description,
+            matched_bytes=mb.tobytes(),
+            segment_type=(
+                SegmentType.STAGE1_MULTIPLE
+                if rgx.category == PatternCategory.MULTI_PART
+                else SegmentType.STAGE1_SINGLE
+            ),
+            matched_groups=groups,
+        )
+        hits.add_chain(MatchChain(base_address=base_ea, segments=[seg]))
+
+    return hits
+
+
+def stage1_find_patterns(
+    buf: memoryview, base_ea: int, mp: bool = False
+) -> list[MatchChain]:
+    """
+    Parallel regex-based Stage 1. Returns List[MatchChain].
+    """
+    jobs = [
+        (rgx, base_ea, buf)
+        for rgx in itertools.chain(MULTI_PART_PATTERNS, SINGLE_PART_PATTERNS)
+    ]
+
+    if mp:
+        ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(mp_context=ctx) as exe:
+            all_groups = exe.map(_stage1_scan_one, jobs)
+    else:
+        all_groups = list(map(_stage1_scan_one, jobs))
+
+    # flatten
+    out = [chain for group in all_groups for chain in group]
+    # sort
+    out.sort(key=lambda c: c.overall_start())
+    return out
+
+
+# ─── Stage 2: peel off junk via Capstone ────────────────────────────────────
 
 
 @dataclasses.dataclass
@@ -1058,47 +1059,6 @@ def find_junk_stage2_chain(
         logger.debug(f"No junk found after stage 1 match at EA 0x{stage1_end_ea:X}")
 
     return chain
-
-
-def _stage2_worker(
-    args: typing.Tuple[typing.List[MatchChain], bytes, int, bool],
-) -> typing.List[MatchChain]:
-    """
-    Worker function for multiprocessing stage 2 junk peeling.
-
-    Args:
-        args: A tuple containing:
-            - chains_chunk: A list of MatchChain objects to process.
-            - buf: The full byte buffer of the memory region.
-            - base_ea: The base effective address of the buffer.
-            - is_64: True for 64-bit disassembly, False for 32-bit.
-
-    Returns:
-        A list of the processed MatchChain objects with individual junk segments added.
-    """
-    chains_chunk, buf, base_ea, is_64 = args
-    logger.info(f"Worker processing {len(chains_chunk)} chains for Stage 2...")
-    processed_chains: typing.List[MatchChain] = []
-    for chain in chains_chunk:
-        # Process each chain individually
-        processed_chain = find_junk_stage2_chain(chain, buf, base_ea, is_64)
-        processed_chains.append(processed_chain)
-    logger.info(f"Worker finished processing {len(chains_chunk)} chains for Stage 2.")
-    return processed_chains
-
-
-# ─── Stage 3: filter ────────────────────────────────────────────────────────
-
-
-def stage3_filter(chains, min_length=12, max_length=129):
-    return [
-        c
-        for c in chains
-        if min_length <= c.overall_length() <= max_length and c.junk_length > 0
-    ]
-
-
-# ─── Stage 4: jump-chain + big-instr + overlap ──────────────────────────────
 
 
 @dataclasses.dataclass
@@ -1451,32 +1411,6 @@ class JumpTargetAnalyzer:
             self.jump_details.append((insn.address, final_target, chain.stage1_type))
             logger.debug("Found jump @0x%X → 0x%X", insn.address, final_target)
 
-        # for jump_match in re.finditer(
-        #     rb"[\xEB\x70-\x7F].", self.match_bytes, re.DOTALL
-        # ):
-        #     jump_offset = jump_match.start()
-        #     jump_ea = self.match_start + jump_offset
-        #     final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
-        #     if not final_target:
-        #         logger.debug(
-        #             f"  Skipping jump at 0x{jump_ea:X}: Invalid final target 0x{final_target if final_target else 0:X}"
-        #         )
-        #         continue
-
-        #     # Adjusted condition: Target must be *after* the match end and within 6 bytes
-        #     if abs(final_target - match_end) > 6:
-        #         logger.debug(
-        #             f"  Skipping jump at 0x{jump_ea:X}: Final target 0x{final_target:X} not within [(0x{match_end - 6:X}, 0x{match_end:X}) or (0x{match_end:X}, 0x{match_end + 6:X}]"
-        #         )
-        #         continue
-        #     self.jump_targets[final_target] += 1
-        #     # Record the stage1_type on the first occurrence.
-        #     if final_target not in self.target_type:
-        #         self.target_type[final_target] = chain.stage1_type
-        #     self.jump_details.append((jump_ea, final_target, chain.stage1_type))
-        #     logger.debug(
-        #         f"  Found {jump_match.group().hex()} @ 0x{jump_ea:X} targeting 0x{final_target:X}"
-        #     )
         return self
 
     def __iter__(self):
@@ -1498,16 +1432,6 @@ class JumpTargetAnalyzer:
                     final_candidate = target
                     break
             yield final_candidate
-
-
-# Function to check if a byte is a valid REX prefix (0x40-0x4F)
-def is_rex_prefix(byte):
-    return 0x40 <= byte <= 0x4F
-
-
-# Function to check if a byte is a valid ModR/M byte (0x80-0xBF)
-def is_valid_modrm(byte):
-    return 0x80 <= byte <= 0xBF
 
 
 def find_big_instruction(buffer_bytes: bytes, is_x64: bool = False) -> dict:
@@ -1651,7 +1575,7 @@ def _stage4_is_chain_valid(
     mem: bytes,
     start_ea: int,
     is_x64: bool,
-    max_size: int = 129,
+    max_size: int = MAX_PATTERN_LEN,
 ) -> MatchSegment | None:
     """
     Filter out false positive anti-disassembly patterns and handle overlaps.
@@ -1661,7 +1585,7 @@ def _stage4_is_chain_valid(
         chains: List of MatchChain objects
         mem: Memory object containing binary data
         start_ea: Starting effective address
-        max_size: Maximum valid size for an anti-disassembly routine (default: 129)
+        max_size: Maximum valid size for an anti-disassembly routine (default: MAX_PATTERN_LEN)
 
     Returns:
         A single validated MatchChain object
@@ -1744,17 +1668,19 @@ def _stage4_is_chain_valid(
             )
 
             # Check for additional anti-disassembly bytes
-            for i in itertools.count():
-                extra_offset = start_offset + new_len + i
-                b = mem[extra_offset]
-                if b != SUPERFLULOUS_BYTE:
-                    if i != 0:
-                        logger.debug(
-                            f"    Found {i} extra anti-disassembly bytes @ 0x{search_start + 6:X}"
-                        )
+            max_extra = max_size - new_len
+            mem_len = len(mem)
+            for _ in range(max_extra):
+                extra_offset = start_offset + new_len
+                if extra_offset >= mem_len:
                     break
-
-                new_bytes += bytes([b])
+                if mem[extra_offset] != SUPERFLULOUS_BYTE:
+                    break
+                logger.info(
+                    "* Found extra anti-disassembly byte @ 0x%X",
+                    start_ea + start_offset + new_len,
+                )
+                new_bytes += bytes([mem[extra_offset]])
                 new_len += 1
 
             return MatchSegment(
@@ -1766,87 +1692,31 @@ def _stage4_is_chain_valid(
             )
 
 
-def resolve_overlaps(chains: typing.List[MatchChain]) -> typing.List[MatchChain]:
+def resolve_overlaps(chains: list[MatchChain]) -> list[MatchChain]:
     """
-    Resolves overlaps among validated chains.
-
-    Args:
-        chains: List of validated MatchChain objects (including all segments).
-
-    Returns:
-        List of non-overlapping MatchChain objects.
+    Fast, linear-time overlap resolution: keep only the first chain
+    whose start is ≥ the furthest end so far.
     """
     logger.info(f"Resolving overlaps among {len(chains)} chains")
-    # Sort chains by start address
-    sorted_chains: typing.List[MatchChain] = sorted(
-        chains, key=lambda c: c.overall_start()
-    )
-    final_chains: typing.List[MatchChain] = []
-    covered_ranges: typing.List[typing.Tuple[int, int]] = []
 
-    for chain in sorted_chains:
-        chain_start = chain.overall_start()
-        # Calculate chain end including the big instruction
-        chain_end = chain_start + chain.overall_length()
-        # Check if this chain overlaps with an already accepted chain
-        is_covered = False
-        for start, end in covered_ranges:
-            # Check if this chain starts within a covered range
-            if chain_start >= start and chain_start < end:
-                logger.debug(
-                    f"  Rejected overlap: Chain @ 0x{chain_start:X} (len {chain.overall_length()}) starts within existing pattern ({start:X} to {end:X})"
-                )
-                is_covered = True
-                break
+    # 1) Sort by start EA
+    sorted_chains = sorted(chains, key=lambda c: c.overall_start())
 
-        if not is_covered:
-            final_chains.append(chain)
-            covered_ranges.append((chain_start, chain_end))
-            logger.debug(
-                f"  Accepted: Chain @ 0x{chain_start:X} (len {chain.overall_length()}) - valid pattern to 0x{chain_end:X}"
-            )
+    # 2) One‐pass acceptor
+    final: list[MatchChain] = []
+    max_end = -1  # highest end of any accepted chain so far
+
+    for c in sorted_chains:
+        s = c.overall_start()
+        e = s + c.overall_length()
+        if s >= max_end:
+            final.append(c)
+            max_end = e
 
     logger.info(
-        f"Overlap resolution complete: {len(final_chains)} of {len(chains)} chains accepted"
+        f"Overlap resolution complete: {len(final)} of {len(chains)} chains accepted"
     )
-    return final_chains
-
-
-def _stage4_worker(
-    args: typing.Tuple[typing.List[MatchChain], bytes, int, int, bool],
-) -> typing.List[MatchChain]:
-    """
-    Worker function for multiprocessing stage 4 validation.
-    Takes a chunk of chains and validates each one.
-
-    Args:
-        args: A tuple containing:
-            - chains_chunk: A list of MatchChain objects to process.
-            - buf: The full byte buffer of the memory region.
-            - base_ea: The base effective address of the buffer.
-            - is_64: True for 64-bit disassembly, False for 32-bit.
-
-    Returns:
-        A list of the MatchChain objects from the chunk that were successfully validated.
-    """
-    chains_chunk, buf, base_ea, is_64 = args
-    logger.info(
-        f"Worker processing {len(chains_chunk)} chains for Stage 4 validation..."
-    )
-    validated_in_chunk: typing.List[MatchChain] = []
-    logger.info("Stage 4: Big instruction validation step")
-    for chain in chains_chunk:
-        if _stage4_is_chain_valid(chain, buf, base_ea, is_64):
-            validated_in_chunk.append(chain)
-        else:
-            logger.info(
-                f"  Rejected: {chain.description} @ 0x{chain.overall_start():X} - no valid big instruction found for any jump target"
-            )
-
-    logger.info(
-        f"Worker finished Stage 4 validation: {len(validated_in_chunk)} chains validated in this chunk."
-    )
-    return validated_in_chunk
+    return final
 
 
 # ─── Async deobfuscator ───────────────────────────────────
@@ -1854,16 +1724,38 @@ def _stage4_worker(
 
 def make_chunks(buf_len: int, n_chunks: int, max_pat: int = MAX_PATTERN_LEN):
     """
-    Yield (padded_start, padded_end, core_start, core_end) so that:
-      • [core_start, core_end) are equal-sized, non-overlapping “core” regions
-      • each chunk is expanded on both sides by (max_pat-1) bytes
+    Yield exactly n_chunks tuples of
+      (padded_start, padded_end, core_start, core_end).
+
+    * core ranges partition [0, buf_len) evenly by floor division.
+    * padded ranges extend each core by (max_pat-1) on both sides,
+      clamped to [0, buf_len].
     """
-    chunk_size = math.ceil(buf_len / n_chunks)
-    for i in range(0, buf_len, chunk_size):
-        core_start = i
-        core_end = min(buf_len, i + chunk_size)
+    for i in range(n_chunks):
+        # uniform core split
+        core_start = (buf_len * i) // n_chunks
+        core_end = (buf_len * (i + 1)) // n_chunks
+        core_len = core_end - core_start
+
+        # padding
         padded_start = max(0, core_start - (max_pat - 1))
         padded_end = min(buf_len, core_end + (max_pat - 1))
+        padded_len = padded_end - padded_start
+
+        logger.info(
+            "Chunk %2d/%d: "
+            "core=[%#x-%#x) (%d bytes), "
+            "padded=[%#x-%#x) (%d bytes)",
+            i,
+            n_chunks,
+            core_start,
+            core_end,
+            core_len,
+            padded_start,
+            padded_end,
+            padded_len,
+        )
+
         yield padded_start, padded_end, core_start, core_end
 
 
@@ -1874,45 +1766,75 @@ def process_chunk(args):
     """
     shm_name, padded_start, padded_end, core_start, core_end, base_ea, is_64 = args
 
+    core_valid = []
+
     # attach shared memory
-    shm = multiprocessing.shared_memory.SharedMemory(name=shm_name)
-    full_buf_mv = memoryview(shm.buf)[: shm.size]  # zero-copy view of entire buffer
-    sub_buf = full_buf_mv[padded_start:padded_end]
-    try:
-        # — Stage 1
-        sub_bytes = bytes(sub_buf)
-        s1_chains = stage1_find_patterns(sub_bytes, base_ea + padded_start)
+    with shm_buffer(shm_name) as shm:
+        # zero-copy view of the chunk
+        full_buf_mv = memoryview(shm.buf)[padded_start:padded_end]
+        try:
+            # — Stage 1
+            s1_chains = stage1_find_patterns(full_buf_mv, base_ea + padded_start)
 
-        # — Stage 2 + 3
-        s2_3 = []
-        for chain in s1_chains:
-            chain = find_junk_stage2_chain(chain, full_buf_mv, base_ea, is_64)
-            if (
-                MIN_PATTERN_LEN <= chain.overall_length() <= MAX_PATTERN_LEN
-                and chain.junk_length > 0
-            ):
-                s2_3.append(chain)
+            # — Stage 2 + 3
+            s2_3 = []
+            for chain in s1_chains:
+                chain = find_junk_stage2_chain(chain, full_buf_mv, base_ea, is_64)
+                if (
+                    MIN_PATTERN_LEN <= chain.overall_length() <= MAX_PATTERN_LEN
+                    and chain.junk_length > 0
+                ):
+                    s2_3.append(chain)
 
-        # — Stage 4
-        validated = []
-        for chain in s2_3:
-            seg = _stage4_is_chain_valid(chain, full_buf_mv, base_ea, is_64)
-            if seg:
-                chain.add_segment(seg)  # attach the BIG_INSTRUCTION
-                validated.append(chain)
+            # — Stage 4
+            validated = []
+            for chain in s2_3:
+                seg = _stage4_is_chain_valid(chain, full_buf_mv, base_ea, is_64)
+                if seg:
+                    chain.add_segment(seg)  # attach the BIG_INSTRUCTION
+                    validated.append(chain)
 
-        # — Filter out duplicates from the overlap padding: only keep those
-        #    whose start-offset falls in [core_start, core_end)
-        core_valid = []
-        for c in validated:
-            rel_off = c.overall_start() - base_ea
-            if core_start <= rel_off < core_end:
-                core_valid.append(c)
-    finally:
-        del full_buf_mv
-        del sub_buf
-        shm.close()
+            # — Filter out duplicates from the overlap padding: only keep those
+            #    whose start-offset falls in [core_start, core_end)
+            for c in validated:
+                rel_off = c.overall_start() - base_ea
+                if core_start <= rel_off < core_end:
+                    core_valid.append(c)
+
+                # Sanity check
+                start = c.overall_start()
+                length = c.overall_length()
+                end = start + length
+                if length > MAX_PATTERN_LEN or end > base_ea + shm.size:
+                    logger.warning(
+                        "🚨 chain @ 0x%X length=%d end=0x%X (core=[%d, %d])",
+                        start,
+                        length,
+                        end,
+                        core_start + base_ea,
+                        core_end + base_ea,
+                    )
+        finally:
+            del full_buf_mv
     return core_valid
+
+
+@contextlib.contextmanager
+def shm_buffer(name: str, buf_len: int | None = None):
+    """
+    context manager to access the shared memory buffer.
+    if buf_len is not provided, then the buffer will be the raw shm memory
+    buffer else it will be a byte slice of the shm memory buffer.
+    
+    Usage:
+        with shm_buffer(name=..) as buf:
+            # use buf
+    """
+    shm = multiprocessing.shared_memory.SharedMemory(name=name)
+    try:
+        yield shm.buf[:buf_len] if buf_len else shm
+    finally:
+        shm.close()
 
 
 @dataclasses.dataclass
@@ -1935,120 +1857,24 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         )
         logger.info(f"executor pool created with {self.max_workers} workers")
 
-    @contextlib.asynccontextmanager
-    async def _get_buffer(self):
-        """
-        Async context manager to access the shared memory buffer.
-
-        Usage:
-            async with self._get_buffer() as buf:
-                # use buf
-        """
-        shm = multiprocessing.shared_memory.SharedMemory(name=self.shm_name)
-        try:
-            yield bytes(shm.buf[: self.data_size])
-        finally:
-            shm.close()
-
-    @log_execution_time
-    async def stage1(self):
-        await self.emit("stage1_started")
-        async with self._get_buffer() as buf:
-            loop = asyncio.get_running_loop()
-            chains = await loop.run_in_executor(
-                self.executor, stage1_find_patterns, buf, self.start_ea
-            )
-        await self.emit("stage1_finished", chains)
-        return chains
-
-    @log_execution_time
-    async def stage2(self, chains: typing.List[MatchChain]) -> typing.List[MatchChain]:
-        await self.emit("stage2_started")
-
-        # read the shared buffer once
-        async with self._get_buffer() as buf:
-            loop = asyncio.get_running_loop()
-
-            # split chains into roughly equal chunks
-            chunk_size = math.ceil(len(chains) / self.max_workers)
-            jobs = [
-                (chains[i : i + chunk_size], buf, self.start_ea, self.is_64bit)
-                for i in range(0, len(chains), chunk_size)
-            ]
-
-            # schedule one big task per chunk
-            tasks = [
-                loop.run_in_executor(self.executor, _stage2_worker, job) for job in jobs
-            ]
-
-            # wait for them all, then flatten
-            results = await asyncio.gather(*tasks)
-        updated = [c for group in results for c in group]
-
-        await self.emit("stage2_finished", updated)
-        return updated
-
-    @log_execution_time
-    async def stage3(self, chains):
-        await self.emit("stage3_started")
-        filtered = stage3_filter(chains)
-        await self.emit("stage3_finished", filtered)
-        return filtered
-
-    @log_execution_time
-    async def stage4(self, chains):
-        await self.emit("stage4_started")
-
-        if not chains:
-            logger.info("Stage 4 received no chains to process.")
-            await self.emit("stage4_finished", [])
-            return []
-
-        async with self._get_buffer() as buf:
-            loop = asyncio.get_running_loop()
-
-            # split chains into roughly equal chunks
-            chunk_size = math.ceil(len(chains) / self.max_workers)
-            jobs = [
-                (chains[i : i + chunk_size], buf, self.start_ea, self.is_64bit)
-                for i in range(0, len(chains), chunk_size)
-            ]
-
-            # schedule one big task per chunk using the new worker
-            tasks = [
-                loop.run_in_executor(self.executor, _stage4_worker, job) for job in jobs
-            ]
-
-            # wait & gather results (list of lists)
-            results_from_chunks = await asyncio.gather(*tasks)
-
-        # Flatten the list of lists into a single list of validated chains
-        valid_chains = [c for chunk_result in results_from_chunks for c in chunk_result]
-
-        # resolve overlaps & emit
-        final = resolve_overlaps(valid_chains)
-        await self.emit("stage4_finished", final)
-        return final
-
-    # @log_execution_time
-    # async def run(self):
-    #     await self.emit("run_started")
-    #     s1 = await self.stage1()
-    #     s2 = await self.stage2(s1)
-    #     s3 = await self.stage3(s2)
-    #     final = await self.stage4(s3)
-    #     return final
     @log_execution_time
     async def run(self):
         await self.emit("run_started")
 
-        # 1) define chunks over the shared buffer
+        # 1) define exactly max_workers chunks over the shared buffer
         buf_len = self.data_size
-        chunks = make_chunks(buf_len, self.max_workers)
+        chunks = list(make_chunks(buf_len, self.max_workers))
+        logger.debug(
+            "Splitting buffer of %d bytes into %d chunks:", buf_len, len(chunks)
+        )
+        for idx, (ps, pe, cs, ce) in enumerate(chunks):
+            logger.debug(
+                "  chunk %2d: core=[%d..%d) padded=[%d..%d)", idx, cs, ce, ps, pe
+            )
 
         # 2) fire one full-pipeline task per chunk
         loop = asyncio.get_running_loop()
-        jobs = (
+        jobs = [
             (
                 self.shm_name,
                 padded_start,
@@ -2059,7 +1885,7 @@ class AsyncDeobfuscator(AsyncEventEmitter):
                 self.is_64bit,
             )
             for padded_start, padded_end, core_start, core_end in chunks
-        )
+        ]
         futures = [
             loop.run_in_executor(self.executor, process_chunk, job) for job in jobs
         ]
@@ -2067,11 +1893,14 @@ class AsyncDeobfuscator(AsyncEventEmitter):
         # 3) wait, flatten, resolve overlaps globally
         per_chunk = await asyncio.gather(*futures)
         all_chains = [c for grp in per_chunk for c in grp]
-        sorted_chains: typing.List[MatchChain] = list(
-            sorted(all_chains, key=lambda c: c.overall_start())
-        )
-        await self.emit("run_finished", sorted_chains)
-        return sorted_chains
+
+        # now de-dupe any remaining overlaps
+        final = resolve_overlaps(all_chains)
+
+        # emit & return
+        final.sort(key=lambda c: c.overall_start())
+        await self.emit("run_finished", final)
+        return final
 
     async def shutdown(self):
         self.stop_evt.set()
@@ -2884,6 +2713,9 @@ if is_ida():
                     }
                     logger.info("Emitted processing_results via IPC.")
                     self.processing_results.emit(results)
+                # Worker message: {'type': 'status', 'data': 'connected', 'timestamp': 1745800440.6233163, 'status': 'ready'}
+                elif msg_type == "status" and message.get("status") == "ready":
+                    self.send_command({"command": "start"})
 
         def _on_connection_closed(self):
             """Handle connection closed by worker"""
@@ -3362,6 +3194,3 @@ if __name__ == "__main__":
     else:
         print("Running Taskr().get().run(*Taskr().get().get_section_data('.text'))")
         Taskr().get().run(*Taskr().get().get_section_data(".text"))
-
-        time.sleep(5)
-        Taskr().get().start()
