@@ -1,13 +1,16 @@
 import collections
+import ctypes
 import re
 import traceback
+from ctypes import wintypes
 
-import capstone
 import ida_bytes
 import ida_ua
 import idaapi
 import idautils
 import idc
+
+import capstone
 from mutilz.helpers.ida import clear_output
 
 
@@ -48,22 +51,48 @@ def hexdump(data, addr, bytes_per_line=16, joined=True):
     return "\n".join(result) if joined else result
 
 
+# Function to access memory at specific Windows addresses
+def NumberOfPhysicalPages():
+    """
+    Get the 4 bytes of NumberOfPhysicalPages from KUSER_SHARED_DATA
+    """
+
+    # Real implementation would access memory
+    class KUSER_SHARED_DATA(ctypes.Structure):
+        _fields_ = [
+            ("Reserved", ctypes.c_byte * 0x2E8),
+            ("NumberOfPhysicalPages", wintypes.ULONG),
+        ]
+
+    bytes_array = [0, 0, 0, 0]
+    try:
+        kuser_data = ctypes.cast(0x7FFE0000, ctypes.POINTER(KUSER_SHARED_DATA)).contents
+
+    except Exception as e:
+        print(
+            "Failed to read NumberOfPhysicalPages from KUSER_SHARED_DATA at 0x{:X}".format(
+                0x7FFE02E8
+            )
+        )
+    else:
+        number_of_physical_pages = kuser_data.NumberOfPhysicalPages
+        # Extract individual bytes
+        bytes_array = [
+            (number_of_physical_pages >> 0) & 0xFF,
+            (number_of_physical_pages >> 8) & 0xFF,
+            (number_of_physical_pages >> 16) & 0xFF,
+            (number_of_physical_pages >> 24) & 0xFF,
+        ]
+    return bytes_array
+
+
 def compute_i_value():
     """
     Reads the ULONG32 NumberOfPhysicalPages from KUSER_SHARED_DATA (0x7FFE0000 + 0x2E8),
     computes a 64-bit FNV-1a hash using the standard offset basis (0xCBF29CE484222325)
     and prime (0x100000001B3), then sums the hexadecimal nibbles of the result.
     """
-    kuser_shared_data = 0x7FFE0000
-    num_phys_pages_addr = kuser_shared_data + 0x2E8
-    data = idc.get_bytes(num_phys_pages_addr, 4)
-    if data is None or len(data) != 4:
-        print(
-            "Failed to read NumberOfPhysicalPages from KUSER_SHARED_DATA at 0x{:X}".format(
-                num_phys_pages_addr
-            )
-        )
-        return None
+    data = NumberOfPhysicalPages()
     fnv_prime = 0x100000001B3
     fnv_offset_basis = 0xCBF29CE484222325
     hash_val = fnv_offset_basis
