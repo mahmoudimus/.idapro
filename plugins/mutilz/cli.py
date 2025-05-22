@@ -26,6 +26,7 @@ import ida_ua
 import idaapi
 import idautils
 import idc
+import mutilz.settings
 import mutilz.actions as actions
 import mutilz.helpers.ida as ida_helpers
 
@@ -33,7 +34,7 @@ import mutilz.helpers.ida as ida_helpers
 logger = logging.getLogger("${category}.actions.${snake_name}")
 
 
-def execute_action(start_ea: int, end_ea: int):
+def execute_action(start_ea: int, end_ea: int, settings: mutilz.settings.ActionSettings):
     print(f"Hello! Called execute_action with range 0x{start_ea:X} - 0x{end_ea:X}")
     
 
@@ -43,6 +44,11 @@ ${action_doc}
     action_name: str = "${category}:${snake_name}"
     action_label: str = "${action_label}"
     icon: int = ${icon}
+
+    @classmethod
+    def settings(cls) -> mutilz.settings.ActionSettings:
+        mutilz.settings.reload()
+        return mutilz.settings.get_action_config(cls.action_name)
 
     def get_selected_addresses(self, ctx):
         is_selected, start_ea, end_ea = idaapi.read_range_selection(
@@ -85,12 +91,21 @@ ${action_doc}
             print(f"No end address selected, using line end: 0x{end_ea:X}")
 
         return start_ea, end_ea
-            
+
+    def func_at(self, curr_ea: int) -> ida_funcs.func_t:
+        func = ida_funcs.get_func(curr_ea)
+        if not func:
+            logger.error("No function at current position!")
+            return
+        return func
+                    
     def activate(self, ctx):
         curr_ea = idaapi.get_screen_ea()
-        start_ea, end_ea = self.get_selected_addresses(ctx)
         try:
-            execute_action(start_ea, end_ea)
+            # start_ea, end_ea = self.get_selected_addresses(ctx) 
+            # or 
+            # func = self.func_at(curr_ea)
+            execute_action(start_ea, end_ea, self.settings())
         finally:
             idc.jumpto(curr_ea)
 
