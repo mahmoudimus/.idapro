@@ -51,6 +51,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -316,10 +317,7 @@ class CapstoneAnalysisRunnable(QRunnable):
                 chunk_matches.extend(matches)
                 items_processed_in_this_chunk += 1
 
-                # Optional: Emit granular progress from within the runnable
-                # if total_in_chunk > 0:
-                #     percent = int(((i + 1) / total_in_chunk) * 100) # This runnable's own progress
-
+                self.signals.progress.emit(1)
             self.signals.result.emit(chunk_matches, items_processed_in_this_chunk, True)
         except Exception as e:
             exc_type, exc_value, exc_tb = sys.exc_info()
@@ -340,7 +338,9 @@ class PatternDetectionWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Obfuscation Pattern Detection")
-        self.setMinimumSize(900, 600)
+        self.setMinimumHeight(600)
+        self.setMinimumWidth(900)
+        # self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.matcher = None  # Will be set to FastPatternMatcher when needed
         self.all_patterns = []
         self.start_time = None
@@ -400,6 +400,8 @@ class PatternDetectionWidget(QWidget):
         control_layout.addWidget(self.clear_btn)
         control_layout.addStretch()
         control_group.setLayout(control_layout)
+        # let the control row fill the full width
+        control_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         # Progress section
         progress_group = QGroupBox("Progress")
@@ -414,6 +416,8 @@ class PatternDetectionWidget(QWidget):
         progress_layout.addWidget(self.progress_label)
         progress_layout.addWidget(self.time_label)
         progress_group.setLayout(progress_layout)
+        # let the progress row fill the full width
+        progress_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         # Results section
         results_group = QGroupBox("Detection Results")
@@ -440,6 +444,10 @@ class PatternDetectionWidget(QWidget):
 
         # Results table -> TreeView
         self.results_tree_view = QTreeView()
+        # make the tree view expand when its container resizes
+        self.results_tree_view.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
         self.results_tree_view.setAlternatingRowColors(True)
         self.results_tree_view.setSortingEnabled(True)
         self.results_tree_view.setRootIsDecorated(False)  # For a flat list look
@@ -465,11 +473,19 @@ class PatternDetectionWidget(QWidget):
         self.results_tree_view.setModel(self.proxy_model)
 
         header = self.results_tree_view.header()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(
-            2, QHeaderView.Stretch
-        )  # Description column stretches
+        # allow the user to drag‐resize any column, and even reorder them
         header.setSectionsClickable(True)
+        header.setSectionsMovable(True)
+
+        # default to Interactive so users can drag edges
+        header.setSectionResizeMode(QHeaderView.Interactive)
+
+        # auto‐grab all free space in these two human‐readable columns:
+        header.setSectionResizeMode(2, QHeaderView.Stretch)  # Description
+        header.setSectionResizeMode(4, QHeaderView.Stretch)  # Instructions
+
+        # ensure the very last section also expands into any leftover pixels
+        header.setStretchLastSection(True)
 
         results_layout.addWidget(self.results_tree_view)
 
@@ -478,6 +494,8 @@ class PatternDetectionWidget(QWidget):
         results_layout.addWidget(self.summary_label)
 
         results_group.setLayout(results_layout)
+        # let the results section fill width & height
+        results_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # Layout assembly
         splitter = QSplitter(Qt.Vertical)
@@ -487,12 +505,17 @@ class PatternDetectionWidget(QWidget):
         top_layout.addWidget(control_group)
         top_layout.addWidget(progress_group)
         top_widget.setLayout(top_layout)
+        # container for control+progress should also expand horizontally
+        top_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         splitter.addWidget(top_widget)
         splitter.addWidget(results_group)
         splitter.setSizes([200, 400])  # Give more space to results
+        # give the splitter all excess space (stretch=1)
+        layout.addWidget(splitter, 1)
 
-        layout.addWidget(splitter)
+        # and make the splitter itself expand in both directions
+        splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setLayout(layout)
 
     def _connect_signals(self):
@@ -525,6 +548,7 @@ class PatternDetectionWidget(QWidget):
         # else:
         # If start_time is None or detection not active, could clear or set to "Elapsed: 0s"
         # self.time_label.setText("Elapsed: 0s") # Or keep last value if preferred
+        QApplication.processEvents()  # Ensure UI events are processed
 
     def start_detection(self):
         """Start pattern detection on main thread."""
@@ -569,7 +593,6 @@ class PatternDetectionWidget(QWidget):
             self.next_prompt_time = 120
 
             self.progress_label.setText("Searching for pattern candidates...")
-            QApplication.processEvents()
 
             self.candidates = self.matcher.find_pattern_candidates(
                 text_seg.start_ea, text_seg.end_ea
@@ -582,7 +605,6 @@ class PatternDetectionWidget(QWidget):
 
             self.progress_bar.setValue(10)
             self.progress_label.setText("Preparing candidate data...")
-            QApplication.processEvents()
 
             # Phase 2: Prepare all candidate data in a single step
             self.candidates_data = []
@@ -650,7 +672,6 @@ class PatternDetectionWidget(QWidget):
                     self.progress_label.setText(
                         f"Preparing data for candidate {idx + 1}/{total_candidates}"
                     )
-                    QApplication.processEvents()  # Keep UI responsive
 
                 # Check for user prompt to continue (if enabled and time elapsed)
                 if self.start_time is not None and self.enable_continue_prompt:
@@ -735,6 +756,12 @@ class PatternDetectionWidget(QWidget):
             runnable.signals.result.connect(self._handle_runnable_result)
             runnable.signals.error.connect(self._handle_runnable_error)
             runnable.signals.auto_finished.connect(self._handle_runnable_finished)
+            runnable.signals.auto_started.connect(
+                self._handle_runnable_started
+            )  # Connect new signal
+            runnable.signals.progress.connect(
+                self._handle_runnable_progress
+            )  # Connect new signal
             # We can connect auto_started and progress if needed for more detailed UI updates
 
             self.active_runnables += 1
@@ -748,6 +775,47 @@ class PatternDetectionWidget(QWidget):
         ):  # Should not happen if candidates_data is not empty
             logging.info("No runnables started, finishing detection.")
             self.detection_finished([])
+
+    def _handle_runnable_started(self):
+        """Slot to handle the auto_started signal from a CapstoneAnalysisRunnable."""
+        logging.debug("A CapstoneAnalysisRunnable has started.")
+        # You could update a status label here if desired, e.g.,
+        # self.progress_label.setText("Analysis worker started...")
+        # but be cautious about overwriting overall progress information.
+
+    def _handle_runnable_progress(self, item_processed: int):
+        """Slot to handle the progress signal from a CapstoneAnalysisRunnable."""
+        logging.debug(f"Received chunk-local progress: {item_processed}%")
+        # Update the label to show ongoing activity within a chunk.
+        # This assumes self.items_processed_count is up-to-date from completed chunks.
+        self.items_processed_count += item_processed
+        if (
+            self.total_items_for_analysis > 0
+            and self.items_processed_count < self.total_items_for_analysis
+        ):
+            base_text = f"Analyzing... {self.items_processed_count}/{self.total_items_for_analysis} processed."
+            # Calculate progress for the analysis phase (50% to 100% of total bar)
+            # analysis_phase_percentage_float is 0-100 for the analysis work itself
+            analysis_phase_percentage_float = (
+                float(self.items_processed_count) / self.total_items_for_analysis
+            ) * 100.0
+
+            # This percentage maps to the 50-100 part of the progress bar
+            # So, it contributes analysis_phase_percentage_float / 2.0 to the value above 50.
+            progress_bar_increment = analysis_phase_percentage_float / 2.0
+            new_progress_value = 50 + int(
+                progress_bar_increment
+            )  # int() here, after division by 2.0
+            self.progress_bar.setValue(min(100, new_progress_value))
+            self.progress_label.setText(
+                f"{base_text} (Processed: {analysis_phase_percentage_float}%)"
+            )
+            # logging.debug(
+            #     "_handle_runnable_result: Updated self.items_processed_count to %d. Progress bar set to %d%%. Label: %s",
+            #     self.items_processed_count,
+            #     new_progress_value,
+            #     self.progress_label.text(),
+            # )
 
     def _handle_runnable_result(
         self,
@@ -766,39 +834,14 @@ class PatternDetectionWidget(QWidget):
 
         if success:
             self.collected_matches_from_runnables.extend(found_matches)
-            self.items_processed_count += (
-                items_processed_in_chunk  # Accumulate from this chunk
-            )
-
-            if self.total_items_for_analysis > 0:
-                # Calculate progress for the analysis phase (50% to 100% of total bar)
-                analysis_phase_percentage = (
-                    self.items_processed_count / self.total_items_for_analysis
-                ) * 100  # Percentage of analysis phase completion
-                # This percentage maps to the 50-100 part of the progress bar
-                new_progress_value = 50 + int(analysis_phase_percentage / 2)
-                self.progress_bar.setValue(min(100, new_progress_value))
-                self.progress_label.setText(
-                    f"Analyzing... {self.items_processed_count}/{self.total_items_for_analysis} processed."
-                )
-                logging.debug(
-                    "_handle_runnable_result: Updated self.items_processed_count to %d. Progress bar set to %d%%. Label: %s",
-                    self.items_processed_count,
-                    new_progress_value,
-                    self.progress_label.text(),
-                )
-            else:
-                self.progress_bar.setValue(self.progress_bar.value() + 1)  # Fallback
-                logging.debug(
-                    "_handle_runnable_result: Fallback progress increment (total_items_for_analysis is 0)."
-                )
+            if self.total_items_for_analysis < 0:
+                # Fallback if total_items_for_analysis is 0, though should not happen if processing items.
+                self.progress_bar.setValue(self.progress_bar.value() + 1)
         else:
             logging.warning(
                 "A CapstoneAnalysisRunnable reported failure via result signal. Items reported by this chunk: %d",
                 items_processed_in_chunk,
             )
-
-        QApplication.processEvents()  # Force UI update processing
 
     def _handle_runnable_finished(self):
         """Slot to handle the auto_finished signal from a CapstoneAnalysisRunnable."""
@@ -1742,8 +1785,10 @@ class FastPatternMatcher:
         patterns = []
 
         try:
-            if not USE_CAPSTONE:
-                return patterns  # Capstone disabled
+            if (
+                not USE_CAPSTONE or self.detector.cs is None
+            ):  # Added self.detector.cs is None check
+                return patterns  # Capstone disabled or cs not initialized
             instructions = list(self.detector.cs.disasm(data, base_address))
             if len(instructions) < 2:
                 return patterns
@@ -2087,6 +2132,7 @@ class PatternDetectionForm(ida_kernwin.PluginForm):
             "Obfuscation Pattern Detection",
             ida_kernwin.PluginForm.WOPN_DP_RIGHT  # dock on the right; change to taste
             | ida_kernwin.PluginForm.WOPN_PERSIST  # reopen with the database
+            | ida_kernwin.PluginForm.WOPN_DP_SZHINT  # use the widget's size hint to determine the best geometry (Qt only)
             | ida_kernwin.PluginForm.WOPN_TAB,  # allow tab-docking
         )
         return form
@@ -2112,7 +2158,8 @@ class pattern_detect_t(idaapi.plugin_t):
     # plugin entry-point ----------------------------------------------
     def run(self, arg):
         form = self._ensure_form()
-        ida_kernwin.switchto_tform(form, True)  # just bring it to front
+        if form:
+            ida_kernwin.activate_widget(form, True)  # just bring it to front
 
 
 def PLUGIN_ENTRY():  # IDA looks for this symbol
