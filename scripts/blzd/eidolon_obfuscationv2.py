@@ -1,22 +1,24 @@
-from __future__ import annotations
-
-import datetime
-import json
-import weakref
-
 """
 Optimized Capstone-based instruction pattern detection for x86 obfuscation patterns.
 Uses IDA's fast signature search to locate candidates, then verifies with Capstone.
 Includes junk instruction filtering to reduce false positives.
 """
 
-import inspect
+from __future__ import annotations
+
+import collections
+import dataclasses
+import datetime
+import enum
+import json
 import logging
 import re
 import sys  # For sys.exc_info()
 import time
 import traceback  # For formatting traceback
-import types
+import typing
+import weakref
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -26,22 +28,18 @@ from PyQt5.QtCore import (
     QObject,
     QRegularExpression,
     QRunnable,
-    QSize,
     QSortFilterProxyModel,
     Qt,
-    QThread,
     QThreadPool,
     QTimer,
     pyqtSignal,
 )
-from PyQt5.QtGui import QFont, QStandardItem, QStandardItemModel
+from PyQt5.QtGui import QStandardItem, QStandardItemModel
 
 # Qt imports
 from PyQt5.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
-    QDialog,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -53,16 +51,12 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
-    QTextEdit,
     QTreeView,
     QVBoxLayout,
     QWidget,
 )
 
 import ida_bytes
-import ida_ida
 
 # IDA imports
 import ida_kernwin
@@ -76,7 +70,7 @@ import capstone
 # Toggle Capstone verification on/off (handy for profiling)
 # ----------------------------------------------------------------------
 USE_CAPSTONE = True  # ← flip to True to restore Capstone analysis
-
+MAX_PATTERN_LEN = 129
 
 # --- Pattern Detection Core Classes (must be defined first) ---
 
@@ -100,6 +94,127 @@ class JunkPatternMetadata:
         if self.compiled is None:
             self.compiled = re.compile(self.pattern, flags)
         return self.compiled
+
+
+class SegmentType(enum.Enum):
+    STAGE1_MULTIPLE = enum.auto()
+    STAGE1_SINGLE = enum.auto()
+    JUNK = enum.auto()
+    BIG_INSTRUCTION = enum.auto()
+
+
+@dataclasses.dataclass
+class MatchSegment:
+    start: int
+    length: int
+    description: str
+    matched_bytes: bytes
+    segment_type: SegmentType
+    matched_groups: dict = dataclasses.field(default_factory=dict)
+
+
+class MatchChain:
+    def __init__(self, base_address: int, segments: typing.List[MatchSegment] = None):
+        self.base_address = base_address
+        self.segments = segments or []
+
+    def add_segment(self, segment: MatchSegment):
+        self.segments.append(segment)
+
+    def overall_start(self) -> int:
+        return self.segments[0].start + self.base_address if self.segments else 0
+
+    def overall_length(self) -> int:
+        if not self.segments:
+            return 0
+        first = self.segments[0]
+        last = self.segments[-1]
+        return (last.start + last.length) - first.start
+
+    def overall_matched_bytes(self) -> bytes:
+        return b"".join(seg.matched_bytes for seg in self.segments)
+
+    def append_junk(
+        self, junk_start: int, junk_len: int, junk_desc: str, junk_bytes: bytes
+    ):
+        seg = MatchSegment(
+            start=junk_start,
+            length=junk_len,
+            description=junk_desc,
+            matched_bytes=junk_bytes,
+            segment_type=SegmentType.JUNK,
+        )
+        self.add_segment(seg)
+
+    @property
+    def description(self) -> str:
+        desc = []
+        for idx, seg in enumerate(self.segments):
+            if idx == 0:
+                desc.append(f"{seg.description}")
+            else:
+                desc.append(f" -> {seg.description}")
+        return "".join(desc)
+
+    def update_description(self, new_desc: str):
+        if self.segments:
+            self.segments[0].description = new_desc
+
+    # New properties for junk analysis
+    @property
+    def stage1_type(self) -> SegmentType:
+        return self.segments[0].segment_type
+
+    @property
+    def junk_segments(self) -> list:
+        """
+        Returns a list of segments considered as junk based on their segment_type.
+        """
+        return [seg for seg in self.segments if seg.segment_type == SegmentType.JUNK]
+
+    @property
+    def junk_starts_at(self) -> typing.Optional[int]:
+        """
+        Returns the starting address of the junk portion.
+        This is computed as base_address + the offset of the first junk segment.
+        If no junk segments exist, returns None.
+        """
+        js = self.junk_segments
+        if js:
+            return self.base_address + js[0].start
+        return None
+
+    @property
+    def junk_length(self) -> int:
+        """
+        Returns the total length of the junk portion.
+        This is computed as the difference between the end (start + length) of the last junk segment
+        and the start of the first junk segment.
+        If there are no junk segments, returns 0.
+        """
+        js = self.junk_segments
+        if not js:
+            return 0
+        first = js[0]
+        last = js[-1]
+        return (last.start + last.length) - first.start
+
+    def __lt__(self, other):
+        return self.overall_start() < other.overall_start()
+
+    def __repr__(self):
+        r = [
+            f"{self.description.rjust(32, ' ')} @ 0x{self.overall_start():X} - "
+            f"{self.overall_matched_bytes().hex()[:16]}"
+            f"{'...' if self.overall_length() > 16 else ''}",
+            "  |",
+        ]
+        for seg in self.segments:
+            _grps = f"{' - ' + str(seg.matched_groups) if seg.matched_groups else ''}"
+            r.append(
+                f"  |_ {seg.description} @ 0x{self.base_address + seg.start:X} - {seg.matched_bytes.hex()}{_grps}"
+            )
+        return "\n".join(r)
 
 
 @dataclass
@@ -2067,6 +2182,636 @@ class SinglePartPatternDetector(PatternDetector):
     """Detects single-part prefix + conditional jump patterns."""
 
     pass
+
+
+@dataclasses.dataclass
+class Range:
+    """A range of addresses with a start (inclusive) and end (exclusive)."""
+
+    start: int
+    end: int
+
+    def __post_init__(self):
+        if self.start >= self.end:
+            raise ValueError("start must be less than end")
+
+    def __contains__(self, addr: int) -> bool:
+        """Check if an address is within this range."""
+        return self.start <= addr < self.end
+
+    def __len__(self) -> int:
+        """Return the size of the range in bytes."""
+        return self.end - self.start
+
+    def overlaps(self, other: "Range") -> bool:
+        """Check if this range overlaps with another range."""
+        return self.start < other.end and other.start < self.end
+
+    def merge(self, other: "Range") -> "Range":
+        return Range(min(self.start, other.start), max(self.end, other.end))
+
+
+class IntervalSet:
+    """
+    Sorted, non-overlapping list of Range objects with O(log n) insertion.
+    """
+
+    __slots__ = ("_ranges",)
+
+    def __init__(self) -> None:
+        self._ranges: list[Range] = []
+
+    def __iter__(self):
+        return iter(self._ranges)
+
+    def __len__(self):
+        return len(self._ranges)
+
+    # --- public ------------------------------------------------------------
+    def add(self, new: Range) -> None:
+        """
+        Insert `new` and coalesce any overlaps / adjacencies in-place.
+        """
+        # Fast-path: first interval
+        if not self._ranges:
+            self._ranges.append(new)
+            return
+
+        # Binary-search insertion point by *start*
+        idx = bisect_left(
+            self._ranges, new.start, key=lambda r: r.start
+        )  # Python 3.10+
+
+        # Extend backward if necessary
+        if idx > 0 and self._ranges[idx - 1].end >= new.start:
+            idx -= 1
+
+        # Merge forward while overlapping
+        while idx < len(self._ranges) and new.overlaps(self._ranges[idx]):
+            new = new.merge(self._ranges[idx])
+            del self._ranges[idx]
+
+        # Also coalesce “touching” intervals (…,end==new.start or vice-versa)
+        if idx < len(self._ranges) and new.end == self._ranges[idx].start:
+            new = new.merge(self._ranges[idx])
+            del self._ranges[idx]
+        if idx > 0 and self._ranges[idx - 1].end == new.start:
+            new = new.merge(self._ranges[idx - 1])
+            del self._ranges[idx - 1]
+            idx -= 1
+
+        self._ranges.insert(idx, new)
+
+    # ­— optional helpers ---------------------------------------------------
+    def covers(self, addr: int) -> bool:
+        i = bisect_right(self._ranges, addr, key=lambda r: r.start) - 1
+        return i >= 0 and addr < self._ranges[i].end
+
+    def as_tuples(self):
+        return [(r.start, r.end) for r in self._ranges]
+
+
+@dataclasses.dataclass
+class BasicDecodedInstruction:
+    """Holds standardized information about a decoded instruction."""
+
+    address: int
+    size: int
+    is_jump: bool = False
+    jump_target: typing.Optional[int] = None
+    is_nop: bool = False
+    dead_opaque_predicate: bool = False
+
+
+class InstructionDecoder(typing.Protocol):
+    """Protocol defining the expected signature for decoder functions."""
+
+    def __init__(self, is_x64: bool): ...
+
+    def decode(
+        self, ea: int, mem_bytes_at_ea: bytes
+    ) -> typing.Optional[BasicDecodedInstruction]:
+        """
+        Decodes the instruction at virtual address 'ea' using the provided memory bytes.
+
+        Args:
+            ea: The virtual address of the instruction to decode.
+            mem_bytes_at_ea: A bytes object containing memory starting from 'ea'.
+                             The implementation should only consume the bytes
+                             needed for the single instruction at 'ea'.
+
+        Returns:
+            An InstructionInfo object if decoding is successful, otherwise None.
+        """
+        ...
+
+
+class CapstoneInstructionDecoder(InstructionDecoder):
+    # Define register pairs for inc/pop patterns
+    # Bidirectional mapping between 32-bit and 64-bit registers
+    # Define base 32-bit to 64-bit register mapping
+    REG_32_TO_64 = {
+        capstone.x86.X86_REG_EAX: capstone.x86.X86_REG_RAX,
+        capstone.x86.X86_REG_EBX: capstone.x86.X86_REG_RBX,
+        capstone.x86.X86_REG_ECX: capstone.x86.X86_REG_RCX,
+        capstone.x86.X86_REG_EDX: capstone.x86.X86_REG_RDX,
+        # explicitly exclude esi, because it is not a valid register
+        capstone.x86.X86_REG_EDI: capstone.x86.X86_REG_RDI,
+        capstone.x86.X86_REG_EBP: capstone.x86.X86_REG_RBP,
+        capstone.x86.X86_REG_ESP: capstone.x86.X86_REG_RSP,
+    }
+    # Derive 64-bit to 32-bit mapping by inverting the base mapping
+    REG_64_TO_32 = {v: k for k, v in REG_32_TO_64.items()}
+
+    def __init__(self, is_x64: bool):
+        self.is_x64 = is_x64
+        self.md = capstone.Cs(
+            capstone.CS_ARCH_X86, capstone.CS_MODE_64 if is_x64 else capstone.CS_MODE_32
+        )
+        self.md.detail = True
+
+    def get_next_insn(
+        self, mem_bytes_at_ea: bytes, ea: int
+    ) -> typing.Optional[capstone.CsInsn]:
+        try:
+            # Use list comprehension and next to get the first instruction or None
+            insn = next(self.md.disasm(mem_bytes_at_ea, ea, count=1), None)
+        except capstone.CsError as e:
+            logging.error(f"Capstone decoding error at 0x{ea:X}: {e}")
+            return None
+        logging.debug(
+            "Decoded instruction: %s %s (%X bytes) at offset %s - bytes: %s",
+            insn.mnemonic,
+            insn.op_str,
+            insn.size,
+            hex(ea),
+            insn.bytes.hex(),
+        )
+        return insn
+
+    def decode(
+        self, ea: int, mem_bytes_at_ea: bytes
+    ) -> typing.Optional[BasicDecodedInstruction]:
+        """
+        Decodes instruction at ea using IDA's disassembler.
+        Ignores mem_bytes_at_ea, uses IDA's database.
+        Conforms to DecoderProtocol.
+        """
+        # Decode using Capstone
+        insn = self.get_next_insn(mem_bytes_at_ea, ea)
+        if insn is None:
+            return None
+
+        decoded = BasicDecodedInstruction(address=ea, size=insn.size)
+        if insn.id == capstone.x86.X86_INS_NOP:
+            decoded.is_nop = True
+        # Check for 'xchg r8, r8' as a NOP pattern (0x90 is 'nop', i.e. 0x87 C9 is 'xchg cl, cl')
+        elif insn.id in (
+            capstone.x86.X86_INS_XCHG,
+            capstone.x86.X86_INS_MOV,
+            capstone.x86.X86_GRP_CMOV,
+        ):
+            op1, op2 = insn.operands
+            if op1.type == op2.type and op1.size == op2.size and op1.reg == op2.reg:
+                decoded.is_nop = True
+        # Handle 'inc eax' followed by 'pop rax' as a NOP pattern
+        elif all(
+            (
+                insn.id == capstone.x86.X86_INS_INC,
+                len(insn.operands) > 0,
+                insn.operands[0].type == capstone.x86.X86_OP_REG,
+                (
+                    next_insn := self.get_next_insn(
+                        mem_bytes_at_ea, insn.address + insn.size
+                    )
+                ),
+                next_insn.id == capstone.x86.X86_INS_POP,
+            )
+        ):
+            if insn.operands[0].reg in self.REG_32_TO_64 and (
+                next_insn.operands[0].reg == insn.operands[0].reg
+                or next_insn.operands[0].reg == self.REG_32_TO_64[insn.operands[0].reg]
+            ):
+                decoded.is_nop = True
+                decoded.size = insn.size + next_insn.size
+                return decoded
+            elif insn.operands[0].reg in self.REG_64_TO_32 and (
+                next_insn.operands[0].reg == insn.operands[0].reg
+                or next_insn.operands[0].reg == self.REG_64_TO_32[insn.operands[0].reg]
+            ):
+                decoded.is_nop = True
+                decoded.size = insn.size + next_insn.size
+                return decoded
+        elif insn.id == capstone.x86.X86_INS_PUSH and len(insn.operands) > 0:
+            # we have encountered this dead code:
+            # .text:0000000180188FB2 50                                                  push    rax
+            # .text:0000000180188FB3 EB FF                                               jmp     short near ptr loc_180188FB3+1
+            # .text:0000000180188FB5 C0 58 ? ?                                           rcr     byte ptr [rax-?], ?
+            if insn.operands[0].reg == capstone.x86.X86_REG_RAX:
+                next_insn = self.get_next_insn(
+                    mem_bytes_at_ea, insn.address + insn.size
+                )
+                if next_insn is not None and self._is_self_recursive_jump(insn):
+                    next_next_insn = self.get_next_insn(
+                        mem_bytes_at_ea, next_insn.address + next_insn.size
+                    )
+                    if next_next_insn is not None and next_next_insn.bytes.startswith(
+                        b"\xc0\x58"
+                    ):
+                        decoded.dead_opaque_predicate = True
+                        decoded.size = insn.size + next_insn.size + 2
+                    return decoded
+                else:
+                    decoded.is_nop = True
+                    return decoded
+        # Handle LOOPNE instruction (opcode: E0) - loop while not equal/zero
+        # When assembled as 'loopne near ptr $+5' it becomes: E0 03
+        elif (
+            capstone.CS_GRP_JUMP in insn.groups
+            or insn.id == capstone.x86.X86_INS_LOOPNE
+        ):
+            if (
+                len(insn.operands) > 0
+                and insn.operands[0].type == capstone.x86.X86_OP_IMM
+            ):
+                decoded.is_jump = True
+                decoded.jump_target = insn.operands[0].imm
+        return decoded
+
+    def _is_self_recursive_jump(self, insn: capstone.CsInsn) -> bool:
+        """
+        Heuristic detection of self-recursive jumps for Capstone.
+
+        Args:
+            insn: Capstone instruction object
+
+        Returns:
+            True if this appears to be a self-recursive jump
+        """
+        jump_source = insn.address
+        # Pattern detection for common dead opaque predicates
+        # EB FF - jump back 1 byte (into same instruction)
+        if (
+            insn.id == capstone.x86.X86_INS_JMP
+            and len(insn.bytes) == 2
+            and insn.bytes[0] == 0xEB
+            and insn.bytes[1] == 0xFF
+        ):
+            logging.debug(f"Self-recursive jump detected: EB FF at 0x{jump_source:X}")
+            return True
+
+        return False
+
+
+@dataclasses.dataclass
+class JumpTargetAnalyzer:
+    # Input parameters for processing jumps.
+    match_bytes: bytes  # The bytes in which we're matching jump instructions.
+    match_start: int  # The address where match_bytes starts.
+    block_end: int  # End address of the allowed region.
+    start_ea: int  # Base address of the memory block (used for bounds checking).
+
+    # Internal structures.
+    jump_targets: collections.Counter = dataclasses.field(
+        init=False, default_factory=collections.Counter
+    )
+    jump_details: list = dataclasses.field(
+        init=False, default_factory=list
+    )  # List of (jump_ea, final_target, stage1_type)
+    target_type: dict = dataclasses.field(
+        init=False, default_factory=dict
+    )  # final_target -> stage1_type
+
+    def follow_jump_chain(
+        self,
+        mem: bytes,
+        current_ea: int,
+        match_end: int,
+        decoder: InstructionDecoder,
+        visited: set = None,
+        depth: int = 0,
+    ) -> typing.Optional[int]:
+        """
+        Follow a chain of 2-byte jumps starting from current_ea using the provided decoder.
+
+        Args:
+            mem: Memory object containing the relevant byte data. Its 'base' attribute
+                 defines the absolute address corresponding to the start of its buffer.
+            current_ea: The absolute starting virtual address for tracing.
+            match_end: The absolute end address (exclusive) of the 'stage1' area.
+            decoder: A function conforming to DecoderProtocol used for disassembly.
+            visited: Set of visited addresses to prevent loops (internal use).
+            depth: Recursion depth for logging (internal use).
+
+        Returns:
+            The absolute virtual address where the jump chain ends, or None.
+        """
+        indent = "  " * depth + "|_ "
+        if visited is None:
+            visited = set()
+
+        # Get an efficient view of the memory buffer
+        mem_view = mem
+        mem_start_ea = self.start_ea  # Absolute start address of the buffer
+        mem_len = len(mem_view)
+        mem_end_ea = mem_start_ea + mem_len  # Absolute end address (exclusive)
+
+        if current_ea in visited:
+            logging.debug(
+                "%sJump chain stopped: Already visited 0x%X", indent, current_ea
+            )
+            return None
+        # Check if start address is within the bounds defined by the Memory object
+        if not (mem_start_ea <= current_ea < mem_end_ea):
+            logging.debug(
+                "%sJump chain stopped: Start address 0x%X is outside Memory bounds [0x%X, 0x%X)",
+                indent,
+                current_ea,
+                mem_start_ea,
+                mem_end_ea,
+            )
+            return None
+
+        visited.add(current_ea)
+
+        trace_ea = current_ea
+        while True:
+            # Check if the current tracing address is still within the Memory bounds
+            if not (mem_start_ea <= trace_ea < mem_end_ea):
+                logging.debug(
+                    "%sStopping trace: Address 0x%X is outside Memory bounds [0x%X, 0x%X). Returning last valid start: 0x%X",
+                    indent,
+                    trace_ea,
+                    mem_start_ea,
+                    mem_end_ea,
+                    current_ea,
+                )
+                return current_ea  # Return the start address of the sequence that led out of bounds
+
+            decoded_insn = None
+            # Calculate offset relative to the start of the Memory object's buffer
+            offset = trace_ea - mem_start_ea
+            logging.debug("%soffset: %X", indent, offset)
+            # We already know offset is >= 0 because trace_ea >= mem_start_ea
+            # We need to ensure we have enough bytes left for *potential* instructions
+
+            # Get bytes starting from the offset using the memoryview slice
+            # Convert the slice to bytes for the decoder interface
+            bytes_for_decoder = mem_view[offset:]
+            if (
+                not bytes_for_decoder
+            ):  # Should not happen if bounds check is correct, but defensive check
+                logging.warning(
+                    "%sNo bytes available for decoding at offset %X (address 0x%X). Stopping trace.",
+                    indent,
+                    offset,
+                    trace_ea,
+                )
+                return current_ea
+
+            try:
+                # Call the passed-in decoder function
+                decoded_insn = decoder.decode(trace_ea, bytes_for_decoder)
+            except Exception as e:
+                logging.error(
+                    "%sDecoder function raised exception at 0x%X: %s",
+                    indent,
+                    trace_ea,
+                    e,
+                )
+                decoded_insn = None  # Treat as decode failure
+
+            # If decoding failed or decoder returned None
+            if not decoded_insn:
+                logging.debug(
+                    "%sFailed to decode instruction at 0x%X. Stopping trace. Returning start: 0x%X",
+                    indent,
+                    trace_ea,
+                    current_ea,
+                )
+                return current_ea  # Return start of the sequence
+
+            # --- Process the decoded instruction ---
+            if decoded_insn.is_nop:
+                logging.debug(
+                    "%sNOP found at 0x%X (size %X). Skipping.",
+                    indent,
+                    trace_ea,
+                    decoded_insn.size,
+                )
+                trace_ea += decoded_insn.size
+                continue  # Continue the while loop to the next instruction
+
+            if decoded_insn.dead_opaque_predicate:
+                logging.debug(
+                    "%sDead opaque predicate found at 0x%X (size %X). Returning start: 0x%X.",
+                    indent,
+                    trace_ea,
+                    decoded_insn.size,
+                    current_ea,
+                )
+                return current_ea + decoded_insn.size
+
+            if not decoded_insn.is_jump or decoded_insn.size != 2:
+                logging.debug(
+                    "%sChain stopped at 0x%X: Instruction is not a 2-byte jump. Returning start: 0x%X",
+                    indent,
+                    trace_ea,
+                    current_ea,
+                )
+                return current_ea  # Return the start address of the sequence that ended
+
+            # --- We have a 2-byte jump ---
+            target = decoded_insn.jump_target  # This is an absolute address
+            logging.debug(
+                "%s  -> Found 2-byte jump at 0x%X targeting 0x%X",
+                indent,
+                trace_ea,
+                target,
+            )
+
+            # --- Decide action based on the jump target (using absolute addresses) ---
+            # 1. Target is within the 'followable' range [match_start, match_end )
+            if self.match_start <= target < match_end:
+                logging.debug(
+                    "%sFollowing jump from 0x%X to 0x%X (recursive call)",
+                    indent,
+                    trace_ea,
+                    target,
+                )
+                # Pass the same Memory object and decoder down recursively
+                return self.follow_jump_chain(
+                    mem, target, match_end, decoder, visited, depth + 1
+                )
+
+            # 3. Target is within the overall Memory block, but *before* match_start.
+            elif mem_start_ea <= target < self.match_start:
+                logging.debug(
+                    "%sJump chain ends: Target 0x%X is within Memory bounds [0x%X,0x%X) but outside followable range [0x%X, 0x%X). Returning target.",
+                    indent,
+                    target,
+                    mem_start_ea,
+                    mem_end_ea,
+                    self.match_start,
+                    match_end,
+                )
+                if depth == 0:  # this is a bs jump, ignore it.
+                    return None
+                return target  # Return the target address itself
+
+            # 4. Target is out of the overall Memory bounds or otherwise unexpected.
+            else:
+                logging.debug(
+                    "%sJump chain stopped: Target 0x%X is outside allowed ranges. Returning start address 0x%X",
+                    indent,
+                    target,
+                    current_ea,
+                )
+                if depth == 0:  # this is a bs jump, ignore it.
+                    return None
+                return current_ea  # Return the start address of the sequence containing the invalid jump
+
+    def _decode_stream(self, decoder, start, match_bytes):
+        offset = 0
+        n = len(match_bytes)
+
+        while offset < n:
+            try:
+                # hand the decoder only the bytes we haven’t consumed yet
+                insn = decoder.decode(start + offset, match_bytes[offset:])
+            except Exception as e:
+                logging.error("Decode error @0x%X: %s", start + offset, e)
+                return
+
+            if not insn:
+                return
+
+            yield insn
+            offset += insn.size
+
+    def process(self, mem, chain, is_x64: bool):
+        """
+        Process each jump match in match_bytes.
+        'chain' is expected to have attributes:
+          - junk_length: int
+          - stage1_type: SegmentType
+        """
+        decoder = CapstoneInstructionDecoder(is_x64)
+        match_end = chain.overall_start() + MAX_PATTERN_LEN
+        logging.debug(
+            "Processing jumps for chain @ 0x%X, match_end=0x%X",
+            chain.overall_start(),
+            match_end,
+        )
+        match chain.stage1_type:
+            case SegmentType.STAGE1_SINGLE:
+                jump_offset = chain.segments[0].length - (
+                    len(chain.segments[0].matched_groups["jump"]) // 2
+                )
+                jump_ea = self.match_start + jump_offset
+            case SegmentType.STAGE1_MULTIPLE:
+                jump_offset = 0
+                jump_ea = self.match_start + jump_offset
+            case _:
+                raise ValueError(f"Invalid stage1_type: {chain.stage1_type}")
+
+        final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
+        if not final_target:
+            logging.debug(
+                "  Skipping jump at 0x%X: Invalid final target 0x%X",
+                jump_ea,
+                final_target if final_target else 0,
+            )
+        else:
+            self.jump_targets[final_target] += 1
+            if final_target not in self.target_type:
+                self.target_type[final_target] = chain.stage1_type
+            self.jump_details.append((jump_ea, final_target, chain.stage1_type))
+            logging.debug("Found jump @0x%X → 0x%X", jump_ea, final_target)
+        return self
+
+    def __iter__(self):
+        """
+        Iterate over the most likely targets.
+        For each candidate, if a jump exists whose starting address equals candidate + 1,
+        yield its final target instead.
+
+        Sorting is by count descending, then by final_target descending.
+        """
+        # Prepare a list of (final_target, count) tuples
+        results = list(self.jump_targets.items())
+        # Sort by count descending, then by final_target descending
+        results.sort(key=lambda x: (x[1], x[0]), reverse=True)
+        for candidate, count in results:
+            final_candidate = candidate
+            for jump_ea, target, stype in self.jump_details:
+                if jump_ea == candidate + 1:
+                    final_candidate = target
+                    break
+            yield final_candidate
+
+
+def _analyze_chain(
+    chain: MatchChain,
+    mem: bytes,
+    start_ea: int,
+    is_x64: bool,
+    max_size: int = MAX_PATTERN_LEN,
+) -> list[Range]:
+    """
+    Filter out false positive anti-disassembly patterns and handle overlaps.
+    Integrates with existing big instruction detection code.
+
+    Args:
+        chains: List of MatchChain objects
+        mem: Memory object containing binary data
+        start_ea: Starting effective address
+        max_size: Maximum valid size for an anti-disassembly routine (default: MAX_PATTERN_LEN)
+
+    Returns:
+        A single validated MatchChain object
+    """
+
+    # Find the big instruction
+    match_start = chain.overall_start()
+    chain_end = match_start + max_size
+    ranges = []
+
+    logging.info(f"Analyzing match: {chain.description} @ 0x{match_start:X}")
+
+    # Determine possible jump targets - using your existing code
+    jump_targets = JumpTargetAnalyzer(
+        chain.overall_matched_bytes(), match_start, chain_end, start_ea
+    ).process(mem=mem, chain=chain, is_x64=is_x64)
+
+    for target in jump_targets:
+        if target <= match_start:  # sanity-check
+            continue
+        logging.info(f"most_likely_target: 0x{target:X}, block_end: 0x{chain_end:X}")
+        ranges.append(Range(match_start, target))
+    return ranges
+
+
+def resolve_overlaps(ranges: list[Range]) -> IntervalSet:
+    """
+    Fast, linear-time overlap resolution: keep only the first chain
+    whose start is ≥ the furthest end so far.
+    """
+    logging.info(f"Resolving overlaps among {len(ranges)} ranges")
+    intervals = IntervalSet()
+
+    for r in ranges:
+        intervals.add(r)
+
+        # decide whether to keep the chain object itself
+        last_end = intervals.as_tuples()[-1][1]  # rightmost byte so far
+        target = r.end
+        if target == last_end:  # this chain extended the interval set
+            logging.info(f"  Accepted (or widened): {r.start:X}-{r.end:X}")
+        else:
+            logging.info(f"  Rejected overlap: {r.start:X}-{r.end:X}")
+
+    return intervals
 
 
 # Legacy console function for backwards compatibility
