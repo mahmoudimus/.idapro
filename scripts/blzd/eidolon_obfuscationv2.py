@@ -61,6 +61,7 @@ import ida_bytes
 # IDA imports
 import ida_kernwin
 import ida_nalt
+import ida_range
 import ida_segment
 import idaapi
 
@@ -114,7 +115,11 @@ class MatchSegment:
 
 
 class MatchChain:
-    def __init__(self, base_address: int, segments: typing.List[MatchSegment] = None):
+    def __init__(
+        self,
+        base_address: int,
+        segments: typing.Optional[typing.List[MatchSegment]] = None,
+    ):
         self.base_address = base_address
         self.segments = segments or []
 
@@ -404,6 +409,128 @@ class WorkerSignals(QObject):
     progress = pyqtSignal(int)  # percentage
 
 
+def _analyze_chain(
+    chain: MatchChain,
+    mem: bytes,
+    start_ea: int,
+    is_x64: bool,
+    max_size: int = MAX_PATTERN_LEN,
+) -> list[Range]:
+    """
+    Filter out false positive anti-disassembly patterns and analyze jump chains.
+
+    Args:
+        chain: The MatchChain object representing the pattern and surrounding bytes.
+        mem: Memory bytes of the relevant segment.
+        start_ea: The starting effective address of the 'mem' bytes.
+        is_x64: Boolean indicating if the architecture is x64.
+        max_size: Maximum valid size for an anti-disassembly routine.
+
+    Returns:
+        A list of Range objects representing resolved code blocks stemming from the chain.
+    """
+
+    match_start = chain.overall_start()
+    chain_end = match_start + max_size
+    ranges = []
+
+    logging.info("Analyzing match: %s @ 0x%X", chain.description, match_start)
+
+    jump_analyzer = JumpTargetAnalyzer(
+        chain.overall_matched_bytes(), match_start, chain_end, start_ea
+    )
+    jump_targets_iter = jump_analyzer.process(mem=mem, chain=chain, is_x64=is_x64)
+
+    for target in jump_targets_iter:
+        if target is None:
+            logging.debug(
+                "JumpTargetAnalyzer yielded None for chain @ 0x%X, skipping this target.",
+                match_start,
+            )
+            continue
+        if target <= match_start:
+            logging.debug(
+                "Invalid jump target 0x%X (<= match_start 0x%X) for chain. Skipping.",
+                target,
+                match_start,
+            )
+            continue
+
+        logging.info(
+            "Most likely target: 0x%X, analysis boundary: 0x%X", target, chain_end
+        )
+        ranges.append(Range(match_start, target))
+    return ranges
+
+
+class AnalysisTask(QRunnable):
+    """
+    A QRunnable task to analyze a single pattern match (pm) in a separate thread.
+    """
+
+    def __init__(
+        self,
+        pattern_detection_widget,
+        pm,
+        mem_start_ea,
+        mem_bytes,
+        matcher_instance,
+        is_x64,
+    ):
+        super().__init__()
+        self.pattern_detection_widget = pattern_detection_widget
+        self.pm = pm
+        self.mem_start_ea = mem_start_ea
+        self.mem_bytes = mem_bytes
+        self.matcher_instance = matcher_instance
+        self.is_x64 = is_x64
+        self.result_ranges = []
+        self.error = None
+        # Store ida_address for reliable logging, as pm object might have thread affinity issues
+        # or its attributes might be accessed from a different thread context.
+        self.pm_ida_address = pm.ida_address
+
+    def run(self):
+        """
+        Executes the analysis task.
+        This method is called when the task is run by a thread in the QThreadPool.
+        """
+        try:
+            # Access _convert_pm_to_mchain from the passed PatternDetectionWidget instance
+            mchain = self.pattern_detection_widget._convert_pm_to_mchain(
+                self.pm, self.mem_start_ea, self.mem_bytes, self.matcher_instance
+            )
+            if not mchain:
+                # Logging is expected to be handled within _convert_pm_to_mchain
+                return
+
+            logging.debug(
+                "Threaded: Calling _analyze_chain for MatchChain at 0x%X (pm: 0x%X)",
+                mchain.overall_start(),
+                self.pm_ida_address,  # Use stored pm_ida_address
+            )
+            # _analyze_chain is assumed to be a global function or correctly imported/defined
+            # to be accessible here. It should also be thread-safe.
+            pm_ranges = _analyze_chain(
+                mchain, self.mem_bytes, self.mem_start_ea, self.is_x64
+            )
+            self.result_ranges = pm_ranges
+            logging.debug(
+                "Threaded: _analyze_chain for 0x%X (pm: 0x%X) returned %d ranges.",
+                mchain.overall_start(),
+                self.pm_ida_address,  # Use stored pm_ida_address
+                len(self.result_ranges),
+            )
+        except Exception as e:
+            self.error = e
+            logging.error(
+                "Threaded: Error in AnalysisTask for pm at 0x%X: %s",
+                self.pm_ida_address,  # Use stored pm_ida_address
+                e,
+                exc_info=True,
+            )
+
+
 class CapstoneAnalysisRunnable(QRunnable):
     def __init__(self, data_chunk, matcher):
         super().__init__()
@@ -447,15 +574,122 @@ class CapstoneAnalysisRunnable(QRunnable):
             self.signals.auto_finished.emit()
 
 
+class PatchManager:
+    """Manages deferred patch operations."""
+
+    class Mode(enum.Enum):
+        PATCH = enum.auto()  # Use ida_bytes.patch_bytes
+        PUT = enum.auto()  # Use ida_bytes.put_bytes
+
+    def __init__(
+        self,
+        patch_mode: Mode = Mode.PATCH,
+        dry_run: bool = False,
+        auto_clear: bool = True,
+    ):
+        self.dry_run = dry_run
+        self.patch_mode = patch_mode
+        self.pending_patches: list[DeferredPatchOp] = []
+        self.auto_clear = auto_clear
+        logging.info(
+            "PatchManager initialized (dry_run=%s, mode=%s)",
+            self.dry_run,
+            self.patch_mode.name,
+        )
+
+    def add_patch(self, address: int, byte_values: bytes):
+        """Creates and queues a DeferredPatchOp."""
+        op = DeferredPatchOp(address, byte_values, self.patch_mode)
+        self.pending_patches.append(op)
+        logging.debug("Queued patch operation: %s", op)
+
+    def apply_all(self, dry_run_override: bool | None = None) -> bool:
+        """Applies all queued patch operations."""
+        logging.info("Applying %d queued patches...", len(self))
+        success_count = 0
+        fail_count = 0
+
+        if dry_run_override is None:
+            # None is a sentinel value here that represents "use the default"
+            dry_run_override = self.dry_run
+
+        for op in self.pending_patches:
+            if op.apply(dry_run_override):
+                success_count += 1
+            else:
+                fail_count += 1
+
+        logging.info(
+            "Patch application complete. Success: %d, Failed: %d",
+            success_count,
+            fail_count,
+        )
+        if self.auto_clear:
+            self.pending_patches.clear()  # Clear the list after applying
+        return fail_count == 0  # Return True if all patches were applied successfully
+
+    def __len__(self) -> int:
+        return len(self.pending_patches)
+
+
+@dataclasses.dataclass(repr=False)
+class DeferredPatchOp:
+    """Class to store patch operations that will be applied later."""
+
+    address: int
+    byte_values: bytes
+    mode: PatchManager.Mode
+    dry_run: bool = False
+
+    @classmethod
+    def patch(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PATCH, dry_run)
+
+    @classmethod
+    def put(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PUT, dry_run)
+
+    def apply(self, dry_run_override: bool = False) -> bool:
+        """Apply the patch operation using either patch_bytes or put_bytes based on mode."""
+        is_dry_run = dry_run_override or self.dry_run
+        logging.info(
+            "[*] %sPatching decrypted chunk %s at 0x%X (size: %d)",
+            "(Dry Run) " if is_dry_run else "",
+            ("revertably" if self.mode == PatchManager.Mode.PATCH else "destructively"),
+            self.address,
+            len(self.byte_values),
+        )
+        success = True
+        if is_dry_run:
+            return success
+
+        try:
+            func = (
+                idaapi.put_bytes
+                if self.mode == PatchManager.Mode.PUT
+                else idaapi.patch_bytes
+            )
+            func(self.address, self.byte_values)
+        except Exception as e:
+            logging.error(f"Failed to apply patch {self}: {e}", exc_info=True)
+            success = False
+        return success
+
+    def __str__(self):
+        """String representation with hex formatting."""
+        dry_run_str = " (dry run)" if self.dry_run else ""
+        return f"{self.__class__.__name__}({len(self.byte_values)} bytes, mode={self.mode.name}{dry_run_str} @ address=0x{self.address:X})"
+
+    __repr__ = __str__
+
+
 class PatternDetectionWidget(QWidget):
     """Main dialog for pattern detection with progress tracking and results display."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Obfuscation Pattern Detection")
-        self.setMinimumHeight(600)
-        self.setMinimumWidth(900)
-        # self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.matcher = None  # Will be set to FastPatternMatcher when needed
         self.all_patterns = []
         self.start_time = None
@@ -487,7 +721,8 @@ class PatternDetectionWidget(QWidget):
 
     def _setup_ui(self):
         """Setup the user interface."""
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         # Control section
         control_group = QGroupBox("Detection Control")
@@ -581,9 +816,8 @@ class PatternDetectionWidget(QWidget):
             ]
         )
 
-        self.proxy_model = CustomFilterProxyModel(
-            self
-        )  # Parent `self` for QObject management
+        # Parent `self` for QObject management
+        self.proxy_model = CustomFilterProxyModel(self)
         self.proxy_model.setSourceModel(self.source_model)
         self.results_tree_view.setModel(self.proxy_model)
 
@@ -591,16 +825,14 @@ class PatternDetectionWidget(QWidget):
         # allow the user to drag‐resize any column, and even reorder them
         header.setSectionsClickable(True)
         header.setSectionsMovable(True)
-
         # default to Interactive so users can drag edges
         header.setSectionResizeMode(QHeaderView.Interactive)
-
-        # auto‐grab all free space in these two human‐readable columns:
-        header.setSectionResizeMode(2, QHeaderView.Stretch)  # Description
-        header.setSectionResizeMode(4, QHeaderView.Stretch)  # Instructions
-
-        # ensure the very last section also expands into any leftover pixels
-        header.setStretchLastSection(True)
+        # for col in range(7):
+        #     header.setSectionResizeMode(col, QHeaderView.Stretch)
+        # # ensure the very last section also expands into any leftover pixels
+        last = header.model().columnCount() - 1
+        header.setSectionResizeMode(last, QHeaderView.Stretch)
+        # header.setStretchLastSection(True)
 
         results_layout.addWidget(self.results_tree_view)
 
@@ -635,7 +867,9 @@ class PatternDetectionWidget(QWidget):
 
     def _connect_signals(self):
         """Connect UI signals."""
-        self.start_btn.clicked.connect(self.start_detection)
+        self.start_btn.clicked.connect(
+            lambda: self.start_detection(ida_range.range_t(0x180001000, 0x18000191C))
+        )
         self.cancel_btn.clicked.connect(self.cancel_detection)
         self.filter_input.textChanged.connect(self.apply_filters)
         self.category_filter.currentTextChanged.connect(self.apply_filters)
@@ -665,31 +899,31 @@ class PatternDetectionWidget(QWidget):
         # self.time_label.setText("Elapsed: 0s") # Or keep last value if preferred
         QApplication.processEvents()  # Ensure UI events are processed
 
-    def start_detection(self):
+    def start_detection(self, segm_range: ida_range.range_t | None = None):
         """Start pattern detection on main thread."""
         try:
             if not self.matcher:
                 self.matcher = FastPatternMatcher()
 
-            text_seg = ida_segment.get_segm_by_name(".text")
-            if not text_seg:
-                self.handle_error("Could not find .text segment")
-                return
+            if segm_range is None:
+                segm_range = ida_segment.get_segm_by_name(".text")
+                if not segm_range:
+                    self.handle_error("Could not find .text segment")
+                    return
 
-            self.text_segment_start_ea = text_seg.start_ea
+            self.text_segment_start_ea = segm_range.start_ea
             try:
-                segment_size = text_seg.end_ea - text_seg.start_ea
                 self.text_segment_bytes = ida_bytes.get_bytes(
-                    self.text_segment_start_ea, segment_size
+                    self.text_segment_start_ea, segm_range.size()
                 )
                 if not self.text_segment_bytes:
-                    self.handle_error("Failed to read .text segment bytes.")
+                    self.handle_error("Failed to read bytes!")
                     return
                 logging.info(
-                    "Successfully read %d bytes from .text segment (0x%x - 0x%x)",
+                    "Successfully read %d bytes from range (0x%x - 0x%x)",
                     len(self.text_segment_bytes),
-                    text_seg.start_ea,
-                    text_seg.end_ea,
+                    segm_range.start_ea,
+                    segm_range.end_ea,
                 )
             except Exception as e:
                 self.handle_error(f"Error reading .text segment: {e}")
@@ -710,7 +944,7 @@ class PatternDetectionWidget(QWidget):
             self.progress_label.setText("Searching for pattern candidates...")
 
             self.candidates = self.matcher.find_pattern_candidates(
-                text_seg.start_ea, text_seg.end_ea
+                segm_range.start_ea, segm_range.end_ea
             )
             logging.info("Found %d potential pattern candidates", len(self.candidates))
 
@@ -1006,220 +1240,293 @@ class PatternDetectionWidget(QWidget):
         self.update_buttons_state()  # Reflect that no patterns might be available if cleared
         # self.detection_finished([]) # This was the original line, let's ensure state is consistent
 
-    def analysis_finished(self, unique_matches: List[PatternMatch]):
-        """Handle analysis completion from worker thread OR all runnables."""
-        logging.info(
-            "Analysis finished. Processing %d unique matches.", len(unique_matches)
-        )
-
+    def _prepare_analysis_dependencies(
+        self,
+    ) -> Optional[Tuple[capstone.Cs, bool, bytes, int, FastPatternMatcher]]:
+        """Checks and prepares dependencies for the analysis phase, including the matcher itself."""
         if (
             self.matcher is None
             or self.matcher.detector is None
             or self.matcher.detector.cs is None
         ):
-            logging.error("Capstone instance not available. Skipping _analyze_chain.")
-            self.all_patterns = unique_matches
-            self._populate_model_from_patterns()  # Uses self.all_patterns
-            self.detection_finished(self.all_patterns)
-            self.update_buttons_state()
-            return
+            logging.error(
+                "Matcher or its Capstone instance not available. Cannot proceed with detailed analysis."
+            )
+            return None
 
         if self.text_segment_bytes is None:
-            logging.error(".text segment bytes not available. Skipping _analyze_chain.")
-            self.all_patterns = unique_matches
-            self._populate_model_from_patterns()  # Uses self.all_patterns
-            self.detection_finished(self.all_patterns)
-            self.update_buttons_state()
-            return
+            logging.error(
+                ".text segment bytes not available. Cannot proceed with detailed analysis."
+            )
+            return None
 
         cs_instance = self.matcher.detector.cs
         is_x64 = cs_instance.mode == capstone.CS_MODE_64
         mem_bytes = self.text_segment_bytes
         mem_start_ea = self.text_segment_start_ea
+        return (
+            cs_instance,
+            is_x64,
+            mem_bytes,
+            mem_start_ea,
+            self.matcher,
+        )  # Add matcher to returned tuple
 
-        all_resolved_ranges: List[Range] = []
-        logging.info("Starting _analyze_chain processing for non-junk patterns.")
-
-        for pm in unique_matches:
-            if pm.category == PatternCategory.JUNK:
-                logging.debug(
-                    "Skipping JUNK pattern at 0x%X for _analyze_chain.", pm.ida_address
-                )
-                continue
-
-            current_segment_type: Optional[SegmentType] = None
-            if pm.category == PatternCategory.MULTI_PART:
-                current_segment_type = SegmentType.STAGE1_MULTIPLE
-            elif pm.category == PatternCategory.SINGLE_PART:
-                current_segment_type = SegmentType.STAGE1_SINGLE
-            else:
-                logging.warning(
-                    "Unknown pattern category %s for pm at 0x%X. Skipping.",
-                    pm.category,
-                    pm.ida_address,
-                )
-                continue
-
-            if not pm.instructions:
-                logging.warning(
-                    "PatternMatch at 0x%X has no instructions. Skipping _analyze_chain.",
-                    pm.ida_address,
-                )
-                continue
-
-            chain_instructions = pm.instructions
-            chain_start_addr = chain_instructions[0].address
-            chain_end_addr = (
-                chain_instructions[-1].address + chain_instructions[-1].size
-            )
-            chain_len = chain_end_addr - chain_start_addr
-
-            if chain_len <= 0:
-                logging.warning(
-                    "PatternMatch at 0x%X has non-positive length. Skipping.",
-                    pm.ida_address,
-                )
-                continue
-
-            chain_offset_in_mem = chain_start_addr - mem_start_ea
-            if not (
-                0 <= chain_offset_in_mem < len(mem_bytes)
-                and 0 <= chain_offset_in_mem + chain_len <= len(mem_bytes)
-            ):
-                logging.error(
-                    "PatternMatch at 0x%X (len %d) is out of text segment bounds (offset %d, mem len %d). Skipping.",
-                    chain_start_addr,
-                    chain_len,
-                    chain_offset_in_mem,
-                    len(mem_bytes),
-                )
-                continue
-
-            chain_actual_bytes = mem_bytes[
-                chain_offset_in_mem : chain_offset_in_mem + chain_len
-            ]
-
-            seg_groups = {}
-            if current_segment_type == SegmentType.STAGE1_SINGLE:
-                # Find the conditional jump instruction (heuristic: last instruction in the core pattern)
-                # The pm.instructions list is [prefix, *padding, jump]
-                jump_insn = None
-                for insn in reversed(chain_instructions):  # Search from end
-                    if self.matcher._is_conditional_jump(
-                        insn
-                    ):  # Use existing helper from FastPatternMatcher
-                        jump_insn = insn
-                        break
-                if jump_insn:
-                    seg_groups = {"jump_bytes": jump_insn.bytes}
-                    jump_offset_in_segment = jump_insn.address - chain_start_addr
-                    seg_groups["jump_offset_in_segment"] = jump_offset_in_segment
-                    logging.debug(
-                        "For SINGLE_PART at 0x%X, found jump_insn: %s %s, bytes: %s, offset_in_segment: %d",
-                        pm.ida_address,
-                        jump_insn.mnemonic,
-                        jump_insn.op_str,
-                        jump_insn.bytes.hex(),
-                        jump_offset_in_segment,
-                    )
-                else:
-                    logging.warning(
-                        "Could not find jump instruction in SINGLE_PART PatternMatch at 0x%X. Matched_groups will be empty.",
-                        pm.ida_address,
-                    )
-
-            current_segment = MatchSegment(
-                start=0,  # Relative to MatchChain's base_address
-                length=chain_len,
-                description=pm.description,
-                matched_bytes=chain_actual_bytes,
-                segment_type=current_segment_type,
-                matched_groups=seg_groups,
-            )
-            mchain = MatchChain(
-                base_address=chain_start_addr, segments=[current_segment]
-            )
-
+    def _convert_pm_to_mchain(
+        self,
+        pm: PatternMatch,
+        mem_start_ea: int,
+        mem_bytes: bytes,
+        matcher: FastPatternMatcher,
+    ) -> Optional[MatchChain]:
+        """Converts a PatternMatch object to a MatchChain for _analyze_chain."""
+        if pm.category == PatternCategory.JUNK:
             logging.debug(
-                "Calling _analyze_chain for MatchChain at 0x%X (orig pm: 0x%X)",
-                mchain.overall_start(),
+                "Skipping JUNK pattern at 0x%X for MatchChain conversion.",
                 pm.ida_address,
             )
-            try:
-                pm_ranges = _analyze_chain(mchain, mem_bytes, mem_start_ea, is_x64)
-                all_resolved_ranges.extend(pm_ranges)
-                logging.debug("  _analyze_chain returned %d ranges.", len(pm_ranges))
-            except Exception as e:
-                logging.error(
-                    "Error calling _analyze_chain for pm at 0x%X: %s",
+            return None
+
+        current_segment_type: Optional[SegmentType] = None
+        if pm.category == PatternCategory.MULTI_PART:
+            current_segment_type = SegmentType.STAGE1_MULTIPLE
+        elif pm.category == PatternCategory.SINGLE_PART:
+            current_segment_type = SegmentType.STAGE1_SINGLE
+        else:
+            logging.warning(
+                "Unknown pattern category %s for pm at 0x%X. Skipping MatchChain conversion.",
+                pm.category,
+                pm.ida_address,
+            )
+            return None
+
+        if not pm.instructions:
+            logging.warning(
+                "PatternMatch at 0x%X has no instructions. Skipping MatchChain conversion.",
+                pm.ida_address,
+            )
+            return None
+
+        chain_instructions = pm.instructions
+        chain_start_addr = chain_instructions[0].address
+        chain_end_addr = chain_instructions[-1].address + chain_instructions[-1].size
+        chain_len = chain_end_addr - chain_start_addr
+
+        if chain_len <= 0:
+            logging.warning(
+                "PatternMatch at 0x%X has non-positive length (%d). Skipping MatchChain conversion.",
+                pm.ida_address,
+                chain_len,
+            )
+            return None
+
+        chain_offset_in_mem = chain_start_addr - mem_start_ea
+        if not (
+            0 <= chain_offset_in_mem < len(mem_bytes)
+            and 0 <= chain_offset_in_mem + chain_len <= len(mem_bytes)
+        ):
+            logging.error(
+                "PatternMatch at 0x%X (len %d) is out of text segment bounds (offset %d, mem len %d). Skipping MatchChain conversion.",
+                chain_start_addr,
+                chain_len,
+                chain_offset_in_mem,
+                len(mem_bytes),
+            )
+            return None
+
+        chain_actual_bytes = mem_bytes[
+            chain_offset_in_mem : chain_offset_in_mem + chain_len
+        ]
+
+        seg_groups = {}
+        if current_segment_type == SegmentType.STAGE1_SINGLE:
+            jump_insn = None
+            for insn in reversed(chain_instructions):  # Search from end
+                if matcher._is_conditional_jump(
+                    insn
+                ):  # Use existing helper from FastPatternMatcher
+                    jump_insn = insn
+                    break
+            if jump_insn:
+                jump_offset_in_segment = jump_insn.address - chain_start_addr
+                seg_groups = {
+                    "jump_bytes": jump_insn.bytes,
+                    "jump_offset_in_segment": jump_offset_in_segment,
+                }
+                logging.debug(
+                    "For SINGLE_PART pm at 0x%X, found jump_insn: %s %s, bytes: %s, offset_in_segment: %d",
                     pm.ida_address,
-                    e,
-                    exc_info=True,
+                    jump_insn.mnemonic,
+                    jump_insn.op_str,
+                    jump_insn.bytes.hex(),
+                    jump_offset_in_segment,
+                )
+            else:
+                logging.warning(
+                    "Could not find jump instruction in SINGLE_PART PatternMatch at 0x%X. Matched_groups will be empty for MatchChain.",
+                    pm.ida_address,
                 )
 
+        current_segment = MatchSegment(
+            start=0,  # Relative to MatchChain's base_address
+            length=chain_len,
+            description=pm.description,
+            matched_bytes=chain_actual_bytes,
+            segment_type=current_segment_type,
+            matched_groups=seg_groups,
+        )
+        return MatchChain(base_address=chain_start_addr, segments=[current_segment])
+
+    def _create_pm_from_resolved_range(
+        self,
+        resolved_range: Range,
+        cs_instance: capstone.Cs,
+        mem_start_ea: int,
+        mem_bytes: bytes,
+    ) -> Optional[PatternMatch]:
+        """Creates a PatternMatch object from a resolved Range."""
+        range_start_ea = resolved_range.start
+        range_len = len(resolved_range)
+
+        range_offset_in_mem = range_start_ea - mem_start_ea
+        if not (
+            0 <= range_offset_in_mem < len(mem_bytes)
+            and 0 <= range_offset_in_mem + range_len <= len(mem_bytes)
+        ):
+            logging.error(
+                "Resolved range 0x%X (len %d) is out of text segment bounds (offset %d, mem len %d). Skipping PatternMatch creation.",
+                range_start_ea,
+                range_len,
+                range_offset_in_mem,
+                len(mem_bytes),
+            )
+            return None
+
+        range_bytes_data = mem_bytes[
+            range_offset_in_mem : range_offset_in_mem + range_len
+        ]
+        range_instructions = (
+            list(cs_instance.disasm(range_bytes_data, range_start_ea))
+            if cs_instance
+            else []
+        )
+
+        return PatternMatch(
+            category=PatternCategory.SINGLE_PART,  # Generic category for resolved blocks
+            description=f"Resolved Block: 0x{range_start_ea:X} - 0x{resolved_range.end:X}",
+            start_offset=0,  # Relative to ida_address of this new PM
+            end_offset=range_len,  # Relative to ida_address
+            instructions=range_instructions,
+            pattern_name="ResolvedBlock",
+            ida_address=range_start_ea,
+            junk_count=0,  # Junk count is not determined by this process
+            total_length=range_len,
+        )
+
+    def analysis_finished(self, unique_matches: List[PatternMatch]):
+        """Handle analysis completion by processing matches, resolving chains and overlaps."""
         logging.info(
-            "Finished _analyze_chain calls. Total resolved ranges before overlap removal: %d",
+            "Analysis finished. Received %d unique matches for further processing.",
+            len(unique_matches),
+        )
+
+        analysis_deps = self._prepare_analysis_dependencies()
+        if not analysis_deps:
+            # Fallback to showing original matches if critical dependencies are missing
+            self.all_patterns = unique_matches
+            self._populate_model_from_patterns()
+            self.detection_finished(self.all_patterns)  # Pass original patterns
+            self.update_buttons_state()
+            return
+
+        cs_instance, is_x64, mem_bytes, mem_start_ea, matcher_instance = (
+            analysis_deps  # Unpack matcher_instance
+        )
+
+        all_resolved_ranges: List[Range] = []
+        logging.info("Starting chain analysis for non-junk patterns.")
+
+        thread_pool = QThreadPool.globalInstance()
+        active_tasks = []
+        logging.info(
+            "Submitting %d analysis tasks to the thread pool.", len(unique_matches)
+        )
+
+        for pm in unique_matches:
+            task = AnalysisTask(
+                self, pm, mem_start_ea, mem_bytes, matcher_instance, is_x64
+            )
+            active_tasks.append(task)
+            thread_pool.start(task)
+
+        logging.debug(
+            "All %d tasks submitted. Waiting for completion...", len(active_tasks)
+        )
+        thread_pool.waitForDone()  # Blocks until all submitted tasks are finished
+
+        logging.debug("All tasks completed. Collecting results...")
+
+        for i, task in enumerate(active_tasks):
+            if task.error:
+                logging.warning(
+                    "Task %d for pm at 0x%X (originally 0x%X) encountered an error: %s. Skipping its results.",
+                    i + 1,  # 1-indexed task number
+                    task.pm_ida_address,
+                    task.pm.ida_address,  # In case pm_ida_address differs or for more info
+                    task.error,
+                )
+            else:
+                if task.result_ranges:  # Only extend if there are ranges
+                    all_resolved_ranges.extend(task.result_ranges)
+                    logging.debug(
+                        "Task %d for pm at 0x%X (originally 0x%X) completed, contributing %d ranges.",
+                        i + 1,
+                        task.pm_ida_address,
+                        task.pm.ida_address,
+                        len(task.result_ranges),
+                    )
+                else:
+                    logging.debug(
+                        "Task %d for pm at 0x%X (originally 0x%X) completed with no ranges.",
+                        i + 1,
+                        task.pm_ida_address,
+                        task.pm.ida_address,
+                    )
+
+        logging.info(
+            "Chain analysis complete. Total resolved ranges before overlap removal: %d",
             len(all_resolved_ranges),
         )
+
+        # resolve_overlaps is a global function
         final_interval_set = resolve_overlaps(all_resolved_ranges)
         logging.info(
-            "Overlap resolution complete. Final intervals: %d", len(final_interval_set)
+            "Overlap resolution complete. Final intervals in set: %d",
+            len(final_interval_set),
         )
-
+        patch_manager = PatchManager()
         processed_patterns_for_display: List[PatternMatch] = []
-        if final_interval_set:  # Check if IntervalSet is not empty
-            for (
-                resolved_range
-            ) in final_interval_set:  # Iterate directly if IntervalSet is iterable
-                range_start_ea = resolved_range.start
-                range_len = len(resolved_range)
-
-                range_offset_in_mem = range_start_ea - mem_start_ea
-                if not (
-                    0 <= range_offset_in_mem < len(mem_bytes)
-                    and 0 <= range_offset_in_mem + range_len <= len(mem_bytes)
-                ):
-                    logging.error(
-                        "Resolved range 0x%X (len %d) is out of text segment bounds (offset %d, mem len %d). Skipping.",
-                        range_start_ea,
-                        range_len,
-                        range_offset_in_mem,
-                        len(mem_bytes),
-                    )
-                    continue
-
-                range_bytes_data = mem_bytes[
-                    range_offset_in_mem : range_offset_in_mem + range_len
-                ]
-                range_instructions = (
-                    list(cs_instance.disasm(range_bytes_data, range_start_ea))
-                    if cs_instance
-                    else []
+        if final_interval_set:
+            for resolved_range in final_interval_set:
+                s, e = resolved_range.start, resolved_range.end
+                patch_manager.add_patch(s, b"\x90" * (e - s))
+                new_pm = self._create_pm_from_resolved_range(
+                    resolved_range, cs_instance, mem_start_ea, mem_bytes
                 )
-
-                new_pm = PatternMatch(
-                    category=PatternCategory.SINGLE_PART,  # Generic category for resolved blocks
-                    description=f"Resolved Block: 0x{range_start_ea:X} - 0x{resolved_range.end:X}",
-                    start_offset=0,  # Relative to ida_address of this new PM
-                    end_offset=range_len,  # Relative to ida_address
-                    instructions=range_instructions,
-                    pattern_name="ResolvedBlock",
-                    ida_address=range_start_ea,
-                    junk_count=0,  # Junk count is not determined by this process
-                    total_length=range_len,
-                )
-                processed_patterns_for_display.append(new_pm)
-
+                if new_pm:
+                    processed_patterns_for_display.append(new_pm)
+        logging.info(
+            "Analysis completed. Found {} patch operations.".format(len(patch_manager))
+        )
+        patch_manager.apply_all()
         logging.info(
             "Converted %d final intervals to PatternMatch objects for display.",
             len(processed_patterns_for_display),
         )
 
-        self.all_patterns = (
-            processed_patterns_for_display  # Update self.all_patterns to the new list
-        )
-        self._populate_model_from_patterns()  # This uses self.all_patterns
-        self.detection_finished(self.all_patterns)  # Pass the new list
+        self.all_patterns = processed_patterns_for_display
+        self._populate_model_from_patterns()
+        self.detection_finished(self.all_patterns)
         self.update_buttons_state()
 
     def add_pattern_to_results(self, pattern: PatternMatch):
@@ -1739,36 +2046,6 @@ class PatternDetectionWidget(QWidget):
         )
 
 
-# Legacy compatibility classes (simplified)
-class ProgressDialog:
-    """Legacy compatibility wrapper."""
-
-    def __init__(self, message="Please wait...", hide_cancel=False):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
-
-    def replace_message(self, new_message, hide_cancel=False):
-        pass
-
-    def user_canceled(self):
-        return False
-
-
-class ida_tguidm:
-    """Legacy compatibility wrapper - now handled by Qt dialog."""
-
-    def __init__(self, iterable, total=None, initial=0):
-        self.iterable = iterable
-
-    def __iter__(self):
-        return iter(self.iterable)
-
-
 # ----------------------------------------------------------------------
 # Signature-pattern cache  (pattern-string → compiled_binpat_vec_t)
 # ----------------------------------------------------------------------
@@ -2098,14 +2375,9 @@ class FastPatternMatcher:
             analysis_bytes = region_bytes[analysis_start:analysis_end]
 
             # Try to find patterns in this small region
-            region_matches = self._find_patterns_in_bytes(
+            matches = self._find_patterns_in_bytes(
                 analysis_bytes, base_address + analysis_start
             )
-
-            # Filter matches that are close to our candidate
-            for match in region_matches:
-                if abs(match.ida_address - candidate_ea) <= 20:  # Within 20 bytes
-                    matches.append(match)
 
         except Exception as e:
             logging.warning("Error analyzing candidate at 0x%x: %s", candidate_ea, e)
@@ -2173,17 +2445,19 @@ class FastPatternMatcher:
                                 )
                                 patterns.append(pattern)
                                 logging.info(
-                                    "Valid multi-part pattern found: %s with %d junk instructions (%d bytes)",
+                                    "Valid multi-part pattern found: %s with %d junk instructions (%d bytes) at 0x%x",
                                     pattern.description,
                                     junk_count,
                                     junk_bytes,
+                                    pattern.ida_address,
                                 )
                             else:
                                 logging.debug(
-                                    "Rejected multi-part pattern %s -> %s: insufficient junk (%d < 4)",
+                                    "Rejected multi-part pattern %s -> %s: insufficient junk (%d < 4) at 0x%x",
                                     first_insn.mnemonic,
                                     second_insn.mnemonic,
                                     junk_count,
+                                    first_insn.address,
                                 )
                             break
 
@@ -2230,17 +2504,19 @@ class FastPatternMatcher:
                                 )
                                 patterns.append(pattern)
                                 logging.info(
-                                    "Valid single-part pattern found: %s with %d junk instructions (%d bytes)",
+                                    "Valid single-part pattern found: %s with %d junk instructions (%d bytes at 0x%x)",
                                     pattern.description,
                                     junk_count,
                                     junk_bytes,
+                                    pattern.ida_address,
                                 )
                             else:
                                 logging.debug(
-                                    "Rejected single-part pattern %s -> %s: insufficient junk (%d < 4)",
+                                    "Rejected single-part pattern %s -> %s: insufficient junk (%d < 4) at 0x%x",
                                     first_insn.mnemonic,
                                     jump_insn.mnemonic,
                                     junk_count,
+                                    first_insn.address,
                                 )
                             break
 
@@ -2330,24 +2606,26 @@ class FastPatternMatcher:
 
         return False
 
-    def find_all_patterns_optimized(self) -> List[PatternMatch]:
+    def find_all_patterns_optimized(self, segm_range=None) -> List[PatternMatch]:
         """Main optimized pattern finding function - simplified for Qt integration."""
         all_matches = []
 
-        # Get text segment
-        text_seg = ida_segment.get_segm_by_name(".text")
-        if not text_seg:
+        if segm_range is None:
+            segm_range = ida_segment.get_segm_by_name(".text")
+        if not segm_range:
             logging.error("Could not find .text segment")
             return all_matches
 
         logging.info(
             "Starting optimized pattern detection in .text segment (0x%x - 0x%x)",
-            text_seg.start_ea,
-            text_seg.end_ea,
+            segm_range.start_ea,
+            segm_range.end_ea,
         )
 
         # Phase 1: Fast candidate search
-        candidates = self.find_pattern_candidates(text_seg.start_ea, text_seg.end_ea)
+        candidates = self.find_pattern_candidates(
+            segm_range.start_ea, segm_range.end_ea
+        )
         logging.info("Found %d potential pattern candidates", len(candidates))
 
         if not candidates:
@@ -2526,6 +2804,9 @@ class InstructionDecoder(typing.Protocol):
 
 
 class CapstoneInstructionDecoder(InstructionDecoder):
+    # Maximum x86/x64 instruction length is 15 bytes
+    MAX_INSNSZ = 16
+
     # Define register pairs for inc/pop patterns
     # Bidirectional mapping between 32-bit and 64-bit registers
     # Define base 32-bit to 64-bit register mapping
@@ -2549,24 +2830,66 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         )
         self.md.detail = True
 
-    def get_next_insn(
-        self, mem_bytes_at_ea: bytes, ea: int
-    ) -> typing.Optional[capstone.CsInsn]:
-        try:
-            # Use list comprehension and next to get the first instruction or None
-            insn = next(self.md.disasm(mem_bytes_at_ea, ea, count=1), None)
-        except capstone.CsError as e:
-            logging.error(f"Capstone decoding error at 0x{ea:X}: {e}")
+        # state:
+        self._buf: bytes = b""
+        self._base_ea: int = 0
+        self._offset: int = 0
+
+    def load_buffer(self, mem_bytes: bytes, base_ea: int) -> None:
+        """
+        Load a fresh buffer and reset the internal offset to zero.
+        You must call this before trying to disassemble.
+        """
+        self._buf = mem_bytes
+        self._base_ea = base_ea
+        self._offset = 0
+
+    def get_next_insn(self) -> typing.Optional[capstone.CsInsn]:
+        """
+        Decode the next instruction at (base_ea + offset), advance offset.
+        Returns None on decode error or end of buffer.
+        """
+        if self._offset >= len(self._buf):
             return None
+
+        code = self._buf[self._offset : self._offset + self.MAX_INSNSZ]
+        ea = self._base_ea + self._offset
+
+        try:
+            insn = next(self.md.disasm(code, ea, count=1), None)
+        except capstone.CsError as e:
+            logging.error("Capstone decoding error at 0x%X: %s", ea, e)
+            return None
+
+        if not insn:
+            logging.debug("No instruction decoded at 0x%X", ea)
+            return None
+
+        # advance by the actual size decoded
+        self._offset += insn.size
+
         logging.debug(
-            "Decoded instruction: %s %s (%X bytes) at offset %s - bytes: %s",
+            "Decoded instruction: %s %s (%d bytes) at 0x%X – raw: %s",
             insn.mnemonic,
             insn.op_str,
             insn.size,
-            hex(ea),
+            ea,
             insn.bytes.hex(),
         )
         return insn
+
+    def get_next_insns(self, count: int = 3) -> list[capstone.CsInsn]:
+        """
+        Decode up to `count` instructions, advancing offset each time.
+        Returns fewer than `count` if you hit EOF or a decode failure.
+        """
+        insns: list[capstone.CsInsn] = []
+        for _ in range(count):
+            insn = self.get_next_insn()
+            if not insn:
+                break
+            insns.append(insn)
+        return insns
 
     def decode(
         self, ea: int, mem_bytes_at_ea: bytes
@@ -2576,8 +2899,9 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         Ignores mem_bytes_at_ea, uses IDA's database.
         Conforms to DecoderProtocol.
         """
+        self.load_buffer(mem_bytes_at_ea, ea)
         # Decode using Capstone
-        insn = self.get_next_insn(mem_bytes_at_ea, ea)
+        insn = self.get_next_insn()
         if insn is None:
             return None
 
@@ -2599,41 +2923,37 @@ class CapstoneInstructionDecoder(InstructionDecoder):
                 insn.id == capstone.x86.X86_INS_INC,
                 len(insn.operands) > 0,
                 insn.operands[0].type == capstone.x86.X86_OP_REG,
-                (
-                    next_insn := self.get_next_insn(
-                        mem_bytes_at_ea, insn.address + insn.size
-                    )
-                ),
-                next_insn.id == capstone.x86.X86_INS_POP,
             )
         ):
-            if insn.operands[0].reg in self.REG_32_TO_64 and (
-                next_insn.operands[0].reg == insn.operands[0].reg
-                or next_insn.operands[0].reg == self.REG_32_TO_64[insn.operands[0].reg]
-            ):
-                decoded.is_nop = True
-                decoded.size = insn.size + next_insn.size
-                return decoded
-            elif insn.operands[0].reg in self.REG_64_TO_32 and (
-                next_insn.operands[0].reg == insn.operands[0].reg
-                or next_insn.operands[0].reg == self.REG_64_TO_32[insn.operands[0].reg]
-            ):
-                decoded.is_nop = True
-                decoded.size = insn.size + next_insn.size
-                return decoded
+            next_insn = self.get_next_insn()
+            if next_insn is not None and next_insn.id == capstone.x86.X86_INS_POP:
+                logging.debug(f"Found inc/pop pattern at 0x{insn.address:X}")
+                if insn.operands[0].reg in self.REG_32_TO_64 and (
+                    next_insn.operands[0].reg == insn.operands[0].reg
+                    or next_insn.operands[0].reg
+                    == self.REG_32_TO_64[insn.operands[0].reg]
+                ):
+                    decoded.is_nop = True
+                    decoded.size = insn.size + next_insn.size
+                    return decoded
+                elif insn.operands[0].reg in self.REG_64_TO_32 and (
+                    next_insn.operands[0].reg == insn.operands[0].reg
+                    or next_insn.operands[0].reg
+                    == self.REG_64_TO_32[insn.operands[0].reg]
+                ):
+                    decoded.is_nop = True
+                    decoded.size = insn.size + next_insn.size
+                    return decoded
         elif insn.id == capstone.x86.X86_INS_PUSH and len(insn.operands) > 0:
             # we have encountered this dead code:
             # .text:0000000180188FB2 50                                                  push    rax
             # .text:0000000180188FB3 EB FF                                               jmp     short near ptr loc_180188FB3+1
             # .text:0000000180188FB5 C0 58 ? ?                                           rcr     byte ptr [rax-?], ?
             if insn.operands[0].reg == capstone.x86.X86_REG_RAX:
-                next_insn = self.get_next_insn(
-                    mem_bytes_at_ea, insn.address + insn.size
-                )
-                if next_insn is not None and self._is_self_recursive_jump(insn):
-                    next_next_insn = self.get_next_insn(
-                        mem_bytes_at_ea, next_insn.address + next_insn.size
-                    )
+                logging.debug(f"Found push rax at 0x{insn.address:X}")
+                next_insn = self.get_next_insn()
+                if next_insn is not None and self._is_self_recursive_jump(next_insn):
+                    next_next_insn = self.get_next_insn()
                     if next_next_insn is not None and next_next_insn.bytes.startswith(
                         b"\xc0\x58"
                     ):
@@ -2707,7 +3027,7 @@ class JumpTargetAnalyzer:
         current_ea: int,
         match_end: int,
         decoder: InstructionDecoder,
-        visited: set = None,
+        visited: typing.Optional[set] = None,
         depth: int = 0,
     ) -> typing.Optional[int]:
         """
@@ -2841,7 +3161,16 @@ class JumpTargetAnalyzer:
                 return current_ea  # Return the start address of the sequence that ended
 
             # --- We have a 2-byte jump ---
-            target = decoded_insn.jump_target  # This is an absolute address
+            target = decoded_insn.jump_target
+            if target is None:
+                logging.debug(
+                    "%sChain stopped at 0x%X: Instruction is a jump but has no target. Returning start: 0x%X",
+                    indent,
+                    trace_ea,
+                    current_ea,
+                )
+                return current_ea
+
             logging.debug(
                 "%s  -> Found 2-byte jump at 0x%X targeting 0x%X",
                 indent,
@@ -2993,47 +3322,6 @@ class JumpTargetAnalyzer:
             yield final_candidate
 
 
-def _analyze_chain(
-    chain: MatchChain,
-    mem: bytes,
-    start_ea: int,
-    is_x64: bool,
-    max_size: int = MAX_PATTERN_LEN,
-) -> list[Range]:
-    """
-    Filter out false positive anti-disassembly patterns and handle overlaps.
-    Integrates with existing big instruction detection code.
-
-    Args:
-        chains: List of MatchChain objects
-        mem: Memory object containing binary data
-        start_ea: Starting effective address
-        max_size: Maximum valid size for an anti-disassembly routine (default: MAX_PATTERN_LEN)
-
-    Returns:
-        A single validated MatchChain object
-    """
-
-    # Find the big instruction
-    match_start = chain.overall_start()
-    chain_end = match_start + max_size
-    ranges = []
-
-    logging.info(f"Analyzing match: {chain.description} @ 0x{match_start:X}")
-
-    # Determine possible jump targets - using your existing code
-    jump_targets = JumpTargetAnalyzer(
-        chain.overall_matched_bytes(), match_start, chain_end, start_ea
-    ).process(mem=mem, chain=chain, is_x64=is_x64)
-
-    for target in jump_targets:
-        if target <= match_start:  # sanity-check
-            continue
-        logging.info(f"most_likely_target: 0x{target:X}, block_end: 0x{chain_end:X}")
-        ranges.append(Range(match_start, target))
-    return ranges
-
-
 def resolve_overlaps(ranges: list[Range]) -> IntervalSet:
     """
     Fast, linear-time overlap resolution: keep only the first chain
@@ -3056,31 +3344,6 @@ def resolve_overlaps(ranges: list[Range]) -> IntervalSet:
     return intervals
 
 
-# Legacy console function for backwards compatibility
-def find_obfuscation_patterns_console():
-    """Legacy console-based pattern detection."""
-    logging.basicConfig(level=logging.INFO)
-
-    matcher = FastPatternMatcher()
-    matches = matcher.find_all_patterns_optimized()
-
-    # Display results
-    if matches:
-        logging.info("\n=== Pattern Detection Results ===")
-        for i, match in enumerate(matches):
-            logging.info("%d. %s at 0x%x", i + 1, match.description, match.ida_address)
-            for insn in match.instructions:
-                logging.info("   %s %s", insn.mnemonic, insn.op_str)
-            logging.info("")
-    else:
-        logging.info("No obfuscation patterns found.")
-
-    return matches
-
-
-# Main usage functions
-
-
 def find_obfuscation_patterns():
     logging.basicConfig(level=logging.INFO)
     PatternDetectionForm.show_pattern_detection_form(
@@ -3101,8 +3364,18 @@ class PatternDetectionForm(ida_kernwin.PluginForm):
 
     # QWidget factory --------------------------------------------------
     def OnCreate(self, form):
+
+        # Get the parent widget and ensure it fills space
         parent = self.FormToPyQtWidget(form)
-        self.widget = PatternDetectionWidget(parent)  # <- your QWidget
+        parent.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # type: ignore
+
+        # Create layout for the parent
+        parent_layout = QVBoxLayout(parent)
+        parent_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Create and add our widget
+        self.widget = PatternDetectionWidget(parent)
+        parent_layout.addWidget(self.widget)
         return self.widget
 
     # tidy-up ----------------------------------------------------------
@@ -3114,13 +3387,13 @@ class PatternDetectionForm(ida_kernwin.PluginForm):
     @staticmethod
     def show_pattern_detection_form(plugin_ref):
         form = PatternDetectionForm(plugin_ref)
-
+        # show the dockable widget
+        # ida_kernwin.set_dock_pos(self.WINDOW_TITLE, "IDATopLevelDockArea", ida_kernwin.DP_RIGHT)
         form.Show(
             "Obfuscation Pattern Detection",
             ida_kernwin.PluginForm.WOPN_DP_RIGHT  # dock on the right; change to taste
-            | ida_kernwin.PluginForm.WOPN_PERSIST  # reopen with the database
-            | ida_kernwin.PluginForm.WOPN_DP_SZHINT  # use the widget's size hint to determine the best geometry (Qt only)
-            | ida_kernwin.PluginForm.WOPN_TAB,  # allow tab-docking
+            | ida_kernwin.PluginForm.WOPN_DP_SZHINT,
+            # | ida_kernwin.PluginForm.WOPN_TAB,  # allow tab-docking
         )
         return form
 
@@ -3153,11 +3426,5 @@ def PLUGIN_ENTRY():  # IDA looks for this symbol
     return pattern_detect_t()
 
 
-# Example usage
 if __name__ == "__main__":
-    # Show the modern Qt-based pattern detection dialog with junk filtering
     PatternDetectionForm.show_pattern_detection_form(weakref.ref(PatternDetectionForm))
-
-    # Alternative: Use the legacy console-based detection
-    # patterns = find_obfuscation_patterns_console()
-    # print(f"Detection complete. Found {len(patterns)} patterns.")
