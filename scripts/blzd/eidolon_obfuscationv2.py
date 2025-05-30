@@ -10,6 +10,7 @@ import collections
 import dataclasses
 import datetime
 import enum
+import functools
 import json
 import logging
 import re
@@ -21,7 +22,7 @@ import weakref
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from PyQt5.QtCore import (
     QModelIndex,
@@ -683,6 +684,227 @@ class DeferredPatchOp:
     __repr__ = __str__
 
 
+@dataclasses.dataclass
+class CodeRegionSlicer:
+    """Handles slicing of code regions around a candidate address."""
+
+    region_size_before: int
+    region_size_after: int
+    max_total_region_size: int
+
+    _EMPTY_ITERATOR: Iterator[Tuple[int, bytes, int]] = dataclasses.field(
+        default_factory=lambda: iter([]), init=False, repr=False
+    )
+
+    def __call__(
+        self,
+        segment_start_ea: int,
+        segment_bytes: bytes,
+        candidates: list[int],
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> Iterator[Tuple[int, bytes, int]]:
+        """
+        Slices a region of bytes around the candidate_ea within the segment_bytes.
+
+        Args:
+            candidate_ea: The effective address of the candidate.
+            segment_start_ea: The starting EA of the segment_bytes.
+            segment_bytes: The byte content of the entire segment.
+            candidates: A list of candidate effective addresses.
+            progress_callback: A function to call with the index of the current candidate. If None, no progress will be reported. If callback returns False, the loop will be terminated.
+
+        Returns:
+            An iterator that yields tuples of (region_bytes_slice, slice_base_ea) for each candidate.
+        """
+        if not segment_bytes:
+            logging.warning("Segment bytes are empty, cannot slice.")
+            yield from self._EMPTY_ITERATOR
+
+        for idx, candidate_ea in enumerate(candidates):
+            region_bytes_slice, slice_base_ea = self.get_slice(
+                candidate_ea, segment_start_ea, segment_bytes
+            )
+            if region_bytes_slice and slice_base_ea is not None:
+                yield candidate_ea, region_bytes_slice, slice_base_ea
+            if progress_callback and progress_callback(idx) is False:
+                break
+
+    def get_slice(
+        self,
+        candidate_ea: int,
+        segment_start_ea: int,
+        segment_bytes: bytes,
+    ) -> Tuple[Optional[bytes], Optional[int]]:
+        """
+        Slices a region of bytes around the candidate_ea within the segment_bytes.
+
+        Args:
+            candidate_ea: The effective address of the candidate.
+            segment_start_ea: The starting EA of the segment_bytes.
+            segment_bytes: The byte content of the entire segment.
+
+        Returns:
+            A tuple containing:
+            - region_bytes_slice: The sliced bytes, or None if slicing fails.
+            - slice_base_ea: The base EA of the slice, or None if slicing fails.
+        """
+        if not segment_bytes:
+            logging.warning("Segment bytes are empty, cannot slice.")
+            return None, None
+
+        candidate_offset_in_segment = candidate_ea - segment_start_ea
+        if not (0 <= candidate_offset_in_segment < len(segment_bytes)):
+            logging.warning(
+                "Candidate EA 0x%x is outside the segment bounds (0x%x - 0x%x).",
+                candidate_ea,
+                segment_start_ea,
+                segment_start_ea + len(segment_bytes) - 1,
+            )
+            return None, None
+
+        slice_start_offset = max(
+            0, candidate_offset_in_segment - self.region_size_before
+        )
+        slice_end_offset = min(
+            len(segment_bytes),
+            candidate_offset_in_segment + self.region_size_after,
+        )
+
+        current_slice_len = slice_end_offset - slice_start_offset
+        if current_slice_len <= 0:  # Ensure slice has positive length
+            logging.warning(
+                "Calculated slice for candidate 0x%x has zero or negative length (%d:%d).",
+                candidate_ea,
+                slice_start_offset,
+                slice_end_offset,
+            )
+            return None, None
+
+        if current_slice_len > self.max_total_region_size:
+            excess = current_slice_len - self.max_total_region_size
+            shrink_before = excess // 2
+            shrink_after = excess - shrink_before
+
+            temp_slice_start = slice_start_offset + shrink_before
+            temp_slice_end = slice_end_offset - shrink_after
+
+            # Adjust if candidate is pushed out of bounds by shrinking
+            if candidate_offset_in_segment < temp_slice_start:
+                # Candidate is before the adjusted start, anchor start to candidate
+                temp_slice_start = candidate_offset_in_segment
+                temp_slice_end = temp_slice_start + self.max_total_region_size
+            elif candidate_offset_in_segment >= temp_slice_end:
+                # Candidate is at or after the adjusted end, anchor end to candidate + 1
+                temp_slice_end = (
+                    candidate_offset_in_segment + 1
+                )  # Slice end is exclusive
+                temp_slice_start = temp_slice_end - self.max_total_region_size
+
+            slice_start_offset = max(0, temp_slice_start)
+            slice_end_offset = min(len(segment_bytes), temp_slice_end)
+
+            # Final check for positive length after adjustments
+            if slice_end_offset <= slice_start_offset:
+                logging.warning(
+                    "Adjusted slice for candidate 0x%x has zero or negative length (%d:%d) after max_total_region_size constraint.",
+                    candidate_ea,
+                    slice_start_offset,
+                    slice_end_offset,
+                )
+                return None, None
+
+        region_bytes_slice = segment_bytes[slice_start_offset:slice_end_offset]
+        slice_base_ea = segment_start_ea + slice_start_offset
+
+        if (
+            not region_bytes_slice
+        ):  # Should be caught by length checks, but as a safeguard
+            logging.warning(
+                "Empty byte slice for candidate at 0x%x (offset %d, slice %d:%d in segment) despite positive length assertion.",
+                candidate_ea,
+                candidate_offset_in_segment,
+                slice_start_offset,
+                slice_end_offset,
+            )
+            return None, None
+
+        return region_bytes_slice, slice_base_ea
+
+
+@dataclass
+class CheckContinuePrompt:
+    """Decorator that checks if user wants to continue after elapsed time.
+
+    Args:
+        metadata: Dictionary containing metadata to format into the prompt message
+        cancel_func: Function to call if user cancels
+        enable_prompt: Whether to enable the continue prompt
+        start_time: Optional start time, will be initialized if None
+        prompt_interval: Initial time before first prompt in seconds
+        logger: Optional logger instance
+    """
+
+    metadata: dict | None = None
+    cancel_func: Callable[[], None] | None = None
+    enable_prompt: bool = True
+    start_time: float = 0.0
+    prompt_interval: int = 120
+    logger: logging.Logger | None = None
+
+    def __post_init__(self):
+        current_time = time.time()
+        self.start_time = current_time if self.start_time == 0.0 else self.start_time
+        self.next_prompt_time = self.start_time + self.prompt_interval
+
+    @property
+    def elapsed_time(self) -> float:
+        return time.time() - self.start_time
+
+    def __call__(self, func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not self.enable_prompt:
+                return func(*args, **kwargs)
+
+            if self.elapsed_time < self.next_prompt_time:
+                return func(*args, **kwargs)
+
+            minutes = int(self.elapsed_time / 60)
+            seconds = int(self.elapsed_time % 60)
+            time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+            # Format metadata into message
+            message = f"{func.__name__} has been running for {time_str}.\n\n"
+            if self.metadata:
+                for key, value in self.metadata.items():
+                    message += f"{key}: {value}\n"
+            message += "\nContinue?"
+
+            reply = QMessageBox.question(
+                self,
+                "Continue execution?",
+                message,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+
+            if reply == QMessageBox.No:
+                if self.cancel_func:
+                    return self.cancel_func()
+                raise UserCanceledError("User canceled")
+
+            self.next_prompt_time *= 2
+            if self.logger is not None:
+                self.logger.info(
+                    "Next prompt will be at %d seconds (%.1f minutes)",
+                    self.next_prompt_time,
+                    self.next_prompt_time / 60.0,
+                )
+            return func(*args, **kwargs)
+
+        return wrapper
+
+
 class PatternDetectionWidget(QWidget):
     """Main dialog for pattern detection with progress tracking and results display."""
 
@@ -697,6 +919,13 @@ class PatternDetectionWidget(QWidget):
         self.enable_continue_prompt = False
         self.text_segment_bytes: Optional[bytes] = None
         self.text_segment_start_ea: int = 0
+
+        # Initialize the code slicer
+        self.code_slicer = CodeRegionSlicer(
+            region_size_before=0,
+            region_size_after=MAX_PATTERN_LEN,
+            max_total_region_size=MAX_PATTERN_LEN,
+        )
 
         # Thread pool for Capstone analysis
         self.thread_pool = QThreadPool.globalInstance()
@@ -934,12 +1163,10 @@ class PatternDetectionWidget(QWidget):
             self.progress_bar.setValue(0)
             self.all_patterns.clear()
             self.source_model.removeRows(0, self.source_model.rowCount())
-            self.start_time = time.time()
             self.time_label.setText("Elapsed: 0s")  # Reset display at start
             self.ui_update_timer.start(
                 1000
             )  # Start UI update timer (1 second interval)
-            self.next_prompt_time = 120
 
             self.progress_label.setText("Searching for pattern candidates...")
 
@@ -959,57 +1186,17 @@ class PatternDetectionWidget(QWidget):
             self.candidates_data = []
             total_candidates = len(self.candidates)
 
-            for idx, candidate_ea in enumerate(self.candidates):
+            @CheckContinuePrompt(
+                metadata={"Total Candidates": total_candidates},
+                cancel_func=self.cancel_detection,
+                enable_prompt=self.enable_continue_prompt,
+                logger=logging.getLogger(),
+            )
+            def progress_callback(idx: int):
                 if self.cancel_btn.isEnabled() == False:  # Check if cancelled
                     logging.info("Data preparation cancelled.")
                     self.detection_finished([])  # Or handle cancellation more formally
-                    return
-
-                # Slicing logic from old process_next_batch
-                region_size_before = 50
-                region_size_after = 50
-                max_total_region_size = 100
-                candidate_offset_in_segment = candidate_ea - self.text_segment_start_ea
-                slice_start_offset = max(
-                    0, candidate_offset_in_segment - region_size_before
-                )
-                slice_end_offset = min(
-                    len(self.text_segment_bytes),
-                    candidate_offset_in_segment + region_size_after,
-                )
-                current_slice_len = slice_end_offset - slice_start_offset
-                if current_slice_len > max_total_region_size:
-                    excess = current_slice_len - max_total_region_size
-                    shrink_before = excess // 2
-                    shrink_after = excess - shrink_before
-                    temp_slice_start = slice_start_offset + shrink_before
-                    temp_slice_end = slice_end_offset - shrink_after
-                    if candidate_offset_in_segment < temp_slice_start:
-                        temp_slice_start = candidate_offset_in_segment
-                        temp_slice_end = temp_slice_start + max_total_region_size
-                    elif candidate_offset_in_segment >= temp_slice_end:
-                        temp_slice_end = candidate_offset_in_segment + 1
-                        temp_slice_start = temp_slice_end - max_total_region_size
-                    slice_start_offset = max(0, temp_slice_start)
-                    slice_end_offset = min(len(self.text_segment_bytes), temp_slice_end)
-
-                region_bytes_slice = self.text_segment_bytes[
-                    slice_start_offset:slice_end_offset
-                ]
-                slice_base_ea = self.text_segment_start_ea + slice_start_offset
-
-                if region_bytes_slice:
-                    self.candidates_data.append(
-                        (candidate_ea, region_bytes_slice, slice_base_ea)
-                    )
-                else:
-                    logging.warning(
-                        "Empty byte slice for candidate at 0x%x (offset %d, slice %d:%d in segment)",
-                        candidate_ea,
-                        candidate_offset_in_segment,
-                        slice_start_offset,
-                        slice_end_offset,
-                    )
+                    return False
 
                 # Update progress for data preparation (10% to 50% range)
                 if total_candidates > 0 and (
@@ -1022,33 +1209,75 @@ class PatternDetectionWidget(QWidget):
                         f"Preparing data for candidate {idx + 1}/{total_candidates}"
                     )
 
-                # Check for user prompt to continue (if enabled and time elapsed)
-                if self.start_time is not None and self.enable_continue_prompt:
-                    elapsed_time = time.time() - self.start_time
-                    if elapsed_time >= self.next_prompt_time:
-                        minutes = int(elapsed_time / 60)
-                        seconds = int(elapsed_time % 60)
-                        time_str = (
-                            f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-                        )
-                        reply = QMessageBox.question(
-                            self,
-                            "Continue Detection?",
-                            f"Data preparation has been running for {time_str}.\n\nThis phase processes {total_candidates} candidates.\nContinue?",
-                            QMessageBox.Yes | QMessageBox.No,
-                            QMessageBox.No,
-                        )
-                        if reply == QMessageBox.No:
-                            self.cancel_detection()  # This will set cancel_btn state
-                            return
-                        else:
-                            self.next_prompt_time *= 2  # Postpone next prompt
-                            logging.info(
-                                "Next prompt will be at %d seconds (%.1f minutes)",
-                                self.next_prompt_time,
-                                self.next_prompt_time / 60.0,
-                            )
-                            # No timer to restart, loop continues
+            for code_slice in self.code_slicer(
+                self.text_segment_start_ea,
+                self.text_segment_bytes,
+                self.candidates,
+                progress_callback,
+            ):
+                self.candidates_data.append(code_slice)
+
+            # for idx, candidate_ea in enumerate(self.candidates):
+
+            #     if self.code_slicer and self.text_segment_bytes is not None:
+            #         region_bytes_slice, slice_base_ea = self.code_slicer.get_slice(
+            #             candidate_ea,
+            #             self.text_segment_start_ea,
+            #             self.text_segment_bytes,
+            #         )
+
+            #         if region_bytes_slice and slice_base_ea is not None:
+            #             self.candidates_data.append(
+            #                 (candidate_ea, region_bytes_slice, slice_base_ea)
+            #             )
+            #         else:
+            #             # Logging is handled within get_slice
+            #             pass  # Continue to next candidate
+            #     else:
+            #         logging.error(
+            #             "Code slicer or text_segment_bytes not initialized. Skipping candidate 0x%x",
+            #             candidate_ea,
+            #         )
+            #         continue
+
+            #     # Update progress for data preparation (10% to 50% range)
+            #     if total_candidates > 0 and (
+            #         idx % (total_candidates // 100 + 1) == 0
+            #         or idx == total_candidates - 1
+            #     ):  # Update roughly 100 times or at the end
+            #         progress = int(10 + (idx / total_candidates) * 40)
+            #         self.progress_bar.setValue(progress)
+            #         self.progress_label.setText(
+            #             f"Preparing data for candidate {idx + 1}/{total_candidates}"
+            #         )
+
+            #     # Check for user prompt to continue (if enabled and time elapsed)
+            #     if self.start_time is not None and self.enable_continue_prompt:
+            #         elapsed_time = time.time() - self.start_time
+            #         if elapsed_time >= self.next_prompt_time:
+            #             minutes = int(elapsed_time / 60)
+            #             seconds = int(elapsed_time % 60)
+            #             time_str = (
+            #                 f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+            #             )
+            #             reply = QMessageBox.question(
+            #                 self,
+            #                 "Continue Detection?",
+            #                 f"Data preparation phase is processing {total_candidates} candidates.\nContinue?",
+            #                 QMessageBox.Yes | QMessageBox.No,
+            #                 QMessageBox.No,
+            #             )
+            #             if reply == QMessageBox.No:
+            #                 self.cancel_detection()  # This will set cancel_btn state
+            #                 return
+            #             else:
+            #                 self.next_prompt_time *= 2  # Postpone next prompt
+            #                 logging.info(
+            #                     "Next prompt will be at %d seconds (%.1f minutes)",
+            #                     self.next_prompt_time,
+            #                     self.next_prompt_time / 60.0,
+            #                 )
+            #                 # No timer to restart, loop continues
 
             if (
                 not self.cancel_btn.isEnabled()
