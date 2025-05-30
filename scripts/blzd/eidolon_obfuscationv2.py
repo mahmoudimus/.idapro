@@ -923,7 +923,7 @@ class PatternDetectionWidget(QWidget):
             )  # int() here, after division by 2.0
             self.progress_bar.setValue(min(100, new_progress_value))
             self.progress_label.setText(
-                f"{base_text} (Processed: {analysis_phase_percentage_float}%)"
+                f"{base_text} (Processed: {round(analysis_phase_percentage_float, 2)}%)"
             )
             # logging.debug(
             #     "_handle_runnable_result: Updated self.items_processed_count to %d. Progress bar set to %d%%. Label: %s",
@@ -995,13 +995,231 @@ class PatternDetectionWidget(QWidget):
         # True cancellation would require runnables to periodically check a flag.
         # For now, we let them finish their current small chunk.
         self.active_runnables = 0
-        self.detection_finished([])
+        # When cancelling, ensure we call detection_finished with empty list or current if partial results are okay
+        # For a clean cancel, pass empty.
+        self.progress_label.setText("Detection cancelled.")
+        self.progress_bar.setValue(
+            0
+        )  # Or 100 if treating cancel as "completion" of cancel op
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.update_buttons_state()  # Reflect that no patterns might be available if cleared
+        # self.detection_finished([]) # This was the original line, let's ensure state is consistent
 
-    def analysis_finished(self, patterns: List[PatternMatch]):
+    def analysis_finished(self, unique_matches: List[PatternMatch]):
         """Handle analysis completion from worker thread OR all runnables."""
-        self.all_patterns = patterns
-        self._populate_model_from_patterns()
-        self.detection_finished(patterns)
+        logging.info(
+            "Analysis finished. Processing %d unique matches.", len(unique_matches)
+        )
+
+        if (
+            self.matcher is None
+            or self.matcher.detector is None
+            or self.matcher.detector.cs is None
+        ):
+            logging.error("Capstone instance not available. Skipping _analyze_chain.")
+            self.all_patterns = unique_matches
+            self._populate_model_from_patterns()  # Uses self.all_patterns
+            self.detection_finished(self.all_patterns)
+            self.update_buttons_state()
+            return
+
+        if self.text_segment_bytes is None:
+            logging.error(".text segment bytes not available. Skipping _analyze_chain.")
+            self.all_patterns = unique_matches
+            self._populate_model_from_patterns()  # Uses self.all_patterns
+            self.detection_finished(self.all_patterns)
+            self.update_buttons_state()
+            return
+
+        cs_instance = self.matcher.detector.cs
+        is_x64 = cs_instance.mode == capstone.CS_MODE_64
+        mem_bytes = self.text_segment_bytes
+        mem_start_ea = self.text_segment_start_ea
+
+        all_resolved_ranges: List[Range] = []
+        logging.info("Starting _analyze_chain processing for non-junk patterns.")
+
+        for pm in unique_matches:
+            if pm.category == PatternCategory.JUNK:
+                logging.debug(
+                    "Skipping JUNK pattern at 0x%X for _analyze_chain.", pm.ida_address
+                )
+                continue
+
+            current_segment_type: Optional[SegmentType] = None
+            if pm.category == PatternCategory.MULTI_PART:
+                current_segment_type = SegmentType.STAGE1_MULTIPLE
+            elif pm.category == PatternCategory.SINGLE_PART:
+                current_segment_type = SegmentType.STAGE1_SINGLE
+            else:
+                logging.warning(
+                    "Unknown pattern category %s for pm at 0x%X. Skipping.",
+                    pm.category,
+                    pm.ida_address,
+                )
+                continue
+
+            if not pm.instructions:
+                logging.warning(
+                    "PatternMatch at 0x%X has no instructions. Skipping _analyze_chain.",
+                    pm.ida_address,
+                )
+                continue
+
+            chain_instructions = pm.instructions
+            chain_start_addr = chain_instructions[0].address
+            chain_end_addr = (
+                chain_instructions[-1].address + chain_instructions[-1].size
+            )
+            chain_len = chain_end_addr - chain_start_addr
+
+            if chain_len <= 0:
+                logging.warning(
+                    "PatternMatch at 0x%X has non-positive length. Skipping.",
+                    pm.ida_address,
+                )
+                continue
+
+            chain_offset_in_mem = chain_start_addr - mem_start_ea
+            if not (
+                0 <= chain_offset_in_mem < len(mem_bytes)
+                and 0 <= chain_offset_in_mem + chain_len <= len(mem_bytes)
+            ):
+                logging.error(
+                    "PatternMatch at 0x%X (len %d) is out of text segment bounds (offset %d, mem len %d). Skipping.",
+                    chain_start_addr,
+                    chain_len,
+                    chain_offset_in_mem,
+                    len(mem_bytes),
+                )
+                continue
+
+            chain_actual_bytes = mem_bytes[
+                chain_offset_in_mem : chain_offset_in_mem + chain_len
+            ]
+
+            seg_groups = {}
+            if current_segment_type == SegmentType.STAGE1_SINGLE:
+                # Find the conditional jump instruction (heuristic: last instruction in the core pattern)
+                # The pm.instructions list is [prefix, *padding, jump]
+                jump_insn = None
+                for insn in reversed(chain_instructions):  # Search from end
+                    if self.matcher._is_conditional_jump(
+                        insn
+                    ):  # Use existing helper from FastPatternMatcher
+                        jump_insn = insn
+                        break
+                if jump_insn:
+                    seg_groups = {"jump_bytes": jump_insn.bytes}
+                    jump_offset_in_segment = jump_insn.address - chain_start_addr
+                    seg_groups["jump_offset_in_segment"] = jump_offset_in_segment
+                    logging.debug(
+                        "For SINGLE_PART at 0x%X, found jump_insn: %s %s, bytes: %s, offset_in_segment: %d",
+                        pm.ida_address,
+                        jump_insn.mnemonic,
+                        jump_insn.op_str,
+                        jump_insn.bytes.hex(),
+                        jump_offset_in_segment,
+                    )
+                else:
+                    logging.warning(
+                        "Could not find jump instruction in SINGLE_PART PatternMatch at 0x%X. Matched_groups will be empty.",
+                        pm.ida_address,
+                    )
+
+            current_segment = MatchSegment(
+                start=0,  # Relative to MatchChain's base_address
+                length=chain_len,
+                description=pm.description,
+                matched_bytes=chain_actual_bytes,
+                segment_type=current_segment_type,
+                matched_groups=seg_groups,
+            )
+            mchain = MatchChain(
+                base_address=chain_start_addr, segments=[current_segment]
+            )
+
+            logging.debug(
+                "Calling _analyze_chain for MatchChain at 0x%X (orig pm: 0x%X)",
+                mchain.overall_start(),
+                pm.ida_address,
+            )
+            try:
+                pm_ranges = _analyze_chain(mchain, mem_bytes, mem_start_ea, is_x64)
+                all_resolved_ranges.extend(pm_ranges)
+                logging.debug("  _analyze_chain returned %d ranges.", len(pm_ranges))
+            except Exception as e:
+                logging.error(
+                    "Error calling _analyze_chain for pm at 0x%X: %s",
+                    pm.ida_address,
+                    e,
+                    exc_info=True,
+                )
+
+        logging.info(
+            "Finished _analyze_chain calls. Total resolved ranges before overlap removal: %d",
+            len(all_resolved_ranges),
+        )
+        final_interval_set = resolve_overlaps(all_resolved_ranges)
+        logging.info(
+            "Overlap resolution complete. Final intervals: %d", len(final_interval_set)
+        )
+
+        processed_patterns_for_display: List[PatternMatch] = []
+        if final_interval_set:  # Check if IntervalSet is not empty
+            for (
+                resolved_range
+            ) in final_interval_set:  # Iterate directly if IntervalSet is iterable
+                range_start_ea = resolved_range.start
+                range_len = len(resolved_range)
+
+                range_offset_in_mem = range_start_ea - mem_start_ea
+                if not (
+                    0 <= range_offset_in_mem < len(mem_bytes)
+                    and 0 <= range_offset_in_mem + range_len <= len(mem_bytes)
+                ):
+                    logging.error(
+                        "Resolved range 0x%X (len %d) is out of text segment bounds (offset %d, mem len %d). Skipping.",
+                        range_start_ea,
+                        range_len,
+                        range_offset_in_mem,
+                        len(mem_bytes),
+                    )
+                    continue
+
+                range_bytes_data = mem_bytes[
+                    range_offset_in_mem : range_offset_in_mem + range_len
+                ]
+                range_instructions = (
+                    list(cs_instance.disasm(range_bytes_data, range_start_ea))
+                    if cs_instance
+                    else []
+                )
+
+                new_pm = PatternMatch(
+                    category=PatternCategory.SINGLE_PART,  # Generic category for resolved blocks
+                    description=f"Resolved Block: 0x{range_start_ea:X} - 0x{resolved_range.end:X}",
+                    start_offset=0,  # Relative to ida_address of this new PM
+                    end_offset=range_len,  # Relative to ida_address
+                    instructions=range_instructions,
+                    pattern_name="ResolvedBlock",
+                    ida_address=range_start_ea,
+                    junk_count=0,  # Junk count is not determined by this process
+                    total_length=range_len,
+                )
+                processed_patterns_for_display.append(new_pm)
+
+        logging.info(
+            "Converted %d final intervals to PatternMatch objects for display.",
+            len(processed_patterns_for_display),
+        )
+
+        self.all_patterns = (
+            processed_patterns_for_display  # Update self.all_patterns to the new list
+        )
+        self._populate_model_from_patterns()  # This uses self.all_patterns
+        self.detection_finished(self.all_patterns)  # Pass the new list
         self.update_buttons_state()
 
     def add_pattern_to_results(self, pattern: PatternMatch):
@@ -1618,7 +1836,8 @@ JUNK_PATTERNS = [
     JunkPatternMetadata(rb"(?P<junk>\x6A.)", "PUSH imm8"),
     JunkPatternMetadata(rb"(?P<junk>[\x70-\x7F].)", "Random 0x70-0x7F jump"),
     JunkPatternMetadata(rb"(?P<junk>[\x50-\x5F])", "Single-byte PUSH/POP"),
-    JunkPatternMetadata(rb"(?P<junk>[\x66\x90]\x90)", "Two-byte NOP"),
+    JunkPatternMetadata(rb"(?P<junk>\x66\x90)", "Two-byte NOP"),
+    JunkPatternMetadata(rb"(?P<junk>\x90\x90)", "Two-byte NOP"),
     JunkPatternMetadata(rb"(?P<junk>\x6B.)", "IMUL reg32, r/m32, imm8"),
     JunkPatternMetadata(
         rb"(?P<junk>[\xC0][\x18-\x1F\x58-\x5F\x98-\x9F\xD8-\xDF]....)",
@@ -2251,7 +2470,7 @@ class IntervalSet:
             new = new.merge(self._ranges[idx])
             del self._ranges[idx]
 
-        # Also coalesce “touching” intervals (…,end==new.start or vice-versa)
+        # Also coalesce "touching" intervals (…,end==new.start or vice-versa)
         if idx < len(self._ranges) and new.end == self._ranges[idx].start:
             new = new.merge(self._ranges[idx])
             del self._ranges[idx]
@@ -2677,7 +2896,7 @@ class JumpTargetAnalyzer:
 
         while offset < n:
             try:
-                # hand the decoder only the bytes we haven’t consumed yet
+                # hand the decoder only the bytes we haven't consumed yet
                 insn = decoder.decode(start + offset, match_bytes[offset:])
             except Exception as e:
                 logging.error("Decode error @0x%X: %s", start + offset, e)
@@ -2705,15 +2924,38 @@ class JumpTargetAnalyzer:
         )
         match chain.stage1_type:
             case SegmentType.STAGE1_SINGLE:
-                jump_offset = chain.segments[0].length - (
-                    len(chain.segments[0].matched_groups["jump"]) // 2
+                if "jump_offset_in_segment" not in chain.segments[0].matched_groups:
+                    logging.error(
+                        "JumpTargetAnalyzer: 'jump_offset_in_segment' not found in matched_groups for STAGE1_SINGLE. Chain: %s",
+                        chain,
+                    )
+                    return self  # or consider raising an error / returning empty to signify failure
+
+                jump_offset_in_segment = chain.segments[0].matched_groups[
+                    "jump_offset_in_segment"
+                ]
+                jump_ea = self.match_start + jump_offset_in_segment
+                logging.debug(
+                    "STAGE1_SINGLE: match_start=0x%X, jump_offset_in_segment=%d, calculated jump_ea=0x%X",
+                    self.match_start,
+                    jump_offset_in_segment,
+                    jump_ea,
                 )
-                jump_ea = self.match_start + jump_offset
+
             case SegmentType.STAGE1_MULTIPLE:
+                # For multi-part, the first instruction in the chain *is* the jump.
+                # The MatchChain's base_address (self.match_start here) is the jump_ea.
                 jump_offset = 0
                 jump_ea = self.match_start + jump_offset
+                logging.debug(
+                    "STAGE1_MULTIPLE: match_start=0x%X, jump_ea=0x%X",
+                    self.match_start,
+                    jump_ea,
+                )
             case _:
-                raise ValueError(f"Invalid stage1_type: {chain.stage1_type}")
+                logging.error(
+                    f"Invalid stage1_type: {chain.stage1_type} for chain: {chain}"
+                )
 
         final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
         if not final_target:
