@@ -3493,7 +3493,7 @@ class JumpTargetAnalyzer:
                     "jump_offset_in_segment"
                 ]
                 jump_ea = self.match_start + jump_offset_in_segment
-                logging.debug(
+                logging.info(
                     "STAGE1_SINGLE: match_start=0x%X, jump_offset_in_segment=%d, calculated jump_ea=0x%X",
                     self.match_start,
                     jump_offset_in_segment,
@@ -3505,7 +3505,7 @@ class JumpTargetAnalyzer:
                 # The MatchChain's base_address (self.match_start here) is the jump_ea.
                 jump_offset = 0
                 jump_ea = self.match_start + jump_offset
-                logging.debug(
+                logging.info(
                     "STAGE1_MULTIPLE: match_start=0x%X, jump_ea=0x%X",
                     self.match_start,
                     jump_ea,
