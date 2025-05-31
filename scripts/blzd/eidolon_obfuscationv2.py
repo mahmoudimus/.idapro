@@ -1571,7 +1571,7 @@ class PatternDetectionWidget(QWidget):
         logging.info(
             "Analysis completed. Found {} patch operations.".format(len(patch_manager))
         )
-        # patch_manager.apply_all()
+        patch_manager.apply_all()
         logging.info(
             "Converted %d final intervals to PatternMatch objects for display.",
             len(processed_patterns_for_display),
@@ -3106,10 +3106,11 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         Decode the next instruction at (base_ea + offset), advance offset.
         Returns None on decode error or end of buffer.
         """
-        if self._offset >= len(self._buf):
+        buf_len = len(self._buf)
+        if self._offset >= buf_len:
             return None
 
-        end_offset = min(self._offset + self.MAX_INSNSZ, len(self._buf) - 1)
+        end_offset = min(self._offset + self.MAX_INSNSZ, buf_len)
         try:
             code = self._buf[self._offset : end_offset]
         except IndexError:
@@ -3181,13 +3182,9 @@ class CapstoneInstructionDecoder(InstructionDecoder):
             if op1.type == op2.type and op1.size == op2.size and op1.reg == op2.reg:
                 decoded.is_nop = True
         # Handle 'inc eax' followed by 'pop rax' as a NOP pattern
-        elif all(
-            (
-                insn.id == capstone.x86.X86_INS_INC,
-                len(insn.operands) > 0,
-                insn.operands[0].type == capstone.x86.X86_OP_REG,
-            )
-        ):
+        elif (insn.id == capstone.x86.X86_INS_INC and
+              len(insn.operands) > 0 and
+              insn.operands[0].type == capstone.x86.X86_OP_REG):
             next_insn = self.get_next_insn()
             if next_insn is not None and next_insn.id == capstone.x86.X86_INS_POP:
                 logging.debug(f"Found inc/pop pattern at 0x{insn.address:X}")
@@ -3669,7 +3666,7 @@ def resolve_overlaps(ranges: list[Range]) -> IntervalSet:
 
         if intervals.covers(r.start):
             # this is likely a false positive anti-disassembly pattern that we've already seen
-            logging.info(f"  Rejected overlap: {r} (already covered by {last_range})")
+            logging.debug(f"  Rejected overlap: {r} (already covered by {last_range})")
             continue
 
         intervals.add(r)
