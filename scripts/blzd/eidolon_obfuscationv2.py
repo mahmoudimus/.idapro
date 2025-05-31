@@ -13,6 +13,7 @@ import enum
 import functools
 import json
 import logging
+import multiprocessing
 import re
 import sys  # For sys.exc_info()
 import time
@@ -22,6 +23,7 @@ import weakref
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from itertools import chain
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from PyQt5.QtCore import (
@@ -223,94 +225,6 @@ class MatchChain:
         return "\n".join(r)
 
 
-@dataclass
-class PatternMatch:
-    """Represents a successful pattern match with detailed information."""
-
-    category: PatternCategory
-    description: str
-    start_offset: int
-    end_offset: int
-    instructions: List[capstone.CsInsn]
-    pattern_name: str
-    ida_address: int = 0  # IDA virtual address
-    junk_count: int = 0  # Number of junk instructions following the pattern
-    total_length: int = 0  # Total length including junk instructions
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert pattern match to dictionary for JSON serialization."""
-        # Convert capstone instructions to serializable format
-        serialized_instructions = []
-        for insn in self.instructions:
-            serialized_instructions.append(
-                {
-                    "address": insn.address,
-                    "mnemonic": insn.mnemonic,
-                    "op_str": insn.op_str,
-                    "bytes": insn.bytes.hex(),
-                    "size": insn.size,
-                }
-            )
-
-        return {
-            "category": self.category.name,
-            "description": self.description,
-            "start_offset": self.start_offset,
-            "end_offset": self.end_offset,
-            "instructions": serialized_instructions,
-            "pattern_name": self.pattern_name,
-            "ida_address": self.ida_address,
-            "junk_count": self.junk_count,
-            "total_length": self.total_length,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PatternMatch":
-        """Create pattern match from dictionary (JSON deserialization)."""
-        # Note: We can't reconstruct the full capstone objects, so we create mock objects
-        # with the essential information for display purposes
-        mock_instructions = []
-        for insn_data in data["instructions"]:
-            # Create a simple mock instruction object
-            mock_insn = type(
-                "MockInstruction",
-                (),
-                {
-                    "address": insn_data["address"],
-                    "mnemonic": insn_data["mnemonic"],
-                    "op_str": insn_data["op_str"],
-                    "bytes": bytes.fromhex(insn_data["bytes"]),
-                    "size": insn_data["size"],
-                },
-            )()
-            mock_instructions.append(mock_insn)
-
-        return cls(
-            category=PatternCategory[data["category"]],
-            description=data["description"],
-            start_offset=data["start_offset"],
-            end_offset=data["end_offset"],
-            instructions=mock_instructions,
-            pattern_name=data["pattern_name"],
-            ida_address=data["ida_address"],
-            junk_count=data.get("junk_count", 0),
-            total_length=data.get("total_length", 0),
-        )
-
-
-@dataclass
-class PatternDetector:
-    """Base class for instruction pattern detection using Capstone."""
-
-    cs: Optional[capstone.Cs] = field(default=None, init=False)
-
-    def __post_init__(self):
-        """Initialize capstone with detailed instruction information."""
-        if USE_CAPSTONE:
-            self.cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-            self.cs.detail = True
-
-
 # --- Utility Classes ---
 
 
@@ -410,60 +324,6 @@ class WorkerSignals(QObject):
     progress = pyqtSignal(int)  # percentage
 
 
-def _analyze_chain(
-    chain: MatchChain,
-    mem: bytes,
-    start_ea: int,
-    is_x64: bool,
-    max_size: int = MAX_PATTERN_LEN,
-) -> list[Range]:
-    """
-    Filter out false positive anti-disassembly patterns and analyze jump chains.
-
-    Args:
-        chain: The MatchChain object representing the pattern and surrounding bytes.
-        mem: Memory bytes of the relevant segment.
-        start_ea: The starting effective address of the 'mem' bytes.
-        is_x64: Boolean indicating if the architecture is x64.
-        max_size: Maximum valid size for an anti-disassembly routine.
-
-    Returns:
-        A list of Range objects representing resolved code blocks stemming from the chain.
-    """
-
-    match_start = chain.overall_start()
-    chain_end = match_start + max_size
-    ranges = []
-
-    logging.info("Analyzing match: %s @ 0x%X", chain.description, match_start)
-
-    jump_analyzer = JumpTargetAnalyzer(
-        chain.overall_matched_bytes(), match_start, chain_end, start_ea
-    )
-    jump_targets_iter = jump_analyzer.process(mem=mem, chain=chain, is_x64=is_x64)
-
-    for target in jump_targets_iter:
-        if target is None:
-            logging.debug(
-                "JumpTargetAnalyzer yielded None for chain @ 0x%X, skipping this target.",
-                match_start,
-            )
-            continue
-        if target <= match_start:
-            logging.debug(
-                "Invalid jump target 0x%X (<= match_start 0x%X) for chain. Skipping.",
-                target,
-                match_start,
-            )
-            continue
-
-        logging.info(
-            "Most likely target: 0x%X, analysis boundary: 0x%X", target, chain_end
-        )
-        ranges.append(Range(match_start, target))
-    return ranges
-
-
 class AnalysisTask(QRunnable):
     """
     A QRunnable task to analyze a single pattern match (pm) in a separate thread.
@@ -542,18 +402,26 @@ class CapstoneAnalysisRunnable(QRunnable):
     def run(self):
         self.signals.auto_started.emit()
         try:
+            if self.matcher is None:
+                logging.error("CapstoneAnalysisRunnable: Matcher is None")
+                raise ValueError("Matcher is None in CapstoneAnalysisRunnable")
             chunk_matches = []
             items_processed_in_this_chunk = 0
-            total_in_chunk = len(self.data_chunk)
 
-            for i, (candidate_ea, region_bytes, base_address) in enumerate(
-                self.data_chunk
-            ):
-                if self.matcher is None:
-                    logging.error("CapstoneAnalysisRunnable: Matcher is None")
-                    # Decide: emit error or just skip? For now, let it go to general exception
-                    raise ValueError("Matcher is None in CapstoneAnalysisRunnable")
+            TARGET_DEBUG_ADDRESS = 0x18009B27D
+            DEBUG_LOGGING_WINDOW_LARGE = 500
 
+            for candidate_ea, region_bytes, base_address in self.data_chunk:
+                if (
+                    abs(candidate_ea - TARGET_DEBUG_ADDRESS)
+                    <= DEBUG_LOGGING_WINDOW_LARGE
+                ):
+                    logging.info(
+                        "CapstoneAnalysisRunnable: Processing candidate_ea: 0x%X, region_base_ea: 0x%X, region_len: %d (TARGET NEARBY)",
+                        candidate_ea,
+                        base_address,
+                        len(region_bytes) if region_bytes else 0,
+                    )
                 matches = self.matcher.analyze_candidate_region_bytes(
                     region_bytes, base_address, candidate_ea
                 )
@@ -563,14 +431,12 @@ class CapstoneAnalysisRunnable(QRunnable):
                 self.signals.progress.emit(1)
             self.signals.result.emit(chunk_matches, items_processed_in_this_chunk, True)
         except Exception as e:
-            exc_type, exc_value, exc_tb = sys.exc_info()
-            tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-            self.signals.error.emit(
-                (exc_type.__name__ if exc_type else "Exception", str(exc_value), tb_str)
+            tb_str = "".join(
+                traceback.format_exception(e.__class__, e, e.__traceback__)
             )
-            self.signals.result.emit(
-                [], 0, False
-            )  # Emit a dummy result indicating failure for this chunk
+            self.signals.error.emit((e.__class__.__name__, str(e), tb_str))
+            # Emit a dummy result indicating failure for this chunk
+            self.signals.result.emit([], 0, False)
         finally:
             self.signals.auto_finished.emit()
 
@@ -653,7 +519,7 @@ class DeferredPatchOp:
     def apply(self, dry_run_override: bool = False) -> bool:
         """Apply the patch operation using either patch_bytes or put_bytes based on mode."""
         is_dry_run = dry_run_override or self.dry_run
-        logging.info(
+        logging.debug(
             "[*] %sPatching decrypted chunk %s at 0x%X (size: %d)",
             "(Dry Run) " if is_dry_run else "",
             ("revertably" if self.mode == PatchManager.Mode.PATCH else "destructively"),
@@ -781,37 +647,44 @@ class CodeRegionSlicer:
             return None, None
 
         if current_slice_len > self.max_total_region_size:
-            excess = current_slice_len - self.max_total_region_size
-            shrink_before = excess // 2
-            shrink_after = excess - shrink_before
+            logging.warning(
+                "Calculated slice for candidate 0x%x has length %d, which exceeds max_total_region_size %d.",
+                candidate_ea,
+                current_slice_len,
+                self.max_total_region_size,
+            )
+            return None, None
+            # excess = current_slice_len - self.max_total_region_size
+            # shrink_before = excess // 2
+            # shrink_after = excess - shrink_before
 
-            temp_slice_start = slice_start_offset + shrink_before
-            temp_slice_end = slice_end_offset - shrink_after
+            # temp_slice_start = slice_start_offset + shrink_before
+            # temp_slice_end = slice_end_offset - shrink_after
 
-            # Adjust if candidate is pushed out of bounds by shrinking
-            if candidate_offset_in_segment < temp_slice_start:
-                # Candidate is before the adjusted start, anchor start to candidate
-                temp_slice_start = candidate_offset_in_segment
-                temp_slice_end = temp_slice_start + self.max_total_region_size
-            elif candidate_offset_in_segment >= temp_slice_end:
-                # Candidate is at or after the adjusted end, anchor end to candidate + 1
-                temp_slice_end = (
-                    candidate_offset_in_segment + 1
-                )  # Slice end is exclusive
-                temp_slice_start = temp_slice_end - self.max_total_region_size
+            # # Adjust if candidate is pushed out of bounds by shrinking
+            # if candidate_offset_in_segment < temp_slice_start:
+            #     # Candidate is before the adjusted start, anchor start to candidate
+            #     temp_slice_start = candidate_offset_in_segment
+            #     temp_slice_end = temp_slice_start + self.max_total_region_size
+            # elif candidate_offset_in_segment >= temp_slice_end:
+            #     # Candidate is at or after the adjusted end, anchor end to candidate + 1
+            #     temp_slice_end = (
+            #         candidate_offset_in_segment + 1
+            #     )  # Slice end is exclusive
+            #     temp_slice_start = temp_slice_end - self.max_total_region_size
 
-            slice_start_offset = max(0, temp_slice_start)
-            slice_end_offset = min(len(segment_bytes), temp_slice_end)
+            # slice_start_offset = max(0, temp_slice_start)
+            # slice_end_offset = min(len(segment_bytes), temp_slice_end)
 
-            # Final check for positive length after adjustments
-            if slice_end_offset <= slice_start_offset:
-                logging.warning(
-                    "Adjusted slice for candidate 0x%x has zero or negative length (%d:%d) after max_total_region_size constraint.",
-                    candidate_ea,
-                    slice_start_offset,
-                    slice_end_offset,
-                )
-                return None, None
+            # # Final check for positive length after adjustments
+            # if slice_end_offset <= slice_start_offset:
+            #     logging.warning(
+            #         "Adjusted slice for candidate 0x%x has zero or negative length (%d:%d) after max_total_region_size constraint.",
+            #         candidate_ea,
+            #         slice_start_offset,
+            #         slice_end_offset,
+            #     )
+            #     return None, None
 
         region_bytes_slice = segment_bytes[slice_start_offset:slice_end_offset]
         slice_base_ea = segment_start_ea + slice_start_offset
@@ -827,7 +700,8 @@ class CodeRegionSlicer:
                 slice_end_offset,
             )
             return None, None
-
+        # logging.info(f"Sliced {len(region_bytes_slice)} bytes from {hex(slice_base_ea)} to {hex(slice_base_ea + len(region_bytes_slice))}")
+        # return None, None
         return region_bytes_slice, slice_base_ea
 
 
@@ -923,21 +797,24 @@ class PatternDetectionWidget(QWidget):
         # Initialize the code slicer
         self.code_slicer = CodeRegionSlicer(
             region_size_before=0,
-            region_size_after=MAX_PATTERN_LEN,
-            max_total_region_size=MAX_PATTERN_LEN,
+            region_size_after=MAX_PATTERN_LEN * 2,
+            max_total_region_size=MAX_PATTERN_LEN * 2,
         )
 
         # Thread pool for Capstone analysis
         self.thread_pool = QThreadPool.globalInstance()
         self.thread_pool.setMaxThreadCount(
-            QThreadPool.globalInstance().maxThreadCount() // 2 or 1
-        )  # Use half avail cores
+            max(
+                QThreadPool.globalInstance().maxThreadCount(),
+                multiprocessing.cpu_count(),
+            )
+        )
         self.active_runnables = 0
         self.collected_matches_from_runnables = []
-        self.total_items_for_analysis = (
-            0  # Total candidate data points for analysis phase
-        )
-        self.items_processed_count = 0  # Count of items processed in analysis phase
+        # Total candidate data points for analysis phase
+        self.total_items_for_analysis = 0
+        # Count of items processed in analysis phase
+        self.items_processed_count = 0
 
         self.candidates = []
         self.current_candidate_idx = 0
@@ -1096,9 +973,7 @@ class PatternDetectionWidget(QWidget):
 
     def _connect_signals(self):
         """Connect UI signals."""
-        self.start_btn.clicked.connect(
-            lambda: self.start_detection(ida_range.range_t(0x180001000, 0x18000191C))
-        )
+        self.start_btn.clicked.connect(self.start_detection)
         self.cancel_btn.clicked.connect(self.cancel_detection)
         self.filter_input.textChanged.connect(self.apply_filters)
         self.category_filter.currentTextChanged.connect(self.apply_filters)
@@ -1128,7 +1003,7 @@ class PatternDetectionWidget(QWidget):
         # self.time_label.setText("Elapsed: 0s") # Or keep last value if preferred
         QApplication.processEvents()  # Ensure UI events are processed
 
-    def start_detection(self, segm_range: ida_range.range_t | None = None):
+    def start_detection(self, *, segm_range: ida_range.range_t | None = None):
         """Start pattern detection on main thread."""
         try:
             if not self.matcher:
@@ -1217,71 +1092,8 @@ class PatternDetectionWidget(QWidget):
             ):
                 self.candidates_data.append(code_slice)
 
-            # for idx, candidate_ea in enumerate(self.candidates):
-
-            #     if self.code_slicer and self.text_segment_bytes is not None:
-            #         region_bytes_slice, slice_base_ea = self.code_slicer.get_slice(
-            #             candidate_ea,
-            #             self.text_segment_start_ea,
-            #             self.text_segment_bytes,
-            #         )
-
-            #         if region_bytes_slice and slice_base_ea is not None:
-            #             self.candidates_data.append(
-            #                 (candidate_ea, region_bytes_slice, slice_base_ea)
-            #             )
-            #         else:
-            #             # Logging is handled within get_slice
-            #             pass  # Continue to next candidate
-            #     else:
-            #         logging.error(
-            #             "Code slicer or text_segment_bytes not initialized. Skipping candidate 0x%x",
-            #             candidate_ea,
-            #         )
-            #         continue
-
-            #     # Update progress for data preparation (10% to 50% range)
-            #     if total_candidates > 0 and (
-            #         idx % (total_candidates // 100 + 1) == 0
-            #         or idx == total_candidates - 1
-            #     ):  # Update roughly 100 times or at the end
-            #         progress = int(10 + (idx / total_candidates) * 40)
-            #         self.progress_bar.setValue(progress)
-            #         self.progress_label.setText(
-            #             f"Preparing data for candidate {idx + 1}/{total_candidates}"
-            #         )
-
-            #     # Check for user prompt to continue (if enabled and time elapsed)
-            #     if self.start_time is not None and self.enable_continue_prompt:
-            #         elapsed_time = time.time() - self.start_time
-            #         if elapsed_time >= self.next_prompt_time:
-            #             minutes = int(elapsed_time / 60)
-            #             seconds = int(elapsed_time % 60)
-            #             time_str = (
-            #                 f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-            #             )
-            #             reply = QMessageBox.question(
-            #                 self,
-            #                 "Continue Detection?",
-            #                 f"Data preparation phase is processing {total_candidates} candidates.\nContinue?",
-            #                 QMessageBox.Yes | QMessageBox.No,
-            #                 QMessageBox.No,
-            #             )
-            #             if reply == QMessageBox.No:
-            #                 self.cancel_detection()  # This will set cancel_btn state
-            #                 return
-            #             else:
-            #                 self.next_prompt_time *= 2  # Postpone next prompt
-            #                 logging.info(
-            #                     "Next prompt will be at %d seconds (%.1f minutes)",
-            #                     self.next_prompt_time,
-            #                     self.next_prompt_time / 60.0,
-            #                 )
-            #                 # No timer to restart, loop continues
-
-            if (
-                not self.cancel_btn.isEnabled()
-            ):  # Check if cancel was pressed during the loop
+            # Check if cancel was pressed during the loop
+            if not self.cancel_btn.isEnabled():
                 logging.info("Detection cancelled during data preparation.")
                 # self.detection_finished([]) # cancel_detection already handles this
                 return
@@ -1293,9 +1105,9 @@ class PatternDetectionWidget(QWidget):
 
             self.progress_bar.setValue(50)  # Mark data preparation as complete
             self.start_analysis_phase()  # Proceed to analysis
-
         except Exception as e:
-            self.handle_error(str(e))
+            tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            self.handle_error(f"{type(e).__name__}: {str(e)}\n{tb_str}")
 
     def start_analysis_phase(self):
         """Start the Capstone analysis phase using a thread pool."""
@@ -1323,34 +1135,50 @@ class PatternDetectionWidget(QWidget):
             len(self.candidates_data) + num_threads - 1
         ) // num_threads  # Ceiling division
         chunk_size = max(1, chunk_size)  # Ensure chunk_size is at least 1
-
+        self.candidates_data.sort(key=lambda x: x[2])
+        print(
+            f"Sorted candidates_data: {len(self.candidates_data)}, chunk_size: {chunk_size}, num_threads: {num_threads}"
+        )
         for i in range(0, len(self.candidates_data), chunk_size):
             data_chunk = self.candidates_data[i : i + chunk_size]
             if not data_chunk:
                 continue
+
+            # Debug: Log if the target address is in this chunk
+            target_addr_to_find = 0x18009B27D
+            chunk_candidate_eas = [item[0] for item in data_chunk]
+            if target_addr_to_find in chunk_candidate_eas:
+                logging.info(
+                    "PatternDetectionWidget.start_analysis_phase: Target address 0x%X FOUND in the current chunk (index %d). Chunk EAs: %s",
+                    target_addr_to_find,
+                    i // chunk_size,  # Chunk index
+                    ", ".join(hex(ea) for ea in chunk_candidate_eas),
+                )
+            elif any(
+                abs(ea - target_addr_to_find) < 16 for ea in chunk_candidate_eas
+            ):  # Check if it's close
+                logging.info(
+                    "PatternDetectionWidget.start_analysis_phase: Target address 0x%X is NEAR an EA in the current chunk (index %d). Chunk EAs: %s",
+                    target_addr_to_find,
+                    i // chunk_size,  # Chunk index
+                    ", ".join(hex(ea) for ea in chunk_candidate_eas),
+                )
 
             runnable = CapstoneAnalysisRunnable(data_chunk, self.matcher)
             # Connect to new signals
             runnable.signals.result.connect(self._handle_runnable_result)
             runnable.signals.error.connect(self._handle_runnable_error)
             runnable.signals.auto_finished.connect(self._handle_runnable_finished)
-            runnable.signals.auto_started.connect(
-                self._handle_runnable_started
-            )  # Connect new signal
-            runnable.signals.progress.connect(
-                self._handle_runnable_progress
-            )  # Connect new signal
-            # We can connect auto_started and progress if needed for more detailed UI updates
-
+            runnable.signals.auto_started.connect(self._handle_runnable_started)
+            runnable.signals.progress.connect(self._handle_runnable_progress)
             self.active_runnables += 1
             self.thread_pool.start(runnable)
             logging.info(
                 "Started CapstoneAnalysisRunnable for %d items", len(data_chunk)
             )
 
-        if (
-            self.active_runnables == 0
-        ):  # Should not happen if candidates_data is not empty
+        if self.active_runnables == 0:
+            # Should not happen if candidates_data is not empty
             logging.info("No runnables started, finishing detection.")
             self.detection_finished([])
 
@@ -1388,12 +1216,6 @@ class PatternDetectionWidget(QWidget):
             self.progress_label.setText(
                 f"{base_text} (Processed: {round(analysis_phase_percentage_float, 2)}%)"
             )
-            # logging.debug(
-            #     "_handle_runnable_result: Updated self.items_processed_count to %d. Progress bar set to %d%%. Label: %s",
-            #     self.items_processed_count,
-            #     new_progress_value,
-            #     self.progress_label.text(),
-            # )
 
     def _handle_runnable_result(
         self,
@@ -1438,14 +1260,16 @@ class PatternDetectionWidget(QWidget):
         )
 
         # Remove duplicates from all collected matches
-        unique_matches = []
-        seen_addresses = set()
-        for match in self.collected_matches_from_runnables:
-            if match.ida_address not in seen_addresses:
-                unique_matches.append(match)
-                seen_addresses.add(match.ida_address)
+        # unique_matches = []
+        # seen_addresses = set()
+        # for match in self.collected_matches_from_runnables:
+        #     if match.ida_address not in seen_addresses:
+        #         unique_matches.append(match)
+        #         seen_addresses.add(match.ida_address)
 
-        self.analysis_finished(unique_matches)  # Call the original analysis_finished
+        self.analysis_finished(
+            self.collected_matches_from_runnables
+        )  # Call the original analysis_finished
 
     def cancel_detection(self):
         """Cancel ongoing detection."""
@@ -1747,7 +1571,7 @@ class PatternDetectionWidget(QWidget):
         logging.info(
             "Analysis completed. Found {} patch operations.".format(len(patch_manager))
         )
-        patch_manager.apply_all()
+        # patch_manager.apply_all()
         logging.info(
             "Converted %d final intervals to PatternMatch objects for display.",
             len(processed_patterns_for_display),
@@ -2294,7 +2118,6 @@ def find_byte_sequence(
         sigstr = " ".join(f"{b:02x}" if b != -1 else "?" for b in sig)
     else:
         sigstr = sig.hex()
-
     key = sigstr.encode("utf-8")
     cpv = _sig_cache.get(key)
     if cpv is None:
@@ -2480,43 +2303,95 @@ class JunkDetector:
         return has_enough, junk_count, total_junk_bytes
 
 
-class PaddingDetector:
-    """Detects padding/junk instructions that don't affect program flow."""
+@dataclass
+class PatternMatch:
+    """Represents a successful pattern match with detailed information."""
 
-    @staticmethod
-    def is_padding_instruction(insn: capstone.CsInsn) -> bool:
-        """
-        Check if instruction is padding/junk.
-        Original regex: rb"(?:\xc0[\xe0-\xff]\x00|(?:\x86|\x8a)[\xc0\xc9\xd2\xdb\xe4\xed\xf6\xff])"
+    category: PatternCategory
+    description: str
+    start_offset: int
+    end_offset: int
+    instructions: List[capstone.CsInsn]
+    pattern_name: str
+    ida_address: int = 0  # IDA virtual address
+    junk_count: int = 0  # Number of junk instructions following the pattern
+    total_length: int = 0  # Total length including junk instructions
 
-        Detects:
-        - SHL reg, 0 with various register encodings
-        - XCHG or MOV with specific register combinations
-        """
-        if insn.mnemonic == "shl" and len(insn.operands) == 2:
-            # SHL reg, 0
-            if (
-                insn.operands[1].type == capstone.x86.X86_OP_IMM
-                and insn.operands[1].imm == 0
-            ):
-                return True
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert pattern match to dictionary for JSON serialization."""
+        # Convert capstone instructions to serializable format
+        serialized_instructions = []
+        for insn in self.instructions:
+            serialized_instructions.append(
+                {
+                    "address": insn.address,
+                    "mnemonic": insn.mnemonic,
+                    "op_str": insn.op_str,
+                    "bytes": insn.bytes.hex(),
+                    "size": insn.size,
+                }
+            )
 
-        if insn.mnemonic in ["xchg", "mov"]:
-            # Check for register-to-register operations that don't change state
-            if (
-                len(insn.operands) == 2
-                and insn.operands[0].type == capstone.x86.X86_OP_REG
-                and insn.operands[1].type == capstone.x86.X86_OP_REG
-            ):
-                # Same register operations are junk
-                if insn.operands[0].reg == insn.operands[1].reg:
-                    return True
+        return {
+            "category": self.category.name,
+            "description": self.description,
+            "start_offset": self.start_offset,
+            "end_offset": self.end_offset,
+            "instructions": serialized_instructions,
+            "pattern_name": self.pattern_name,
+            "ida_address": self.ida_address,
+            "junk_count": self.junk_count,
+            "total_length": self.total_length,
+        }
 
-        return False
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PatternMatch":
+        """Create pattern match from dictionary (JSON deserialization)."""
+        # Note: We can't reconstruct the full capstone objects, so we create mock objects
+        # with the essential information for display purposes
+        mock_instructions = []
+        for insn_data in data["instructions"]:
+            # Create a simple mock instruction object
+            mock_insn = type(
+                "MockInstruction",
+                (),
+                {
+                    "address": insn_data["address"],
+                    "mnemonic": insn_data["mnemonic"],
+                    "op_str": insn_data["op_str"],
+                    "bytes": bytes.fromhex(insn_data["bytes"]),
+                    "size": insn_data["size"],
+                },
+            )()
+            mock_instructions.append(mock_insn)
+
+        return cls(
+            category=PatternCategory[data["category"]],
+            description=data["description"],
+            start_offset=data["start_offset"],
+            end_offset=data["end_offset"],
+            instructions=mock_instructions,
+            pattern_name=data["pattern_name"],
+            ida_address=data["ida_address"],
+            junk_count=data.get("junk_count", 0),
+            total_length=data.get("total_length", 0),
+        )
 
 
-class FastPatternMatcher:
-    """Optimized pattern matcher using IDA's signature search + Capstone verification."""
+@dataclass
+class PatternDetector:
+    """Base class for instruction pattern detection using Capstone."""
+
+    cs: Optional[capstone.Cs] = field(default=None, init=False)
+
+    def __post_init__(self):
+        """Initialize capstone with detailed instruction information."""
+        if USE_CAPSTONE:
+            self.cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+            self.cs.detail = True
+
+
+def simple_pattern_generator():
 
     # Signature patterns for fast initial search
     JUMP_PATTERNS = {
@@ -2557,32 +2432,145 @@ class FastPatternMatcher:
         "test_rm32_imm": [0xF7],  # TEST r/m32, imm32
         "cmp_esp": [0x81, 0xFC],  # CMP ESP, imm32
     }
+    for c in (
+        JUMP_PATTERNS,
+        PREFIX_PATTERNS,
+    ):
+        for pattern_name, opcodes in c.items():
+            yield pattern_name, opcodes
 
-    def __init__(self):
+
+def more_specific_pattern_generator():
+    """Generates IDA string patterns based on Untitled-3 logic."""
+
+    pads_ll_str = [[0xC0, -1, 0x00], [0x86, -1], [0x8A, -1]]
+
+    multipart_defs_tuple_list_str: List[Tuple[List[int], List[int]]] = [
+        ([0x70, -1], [0x71, -1]),
+        ([0x71, -1], [0x70, -1]),
+        ([0x72, -1], [0x73, -1]),
+        ([0x73, -1], [0x72, -1]),
+        ([0x74, -1], [0x75, -1]),
+        ([0x75, -1], [0x74, -1]),
+        ([0x76, -1], [0x77, -1]),
+        ([0x77, -1], [0x76, -1]),
+        ([0x78, -1], [0x79, -1]),
+        ([0x79, -1], [0x78, -1]),
+        ([0x7A, -1], [0x7B, -1]),
+        ([0x7B, -1], [0x7A, -1]),
+        ([0x7C, -1], [0x7D, -1]),
+        ([0x7D, -1], [0x7C, -1]),
+        ([0x7E, -1], [0x7F, -1]),
+        ([0x7F, -1], [0x7E, -1]),
+    ]
+    singlepart_defs_tuple_list_str: List[Tuple[List[int], List[int]]] = [
+        ([0x0C, 0x00], [0x71, -1]),
+        ([0x0C, 0x00], [0x73, -1]),
+        ([0x24, 0xFF], [0x71, -1]),
+        ([0x24, 0xFF], [0x73, -1]),
+        ([0x34, 0x00], [0x71, -1]),
+        ([0x34, 0x00], [0x73, -1]),
+        ([0x80, -1, 0x00], [0x71, -1]),
+        ([0x80, -1, 0x00], [0x73, -1]),
+        ([0x80, -1, 0xFF], [0x71, -1]),
+        ([0x80, -1, 0xFF], [0x73, -1]),
+        ([0x84, -1], [0x71, -1]),
+        ([0x84, -1], [0x73, -1]),
+        ([0x85, -1], [0x71, -1]),
+        ([0x85, -1], [0x73, -1]),
+        ([0xA8, -1], [0x71, -1]),
+        ([0xA8, -1], [0x73, -1]),
+        ([0xA9, -1, -1, -1, -1], [0x71, -1]),
+        ([0xA9, -1, -1, -1, -1], [0x73, -1]),
+        ([0xF6, -1, -1], [0x71, -1]),
+        ([0xF6, -1, -1], [0x73, -1]),
+        ([0xF7, -1, -1, -1, -1, -1], [0x71, -1]),
+        ([0xF7, -1, -1, -1, -1, -1], [0x73, -1]),
+        ([0xF8], [0x73, -1]),
+        ([0xF9], [0x72, -1]),
+        ([0xF9], [0x76, -1]),
+    ]
+    for op_hex in [0x80, 0x81, 0x83]:
+        prefix_cmp_esp = [op_hex, 0xFC, 0x00, -1, -1, -1]
+        singlepart_defs_tuple_list_str.append((prefix_cmp_esp, [0x77, -1]))
+        singlepart_defs_tuple_list_str.append((prefix_cmp_esp, [0x73, -1]))
+
+    for prefix_list, jump_list in chain(
+        multipart_defs_tuple_list_str, singlepart_defs_tuple_list_str
+    ):
+        for pad_list in pads_ll_str:
+            yield "PADDED", prefix_list + pad_list + jump_list
+            for pad_list2 in pads_ll_str:
+                yield "PADDED", prefix_list + pad_list + pad_list2 + jump_list
+        yield "NOT_PADDED", prefix_list + jump_list
+
+
+PREFIX_PATTERNS = [
+    rb"\x0C\x00",  # OR AL, 0x00
+    rb"\x24\xFF",  # AND AL, 0xFF
+    rb"\x34\x00",  # XOR AL, 0x00
+    rb"\x80[\xC8-\xCF]\x00",  # OR r/m8, 0x00
+    rb"\x80[\xE0-\xE7]\xFF",  # AND r/m8, 0xFF
+    rb"\x80[\xF0-\xF7]\x00",  # XOR r/m8, 0x00
+    rb"\x84.",  # TEST r/m8, r8
+    rb"\x85.",  # TEST r/m32, r32
+    rb"\xA8.",  # TEST AL, imm8
+    rb"\xA9....",  # TEST EAX, imm32
+    rb"\xF6..",  # TEST r/m8, imm8
+    rb"\xF7.....",  # TEST r/m32, imm32
+    rb"\xF8",  # CLC
+    rb"\xF9",  # STC
+    rb"[\x80\x81\x83]\xFC\x00...",  # CMP ESP,0x1C00
+]
+
+_COMPILED_PREFIX_REGEX = re.compile(b"|".join(PREFIX_PATTERNS), re.DOTALL)
+
+
+def _x(sig):
+    if isinstance(sig, str):
+        sigstr = sig
+    elif isinstance(sig, list):
+        sigstr = " ".join(f"{b:02x}" if b != -1 else "?" for b in sig)
+    else:
+        sigstr = sig.hex()
+    return sigstr
+
+
+pp = {
+    0x18009B27D,
+}
+
+found = set()
+
+
+class FastPatternMatcher:
+    """Optimized pattern matcher using IDA's signature search + Capstone verification."""
+
+    def __init__(self, pattern_generator=more_specific_pattern_generator):
         self.detector = PatternDetector()
-        self.multi_part_detector = MultiPartPatternDetector()
-        self.single_part_detector = SinglePartPatternDetector()
         self.junk_detector = JunkDetector()  # Add junk detector
+        self.pattern_generator = pattern_generator
 
     def find_pattern_candidates(self, start_ea: int, end_ea: int) -> List[int]:
         """Find all potential pattern locations using fast signature search."""
         candidates = set()
-
-        logging.info("Searching for conditional jump candidates...")
-
+        print(
+            f"Searching for pattern candidates in range {hex(start_ea)} to {hex(end_ea)}"
+        )
         # Search for conditional jumps (multi-part patterns)
-        for pattern_name, opcodes in self.JUMP_PATTERNS.items():
-            for opcode in opcodes:
-                for ea in find_byte_sequence(start_ea, end_ea, [opcode]):
-                    candidates.add(ea)
-
-        logging.info("Searching for prefix instruction candidates...")
-
-        # Search for prefix instructions (single-part patterns)
-        for pattern_name, opcodes in self.PREFIX_PATTERNS.items():
+        for pattern_name, opcodes in self.pattern_generator():
             for ea in find_byte_sequence(start_ea, end_ea, opcodes):
+                # print(f"Found pattern candidate at {hex(ea)} with {_x(opcodes)}")
                 candidates.add(ea)
-
+        # Find addresses in pp but not in candidates
+        missing = pp - candidates
+        if missing:
+            print("Addresses in pp but not found in candidates:")
+            for addr in sorted(missing):
+                print(f"  {hex(addr)}")
+        elif not missing:
+            print("All addresses in pp found in candidates")
+        # return []
         return sorted(list(candidates))
 
     def analyze_candidate_region_bytes(
@@ -2618,13 +2606,57 @@ class FastPatternMatcher:
     ) -> List[PatternMatch]:
         """Find patterns in a small byte sequence with junk validation."""
         patterns = []
+        if not USE_CAPSTONE or self.detector.cs is None:
+            return patterns
+
+        TARGET_DEBUG_ADDRESS = 0x18000AF89  # 0x18000AF13
+        DEBUG_LOGGING_WINDOW_LARGE = 500
+        DEBUG_LOGGING_WINDOW_SMALL = 100  # For more detailed logs like instruction dumps and specific check results
+
+        if abs(base_address - TARGET_DEBUG_ADDRESS) <= DEBUG_LOGGING_WINDOW_LARGE:
+            logging.info(  # Changed from debug to info to ensure visibility with default levels
+                "FastPatternMatcher._find_patterns_in_bytes: Analyzing data at base_address: 0x%X, data_len: %d (TARGET NEARBY)",
+                base_address,
+                len(data),
+            )
 
         try:
-            if (
-                not USE_CAPSTONE or self.detector.cs is None
-            ):  # Added self.detector.cs is None check
-                return patterns  # Capstone disabled or cs not initialized
             instructions = list(self.detector.cs.disasm(data, base_address))
+            if not instructions:
+                return patterns
+
+            should_log_instructions = False
+            # Use DEBUG_LOGGING_WINDOW_SMALL for the instruction dump window
+            if instructions:
+                min_instr_addr = instructions[0].address
+                max_instr_addr = instructions[-1].address + instructions[-1].size
+                # Condition to log instructions if the current slice overlaps with the small debug window around the target address
+                if (
+                    max(base_address, min_instr_addr)
+                    < TARGET_DEBUG_ADDRESS + DEBUG_LOGGING_WINDOW_SMALL
+                    and min(base_address + len(data), max_instr_addr)
+                    > TARGET_DEBUG_ADDRESS - DEBUG_LOGGING_WINDOW_SMALL
+                ):
+                    should_log_instructions = True
+
+            if should_log_instructions:
+                logging.info(
+                    "FastPatternMatcher._find_patterns_in_bytes: Instructions near 0x%X (base_address: 0x%X, num_instructions: %d, window: %d):",
+                    TARGET_DEBUG_ADDRESS,
+                    base_address,
+                    len(instructions),
+                    DEBUG_LOGGING_WINDOW_SMALL,
+                )
+                for instr_idx, instr in enumerate(instructions):
+                    logging.info(
+                        "  [%d] 0x%X: %s %s (bytes: %s)",
+                        instr_idx,
+                        instr.address,
+                        instr.mnemonic,
+                        instr.op_str,
+                        instr.bytes.hex(),
+                    )
+
             if len(instructions) < 2:
                 return patterns
 
@@ -2673,13 +2705,24 @@ class FastPatternMatcher:
                                     + junk_bytes,
                                 )
                                 patterns.append(pattern)
-                                logging.info(
+                                logging.debug(
                                     "Valid multi-part pattern found: %s with %d junk instructions (%d bytes) at 0x%x",
                                     pattern.description,
                                     junk_count,
                                     junk_bytes,
                                     pattern.ida_address,
                                 )
+                                if (
+                                    abs(first_insn.address - TARGET_DEBUG_ADDRESS)
+                                    <= DEBUG_LOGGING_WINDOW_SMALL
+                                ):
+                                    logging.info(
+                                        "FastPatternMatcher._find_patterns_in_bytes: Multi-part check at 0x%X. Junk check result: has_junk=%s, junk_count=%d, junk_bytes=%d (TARGET NEARBY)",
+                                        first_insn.address,
+                                        has_junk,
+                                        junk_count,
+                                        junk_bytes,
+                                    )
                             else:
                                 logging.debug(
                                     "Rejected multi-part pattern %s -> %s: insufficient junk (%d < 4) at 0x%x",
@@ -2688,6 +2731,17 @@ class FastPatternMatcher:
                                     junk_count,
                                     first_insn.address,
                                 )
+                                if (
+                                    abs(first_insn.address - TARGET_DEBUG_ADDRESS)
+                                    <= DEBUG_LOGGING_WINDOW_SMALL
+                                ):
+                                    logging.debug(
+                                        "Rejected multi-part pattern %s -> %s: insufficient junk (%d < 4) at 0x%X (TARGET NEARBY)",
+                                        first_insn.mnemonic,
+                                        second_insn.mnemonic,
+                                        junk_count,
+                                        first_insn.address,
+                                    )
                             break
 
                 # Look for single-part patterns (prefix + jump)
@@ -2732,21 +2786,43 @@ class FastPatternMatcher:
                                     + junk_bytes,
                                 )
                                 patterns.append(pattern)
-                                logging.info(
+                                logging.debug(
                                     "Valid single-part pattern found: %s with %d junk instructions (%d bytes at 0x%x)",
                                     pattern.description,
                                     junk_count,
                                     junk_bytes,
                                     pattern.ida_address,
                                 )
+                                if (
+                                    abs(first_insn.address - TARGET_DEBUG_ADDRESS)
+                                    <= DEBUG_LOGGING_WINDOW_SMALL
+                                ):
+                                    logging.info(
+                                        "FastPatternMatcher._find_patterns_in_bytes: Single-part check at 0x%X. Junk check result: has_junk=%s, junk_count=%d, junk_bytes=%d (TARGET NEARBY)",
+                                        first_insn.address,
+                                        has_junk,
+                                        junk_count,
+                                        junk_bytes,
+                                    )
                             else:
-                                logging.debug(
+                                logging.info(
                                     "Rejected single-part pattern %s -> %s: insufficient junk (%d < 4) at 0x%x",
                                     first_insn.mnemonic,
                                     jump_insn.mnemonic,
                                     junk_count,
                                     first_insn.address,
                                 )
+                                if (
+                                    abs(first_insn.address - TARGET_DEBUG_ADDRESS)
+                                    <= DEBUG_LOGGING_WINDOW_SMALL
+                                ):
+                                    logging.info(
+                                        "Rejected single-part pattern %s -> %s: insufficient junk (%d < 4) at 0x%X (TARGET NEARBY)",
+                                        first_insn.mnemonic,
+                                        jump_insn.mnemonic,
+                                        junk_count,
+                                        first_insn.address,
+                                    )
                             break
 
         except Exception as e:
@@ -2801,6 +2877,7 @@ class FastPatternMatcher:
 
     def _is_prefix_instruction(self, insn: capstone.CsInsn) -> bool:
         """Check if instruction can be a prefix for single-part patterns."""
+        return _COMPILED_PREFIX_REGEX.match(insn.bytes) is not None
         # OR AL, 0x00 or AND AL, 0xFF or XOR AL, 0x00
         if insn.id in [
             capstone.x86.X86_INS_OR,
@@ -2835,82 +2912,8 @@ class FastPatternMatcher:
 
         return False
 
-    def find_all_patterns_optimized(self, segm_range=None) -> List[PatternMatch]:
-        """Main optimized pattern finding function - simplified for Qt integration."""
-        all_matches = []
 
-        if segm_range is None:
-            segm_range = ida_segment.get_segm_by_name(".text")
-        if not segm_range:
-            logging.error("Could not find .text segment")
-            return all_matches
-
-        logging.info(
-            "Starting optimized pattern detection in .text segment (0x%x - 0x%x)",
-            segm_range.start_ea,
-            segm_range.end_ea,
-        )
-
-        # Phase 1: Fast candidate search
-        candidates = self.find_pattern_candidates(
-            segm_range.start_ea, segm_range.end_ea
-        )
-        logging.info("Found %d potential pattern candidates", len(candidates))
-
-        if not candidates:
-            return all_matches
-
-        # Phase 2: Detailed analysis of candidates (no progress tracking here - handled by Qt)
-        logging.info("Analyzing candidates with Capstone...")
-
-        # for candidate_ea in candidates:
-        #     matches = self.analyze_candidate_region(candidate_ea)
-        #     all_matches.extend(matches)
-
-        # Remove duplicates (same address)
-        unique_matches = []
-        seen_addresses = set()
-        for match in all_matches:
-            if match.ida_address not in seen_addresses:
-                unique_matches.append(match)
-                seen_addresses.add(match.ida_address)
-
-        logging.info("Found %d unique patterns total", len(unique_matches))
-        return unique_matches
-
-
-# Keep the original detailed detector classes for reference
-class MultiPartPatternDetector(PatternDetector):
-    """Detects multi-part conditional jump patterns."""
-
-    # Complementary jump pairs mapping
-    COMPLEMENTARY_JUMPS = {
-        capstone.x86.X86_INS_JO: capstone.x86.X86_INS_JNO,
-        capstone.x86.X86_INS_JNO: capstone.x86.X86_INS_JO,
-        capstone.x86.X86_INS_JB: capstone.x86.X86_INS_JAE,
-        capstone.x86.X86_INS_JAE: capstone.x86.X86_INS_JB,
-        capstone.x86.X86_INS_JE: capstone.x86.X86_INS_JNE,
-        capstone.x86.X86_INS_JNE: capstone.x86.X86_INS_JE,
-        capstone.x86.X86_INS_JBE: capstone.x86.X86_INS_JA,
-        capstone.x86.X86_INS_JA: capstone.x86.X86_INS_JBE,
-        capstone.x86.X86_INS_JS: capstone.x86.X86_INS_JNS,
-        capstone.x86.X86_INS_JNS: capstone.x86.X86_INS_JS,
-        capstone.x86.X86_INS_JP: capstone.x86.X86_INS_JNP,
-        capstone.x86.X86_INS_JNP: capstone.x86.X86_INS_JP,
-        capstone.x86.X86_INS_JL: capstone.x86.X86_INS_JGE,
-        capstone.x86.X86_INS_JGE: capstone.x86.X86_INS_JL,
-        capstone.x86.X86_INS_JLE: capstone.x86.X86_INS_JG,
-        capstone.x86.X86_INS_JG: capstone.x86.X86_INS_JLE,
-    }
-
-
-class SinglePartPatternDetector(PatternDetector):
-    """Detects single-part prefix + conditional jump patterns."""
-
-    pass
-
-
-@dataclasses.dataclass
+@dataclasses.dataclass(repr=False, order=True, frozen=True)
 class Range:
     """A range of addresses with a start (inclusive) and end (exclusive)."""
 
@@ -2936,6 +2939,9 @@ class Range:
     def merge(self, other: "Range") -> "Range":
         return Range(min(self.start, other.start), max(self.end, other.end))
 
+    def __repr__(self):
+        return f"Range(start=0x{self.start:X}, end=0x{self.end:X})"
+
 
 class IntervalSet:
     """
@@ -2952,6 +2958,15 @@ class IntervalSet:
 
     def __len__(self):
         return len(self._ranges)
+
+    def empty(self):
+        return len(self._ranges) == 0
+
+    def first(self):
+        return self._ranges[0] if self._ranges else None
+
+    def last(self):
+        return self._ranges[-1] if self._ranges else None
 
     # --- public ------------------------------------------------------------
     def add(self, new: Range) -> None:
@@ -2990,6 +3005,19 @@ class IntervalSet:
 
     # ­— optional helpers ---------------------------------------------------
     def covers(self, addr: int) -> bool:
+        """
+        Check if a given address falls within any of the ranges in this interval set.
+
+        Uses binary search to efficiently find if the address is contained within
+        any range. The search finds the rightmost range that starts before or at
+        the given address, then checks if the address falls within that range.
+
+        Args:
+            addr: The address to check for coverage
+
+        Returns:
+            True if the address falls within any range in the set, False otherwise
+        """
         i = bisect_right(self._ranges, addr, key=lambda r: r.start) - 1
         return i >= 0 and addr < self._ranges[i].end
 
@@ -3081,13 +3109,19 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         if self._offset >= len(self._buf):
             return None
 
-        code = self._buf[self._offset : self._offset + self.MAX_INSNSZ]
+        end_offset = min(self._offset + self.MAX_INSNSZ, len(self._buf) - 1)
+        try:
+            code = self._buf[self._offset : end_offset]
+        except IndexError:
+            logging.error("IndexError at 0x%X: %s", self._offset, self._buf.hex())
+            return None
+
         ea = self._base_ea + self._offset
 
         try:
             insn = next(self.md.disasm(code, ea, count=1), None)
         except capstone.CsError as e:
-            logging.error("Capstone decoding error at 0x%X: %s", ea, e)
+            logging.error("Capstone decoding error at 0x%X: %s", ea, e, exc_info=True)
             return None
 
         if not insn:
@@ -3342,10 +3376,17 @@ class JumpTargetAnalyzer:
                 decoded_insn = decoder.decode(trace_ea, bytes_for_decoder)
             except Exception as e:
                 logging.error(
-                    "%sDecoder function raised exception at 0x%X: %s",
+                    "%sDecoder function raised exception at 0x%X: %s. Current_ea: 0x%X, mem_view_len: %X, mem_start_ea: 0x%X, mem_end_ea: 0x%X, offset: %d. Decoding %d bytes",
                     indent,
                     trace_ea,
                     e,
+                    current_ea,
+                    len(mem_view),
+                    mem_start_ea,
+                    mem_end_ea,
+                    offset,
+                    len(bytes_for_decoder),
+                    exc_info=True,
                 )
                 decoded_insn = None  # Treat as decode failure
 
@@ -3473,7 +3514,6 @@ class JumpTargetAnalyzer:
           - junk_length: int
           - stage1_type: SegmentType
         """
-        decoder = CapstoneInstructionDecoder(is_x64)
         match_end = chain.overall_start() + MAX_PATTERN_LEN
         logging.debug(
             "Processing jumps for chain @ 0x%X, match_end=0x%X",
@@ -3493,7 +3533,7 @@ class JumpTargetAnalyzer:
                     "jump_offset_in_segment"
                 ]
                 jump_ea = self.match_start + jump_offset_in_segment
-                logging.info(
+                logging.debug(
                     "STAGE1_SINGLE: match_start=0x%X, jump_offset_in_segment=%d, calculated jump_ea=0x%X",
                     self.match_start,
                     jump_offset_in_segment,
@@ -3505,7 +3545,7 @@ class JumpTargetAnalyzer:
                 # The MatchChain's base_address (self.match_start here) is the jump_ea.
                 jump_offset = 0
                 jump_ea = self.match_start + jump_offset
-                logging.info(
+                logging.debug(
                     "STAGE1_MULTIPLE: match_start=0x%X, jump_ea=0x%X",
                     self.match_start,
                     jump_ea,
@@ -3514,7 +3554,9 @@ class JumpTargetAnalyzer:
                 logging.error(
                     f"Invalid stage1_type: {chain.stage1_type} for chain: {chain}"
                 )
+                return self
 
+        decoder = CapstoneInstructionDecoder(is_x64)
         final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
         if not final_target:
             logging.debug(
@@ -3536,12 +3578,13 @@ class JumpTargetAnalyzer:
         For each candidate, if a jump exists whose starting address equals candidate + 1,
         yield its final target instead.
 
-        Sorting is by count descending, then by final_target descending.
+        Sorting is by count descending
         """
         # Prepare a list of (final_target, count) tuples
         results = list(self.jump_targets.items())
-        # Sort by count descending, then by final_target descending
-        results.sort(key=lambda x: (x[1], x[0]), reverse=True)
+        # Sort by count descending
+        results.sort(key=lambda x: (x[1], x[0]))
+
         for candidate, count in results:
             final_candidate = candidate
             for jump_ea, target, stype in self.jump_details:
@@ -3549,6 +3592,61 @@ class JumpTargetAnalyzer:
                     final_candidate = target
                     break
             yield final_candidate
+            break
+
+
+def _analyze_chain(
+    chain: MatchChain,
+    mem: bytes,
+    start_ea: int,
+    is_x64: bool,
+    max_size: int = MAX_PATTERN_LEN,
+) -> list[Range]:
+    """
+    Filter out false positive anti-disassembly patterns and analyze jump chains.
+
+    Args:
+        chain: The MatchChain object representing the pattern and surrounding bytes.
+        mem: Memory bytes of the relevant segment.
+        start_ea: The starting effective address of the 'mem' bytes.
+        is_x64: Boolean indicating if the architecture is x64.
+        max_size: Maximum valid size for an anti-disassembly routine.
+
+    Returns:
+        A list of Range objects representing resolved code blocks stemming from the chain.
+    """
+
+    match_start = chain.overall_start()
+    chain_end = match_start + max_size
+    ranges = []
+
+    logging.debug("Analyzing match: %s @ 0x%X", chain.description, match_start)
+
+    jump_analyzer = JumpTargetAnalyzer(
+        chain.overall_matched_bytes(), match_start, chain_end, start_ea
+    )
+    jump_targets_iter = jump_analyzer.process(mem=mem, chain=chain, is_x64=is_x64)
+
+    for target in jump_targets_iter:
+        if target is None:
+            logging.debug(
+                "JumpTargetAnalyzer yielded None for chain @ 0x%X, skipping this target.",
+                match_start,
+            )
+            continue
+        if target <= match_start:
+            logging.debug(
+                "Invalid jump target 0x%X (<= match_start 0x%X) for chain. Skipping.",
+                target,
+                match_start,
+            )
+            continue
+
+        logging.debug(
+            "Most likely target: 0x%X, analysis boundary: 0x%X", target, chain_end
+        )
+        ranges.append(Range(match_start, target))
+    return ranges
 
 
 def resolve_overlaps(ranges: list[Range]) -> IntervalSet:
@@ -3558,17 +3656,30 @@ def resolve_overlaps(ranges: list[Range]) -> IntervalSet:
     """
     logging.info(f"Resolving overlaps among {len(ranges)} ranges")
     intervals = IntervalSet()
+    # Sort ranges by start address and remove duplicates
+    ranges = sorted(set(ranges), key=lambda x: x.start)
 
     for r in ranges:
+
+        if intervals.empty():
+            intervals.add(r)
+            continue
+
+        last_range = intervals.last()
+
+        if intervals.covers(r.start):
+            # this is likely a false positive anti-disassembly pattern that we've already seen
+            logging.info(f"  Rejected overlap: {r} (already covered by {last_range})")
+            continue
+
         intervals.add(r)
 
-        # decide whether to keep the chain object itself
-        last_end = intervals.as_tuples()[-1][1]  # rightmost byte so far
+        last_end = last_range.end if last_range else 0
         target = r.end
         if target == last_end:  # this chain extended the interval set
-            logging.info(f"  Accepted (or widened): {r.start:X}-{r.end:X}")
+            logging.info(f"  Accepted (or widened): {r}")
         else:
-            logging.info(f"  Rejected overlap: {r.start:X}-{r.end:X}")
+            logging.debug(f"  Rejected overlap: {r}")
 
     return intervals
 
