@@ -38,8 +38,6 @@ from PyQt5.QtCore import (
     pyqtSignal,
 )
 from PyQt5.QtGui import QStandardItem, QStandardItemModel
-
-# Qt imports
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -49,6 +47,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -652,47 +651,52 @@ class CodeRegionSlicer:
 
 # --- Pattern Detection Classes ---
 
-# ----------------------------------------------------------------------
-# Signature-pattern cache  (pattern-string → compiled_binpat_vec_t)
-# ----------------------------------------------------------------------
-_sig_cache: dict[bytes, ida_bytes.compiled_binpat_vec_t] = {}
 
+class ByteSequenceSearcher:
+    """Encapsulates byte sequence searching with a cache for compiled patterns."""
 
-def find_byte_sequence(
-    start: int,
-    end: int,
-    sig: list[int] | bytes | str,
-    direction: int = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW,
-) -> Iterator[int]:
-    """Cached pattern search: compiles each unique signature once."""
-    if isinstance(sig, str):
-        sigstr = sig
-    elif isinstance(sig, list):
-        sigstr = " ".join(f"{b:02x}" if b != -1 else "?" for b in sig)
-    else:
-        sigstr = sig.hex()
-    key = sigstr.encode("utf-8")
-    cpv = _sig_cache.get(key)
-    if cpv is None:
-        cpv = ida_bytes.compiled_binpat_vec_t()
-        err = ida_bytes.parse_binpat_str(
-            cpv,
-            start,
-            sigstr,
-            16,
-            ida_nalt.get_default_encoding_idx(ida_nalt.BPU_1B),
-        )
-        if err:
-            return
-        _sig_cache[key] = cpv
+    def __init__(self):
+        self._compiled_pattern_cache: dict[bytes, ida_bytes.compiled_binpat_vec_t] = {}
 
-    ea = start
-    while True:
-        res, _ = ida_bytes.bin_search(ea, end, cpv, direction)
-        if res == idaapi.BADADDR:
-            break
-        yield res
-        ea = res + 1
+    def find(
+        self,
+        start: int,
+        end: int,
+        sig: list[int] | bytes | str,
+        direction: int = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW,
+    ) -> Iterator[int]:
+        """Cached pattern search: compiles each unique signature once."""
+        if isinstance(sig, str):
+            sigstr = sig
+        elif isinstance(sig, list):
+            sigstr = " ".join(f"{b:02x}" if b != -1 else "?" for b in sig)
+        else:
+            sigstr = sig.hex()
+        key = sigstr.encode("utf-8")
+        cpv = self._compiled_pattern_cache.get(key)
+        if cpv is None:
+            cpv = ida_bytes.compiled_binpat_vec_t()
+            err = ida_bytes.parse_binpat_str(
+                cpv,
+                start,
+                sigstr,
+                16,
+                ida_nalt.get_default_encoding_idx(ida_nalt.BPU_1B),
+            )
+            if err:
+                logging.error(
+                    f"Failed to parse binary pattern: '{sigstr}'. Error: {err}"
+                )
+                return
+            self._compiled_pattern_cache[key] = cpv
+
+        ea = start
+        while True:
+            res, _ = ida_bytes.bin_search(ea, end, cpv, direction)
+            if res == idaapi.BADADDR:
+                break
+            yield res
+            ea = res + 1
 
 
 @dataclass
@@ -1827,17 +1831,6 @@ class CustomFilterProxyModel(QSortFilterProxyModel):
         return str(ldata_display) < str(rdata_display)
 
 
-class WorkerSignals(QObject):
-    auto_started = pyqtSignal()
-    auto_finished = (
-        pyqtSignal()
-    )  # Renamed from your 'finished' to avoid conflict if we use QThread's finished later
-    error = pyqtSignal(tuple)  # (type, value, traceback_str)
-    result = pyqtSignal(object, object, bool)  # result_data, aux_data, success_flag
-    progress = pyqtSignal(int)  # percentage
-
-
-
 pp = {
     0x18009B27D,
 }
@@ -1845,13 +1838,24 @@ pp = {
 found = set()
 
 
-class FastPatternMatcher:
-    """Optimized pattern matcher using IDA's signature search + Capstone verification."""
+# =====================================================================
+# PATTERN ANALYSIS CORE
+# =====================================================================
+class PatternAnalysisEngine:
+    """Handles pattern detection and analysis logic."""
 
-    def __init__(self, pattern_generator=more_specific_pattern_generator):
-        self.detector = PatternDetector()
-        self.junk_detector = JunkDetector()  # Add junk detector
-        self.pattern_generator = pattern_generator
+    def __init__(self):
+        self.cs = self._init_capstone()
+        self.junk_detector = JunkDetector()
+        self.sig_searcher = ByteSequenceSearcher()
+        self.pattern_generator = more_specific_pattern_generator
+
+    def _init_capstone(self) -> Optional[capstone.Cs]:
+        if not USE_CAPSTONE:
+            return None
+        cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        cs.detail = True
+        return cs
 
     def find_pattern_candidates(self, start_ea: int, end_ea: int) -> List[int]:
         """Find all potential pattern locations using fast signature search."""
@@ -1861,7 +1865,7 @@ class FastPatternMatcher:
         )
         # Search for conditional jumps (multi-part patterns)
         for pattern_name, opcodes in self.pattern_generator():
-            for ea in find_byte_sequence(start_ea, end_ea, opcodes):
+            for ea in self.sig_searcher.find(start_ea, end_ea, opcodes):
                 # print(f"Found pattern candidate at {hex(ea)} with {_x(opcodes)}")
                 candidates.add(ea)
         # Find addresses in pp but not in candidates
@@ -1908,7 +1912,7 @@ class FastPatternMatcher:
     ) -> List[PatternMatch]:
         """Find patterns in a small byte sequence with junk validation."""
         patterns = []
-        if not USE_CAPSTONE or self.detector.cs is None:
+        if not USE_CAPSTONE or self.cs is None:
             return patterns
 
         TARGET_DEBUG_ADDRESS = 0x18000AF89  # 0x18000AF13
@@ -1923,7 +1927,7 @@ class FastPatternMatcher:
             )
 
         try:
-            instructions = list(self.detector.cs.disasm(data, base_address))
+            instructions = list(self.cs.disasm(data, base_address))
             if not instructions:
                 return patterns
 
@@ -2182,10 +2186,16 @@ class FastPatternMatcher:
         return _COMPILED_PREFIX_REGEX.match(insn.bytes) is not None
 
 
+class WorkerSignals(QObject):
+    auto_started = pyqtSignal()
+    auto_finished = pyqtSignal()
+    error = pyqtSignal(tuple)
+    result = pyqtSignal(object, object, bool)
+    progress = pyqtSignal(int)
+
+
 class AnalysisTask(QRunnable):
-    """
-    A QRunnable task to analyze a single pattern match (pm) in a separate thread.
-    """
+    """Task to analyze a single pattern match in a separate thread."""
 
     def __init__(
         self,
@@ -2193,211 +2203,287 @@ class AnalysisTask(QRunnable):
         pm,
         mem_start_ea,
         mem_bytes,
-        matcher_instance,
+        analysis_engine,
         is_x64,
+        analysis_orchestrator,
     ):
         super().__init__()
-        self.pattern_detection_widget = pattern_detection_widget
         self.pm = pm
         self.mem_start_ea = mem_start_ea
         self.mem_bytes = mem_bytes
-        self.matcher_instance = matcher_instance
+        self.analysis_engine = analysis_engine
         self.is_x64 = is_x64
+        self.analysis_orchestrator = analysis_orchestrator
         self.result_ranges = []
         self.error = None
-        # Store ida_address for reliable logging, as pm object might have thread affinity issues
-        # or its attributes might be accessed from a different thread context.
         self.pm_ida_address = pm.ida_address
 
     def run(self):
-        """
-        Executes the analysis task.
-        This method is called when the task is run by a thread in the QThreadPool.
-        """
         try:
-            # Access _convert_pm_to_mchain from the passed PatternDetectionWidget instance
-            mchain = self.pattern_detection_widget._convert_pm_to_mchain(
-                self.pm, self.mem_start_ea, self.mem_bytes, self.matcher_instance
+            mchain = self.analysis_orchestrator._convert_pm_to_mchain(
+                self.pm, self.mem_start_ea, self.mem_bytes, self.analysis_engine
             )
-            if not mchain:
-                # Logging is expected to be handled within _convert_pm_to_mchain
-                return
-
-            logging.debug(
-                "Threaded: Calling _analyze_chain for MatchChain at 0x%X (pm: 0x%X)",
-                mchain.overall_start(),
-                self.pm_ida_address,  # Use stored pm_ida_address
-            )
-            # _analyze_chain is assumed to be a global function or correctly imported/defined
-            # to be accessible here. It should also be thread-safe.
-            pm_ranges = _analyze_chain(
-                mchain, self.mem_bytes, self.mem_start_ea, self.is_x64
-            )
-            self.result_ranges = pm_ranges
-            logging.debug(
-                "Threaded: _analyze_chain for 0x%X (pm: 0x%X) returned %d ranges.",
-                mchain.overall_start(),
-                self.pm_ida_address,  # Use stored pm_ida_address
-                len(self.result_ranges),
-            )
+            if mchain:
+                pm_ranges = self.analysis_orchestrator._analyze_chain_method(mchain)
+                self.result_ranges = pm_ranges
         except Exception as e:
             self.error = e
             logging.error(
-                "Threaded: Error in AnalysisTask for pm at 0x%X: %s",
-                self.pm_ida_address,  # Use stored pm_ida_address
+                "Error in AnalysisTask for pm at 0x%X: %s",
+                self.pm_ida_address,
                 e,
                 exc_info=True,
             )
 
 
 class CapstoneAnalysisRunnable(QRunnable):
-    def __init__(self, data_chunk, matcher):
+    def __init__(self, data_chunk, analysis_engine):
         super().__init__()
         self.data_chunk = data_chunk
-        self.matcher = matcher
+        self.analysis_engine = analysis_engine
         self.signals = WorkerSignals()
 
     def run(self):
         self.signals.auto_started.emit()
         try:
-            if self.matcher is None:
-                logging.error("CapstoneAnalysisRunnable: Matcher is None")
-                raise ValueError("Matcher is None in CapstoneAnalysisRunnable")
             chunk_matches = []
             items_processed_in_this_chunk = 0
 
-            TARGET_DEBUG_ADDRESS = 0x18009B27D
-            DEBUG_LOGGING_WINDOW_LARGE = 500
-
             for candidate_ea, region_bytes, base_address in self.data_chunk:
-                if (
-                    abs(candidate_ea - TARGET_DEBUG_ADDRESS)
-                    <= DEBUG_LOGGING_WINDOW_LARGE
-                ):
-                    logging.info(
-                        "CapstoneAnalysisRunnable: Processing candidate_ea: 0x%X, region_base_ea: 0x%X, region_len: %d (TARGET NEARBY)",
-                        candidate_ea,
-                        base_address,
-                        len(region_bytes) if region_bytes else 0,
-                    )
-                matches = self.matcher.analyze_candidate_region_bytes(
+                matches = self.analysis_engine.analyze_candidate_region_bytes(
                     region_bytes, base_address, candidate_ea
                 )
                 chunk_matches.extend(matches)
                 items_processed_in_this_chunk += 1
-
                 self.signals.progress.emit(1)
+
             self.signals.result.emit(chunk_matches, items_processed_in_this_chunk, True)
         except Exception as e:
             tb_str = "".join(
                 traceback.format_exception(e.__class__, e, e.__traceback__)
             )
             self.signals.error.emit((e.__class__.__name__, str(e), tb_str))
-            # Emit a dummy result indicating failure for this chunk
             self.signals.result.emit([], 0, False)
         finally:
             self.signals.auto_finished.emit()
 
 
-class PatternDetectionWidget(QWidget):
-    """Main dialog for pattern detection with progress tracking and results display."""
+class AnalysisOrchestrator:
+    """Orchestrates pattern analysis workflow and range resolution."""
+
+    def __init__(self, analysis_engine, text_segment_bytes, text_segment_start_ea):
+        self.analysis_engine = analysis_engine
+        self.text_segment_bytes = text_segment_bytes
+        self.text_segment_start_ea = text_segment_start_ea
+        self.cs_instance = analysis_engine.cs
+        self.is_x64 = (
+            analysis_engine.cs and analysis_engine.cs.mode == capstone.CS_MODE_64
+        )
+
+    def _analyze_chain_method(self, chain: MatchChain) -> list[Range]:
+        """Filter out false positive anti-disassembly patterns and analyze jump chains."""
+        match_start = chain.overall_start()
+        chain_end = match_start + MAX_PATTERN_LEN
+        ranges = []
+
+        jump_analyzer = JumpTargetAnalyzer(
+            chain.overall_matched_bytes(),
+            match_start,
+            chain_end,
+            self.text_segment_start_ea,
+        )
+        jump_targets_iter = jump_analyzer.process(
+            mem=self.text_segment_bytes, chain=chain, is_x64=self.is_x64
+        )
+
+        for target in jump_targets_iter:
+            if target is None or target <= match_start:
+                continue
+            ranges.append(Range(match_start, target))
+        return ranges
+
+    @staticmethod
+    def resolve_overlaps_static(ranges: list[Range]) -> IntervalSet:
+        """Fast, linear-time overlap resolution."""
+        intervals = IntervalSet()
+        ranges = sorted(set(ranges), key=lambda x: x.start)
+
+        for r in ranges:
+            if intervals.empty():
+                intervals.add(r)
+                continue
+
+            last_range = intervals.last()
+            if intervals.covers(r.start):
+                continue
+            intervals.add(r)
+        return intervals
+
+    @staticmethod
+    def _convert_pm_to_mchain(
+        pm: PatternMatch,
+        mem_start_ea: int,
+        mem_bytes: bytes,
+        matcher: PatternAnalysisEngine,
+    ) -> Optional[MatchChain]:
+        if pm.category == PatternCategory.JUNK:
+            return None
+
+        current_segment_type = None
+        if pm.category == PatternCategory.MULTI_PART:
+            current_segment_type = SegmentType.STAGE1_MULTIPLE
+        elif pm.category == PatternCategory.SINGLE_PART:
+            current_segment_type = SegmentType.STAGE1_SINGLE
+        else:
+            return None
+
+        if not pm.instructions:
+            return None
+
+        chain_instructions = pm.instructions
+        chain_start_addr = chain_instructions[0].address
+        chain_end_addr = chain_instructions[-1].address + chain_instructions[-1].size
+        chain_len = chain_end_addr - chain_start_addr
+
+        if chain_len <= 0:
+            return None
+
+        chain_offset_in_mem = chain_start_addr - mem_start_ea
+        if not (
+            0 <= chain_offset_in_mem < len(mem_bytes)
+            and 0 <= chain_offset_in_mem + chain_len <= len(mem_bytes)
+        ):
+            return None
+
+        chain_actual_bytes = mem_bytes[
+            chain_offset_in_mem : chain_offset_in_mem + chain_len
+        ]
+        seg_groups = {}
+
+        if current_segment_type == SegmentType.STAGE1_SINGLE:
+            jump_insn = None
+            for insn in reversed(chain_instructions):
+                if matcher._is_conditional_jump(insn):
+                    jump_insn = insn
+                    break
+            if jump_insn:
+                jump_offset_in_segment = jump_insn.address - chain_start_addr
+                seg_groups = {
+                    "jump_bytes": jump_insn.bytes,
+                    "jump_offset_in_segment": jump_offset_in_segment,
+                }
+
+        current_segment = MatchSegment(
+            start=0,
+            length=chain_len,
+            description=pm.description,
+            matched_bytes=chain_actual_bytes,
+            segment_type=current_segment_type,
+            matched_groups=seg_groups,
+        )
+        return MatchChain(base_address=chain_start_addr, segments=[current_segment])
+
+    @staticmethod
+    def _create_pm_from_resolved_range(
+        resolved_range: Range,
+        cs_instance: capstone.Cs,
+        mem_start_ea: int,
+        mem_bytes: bytes,
+    ) -> Optional[PatternMatch]:
+        range_start_ea = resolved_range.start
+        range_len = len(resolved_range)
+        range_offset_in_mem = range_start_ea - mem_start_ea
+
+        if not (
+            0 <= range_offset_in_mem < len(mem_bytes)
+            and 0 <= range_offset_in_mem + range_len <= len(mem_bytes)
+        ):
+            return None
+
+        range_bytes_data = mem_bytes[
+            range_offset_in_mem : range_offset_in_mem + range_len
+        ]
+        range_instructions = (
+            list(cs_instance.disasm(range_bytes_data, range_start_ea))
+            if cs_instance
+            else []
+        )
+
+        return PatternMatch(
+            category=PatternCategory.SINGLE_PART,
+            description=f"Resolved Block: 0x{range_start_ea:X} - 0x{resolved_range.end:X}",
+            start_offset=0,  # Relative to ida_address of this new PM
+            end_offset=range_len,  # Relative to ida_address
+            instructions=range_instructions,
+            pattern_name="ResolvedBlock",
+            ida_address=range_start_ea,
+            junk_count=0,  # Junk count is not determined by this process
+            total_length=range_len,
+        )
+
+
+# =====================================================================
+# UI COMPONENTS
+# =====================================================================
+class ControlPanel(QGroupBox):
+    """UI component for detection control buttons."""
 
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Obfuscation Pattern Detection")
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.matcher = None  # Will be set to FastPatternMatcher when needed
-        self.all_patterns = []
-        self.start_time = None
-        self.next_prompt_time = 120
-        self.enable_continue_prompt = False
-        self.text_segment_bytes: Optional[bytes] = None
-        self.text_segment_start_ea: int = 0
-
-        # Initialize the code slicer
-        self.code_slicer = CodeRegionSlicer(
-            region_size_before=0,
-            region_size_after=MAX_PATTERN_LEN * 2,
-            max_total_region_size=MAX_PATTERN_LEN * 2,
-        )
-
-        # Thread pool for Capstone analysis
-        self.thread_pool = QThreadPool.globalInstance()
-        self.thread_pool.setMaxThreadCount(
-            max(
-                QThreadPool.globalInstance().maxThreadCount(),
-                multiprocessing.cpu_count(),
-            )
-        )
-        self.active_runnables = 0
-        self.collected_matches_from_runnables = []
-        # Total candidate data points for analysis phase
-        self.total_items_for_analysis = 0
-        # Count of items processed in analysis phase
-        self.items_processed_count = 0
-
-        self.candidates = []
-        self.current_candidate_idx = 0
-        self.candidates_data = []  # For worker thread
-
-        self.ui_update_timer = QTimer(self)  # Timer for updating elapsed time
-
-        self._setup_ui()
-        self._connect_signals()
-
-    def _setup_ui(self):
-        """Setup the user interface."""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        # Control section
-        control_group = QGroupBox("Detection Control")
-        control_layout = QHBoxLayout()
+        super().__init__("Detection Control", parent)
+        self.layout = QHBoxLayout()
 
         self.start_btn = QPushButton("Start Detection")
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
 
-        # Save/Load buttons
         self.save_btn = QPushButton("Save Results")
         self.load_btn = QPushButton("Load Results")
         self.export_csv_btn = QPushButton("Export CSV")
         self.clear_btn = QPushButton("Clear Results")
-        self.save_btn.setEnabled(False)  # Enabled when patterns are found
-        self.export_csv_btn.setEnabled(False)  # Enabled when patterns are found
-        self.clear_btn.setEnabled(False)  # Enabled when patterns are found
 
-        control_layout.addWidget(self.start_btn)
-        control_layout.addWidget(self.cancel_btn)
-        control_layout.addWidget(QLabel("|"))  # Separator
-        control_layout.addWidget(self.save_btn)
-        control_layout.addWidget(self.load_btn)
-        control_layout.addWidget(self.export_csv_btn)
-        control_layout.addWidget(self.clear_btn)
-        control_layout.addStretch()
-        control_group.setLayout(control_layout)
-        # let the control row fill the full width
-        control_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.save_btn.setEnabled(False)
+        self.export_csv_btn.setEnabled(False)
+        self.clear_btn.setEnabled(False)
 
-        # Progress section
-        progress_group = QGroupBox("Progress")
-        progress_layout = QVBoxLayout()
+        self.layout.addWidget(self.start_btn)
+        self.layout.addWidget(self.cancel_btn)
+        self.layout.addWidget(QLabel("|"))
+        self.layout.addWidget(self.save_btn)
+        self.layout.addWidget(self.load_btn)
+        self.layout.addWidget(self.export_csv_btn)
+        self.layout.addWidget(self.clear_btn)
+        self.layout.addStretch()
+
+        self.setLayout(self.layout)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+
+class ProgressDisplay(QGroupBox):
+    """UI component for progress tracking."""
+
+    def __init__(self, parent=None):
+        super().__init__("Progress", parent)
+        self.layout = QVBoxLayout()
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_label = QLabel("Ready to start detection...")
         self.time_label = QLabel("Elapsed: 0s")
 
-        progress_layout.addWidget(self.progress_bar)
-        progress_layout.addWidget(self.progress_label)
-        progress_layout.addWidget(self.time_label)
-        progress_group.setLayout(progress_layout)
-        # let the progress row fill the full width
-        progress_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.layout.addWidget(self.progress_bar)
+        self.layout.addWidget(self.progress_label)
+        self.layout.addWidget(self.time_label)
 
-        # Results section
-        results_group = QGroupBox("Detection Results")
-        results_layout = QVBoxLayout()
+        self.setLayout(self.layout)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+
+class ResultsView(QGroupBox):
+    """UI component for results display and filtering."""
+
+    def __init__(self, parent=None):
+        super().__init__("Detection Results", parent)
+        self.layout = QVBoxLayout()
 
         # Filter controls
         filter_layout = QHBoxLayout()
@@ -2416,20 +2502,23 @@ class PatternDetectionWidget(QWidget):
         self.clear_filter_btn = QPushButton("Clear")
         filter_layout.addWidget(self.clear_filter_btn)
 
-        results_layout.addLayout(filter_layout)
+        self.layout.addLayout(filter_layout)
 
-        # Results table -> TreeView
+        # Results table
         self.results_tree_view = QTreeView()
-        # make the tree view expand when its container resizes
         self.results_tree_view.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Expanding
         )
         self.results_tree_view.setAlternatingRowColors(True)
         self.results_tree_view.setSortingEnabled(True)
-        self.results_tree_view.setRootIsDecorated(False)  # For a flat list look
-        self.results_tree_view.setEditTriggers(QTreeView.NoEditTriggers)  # Read-only
+        self.results_tree_view.setRootIsDecorated(False)
+        self.results_tree_view.setEditTriggers(QTreeView.NoEditTriggers)
+        self.results_tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.results_tree_view.customContextMenuRequested.connect(
+            self._on_context_menu_requested
+        )
 
-        self.source_model = QStandardItemModel(0, 7)  # 0 rows, 7 columns
+        self.source_model = QStandardItemModel(0, 7)
         self.source_model.setHorizontalHeaderLabels(
             [
                 "Address",
@@ -2442,82 +2531,211 @@ class PatternDetectionWidget(QWidget):
             ]
         )
 
-        # Parent `self` for QObject management
         self.proxy_model = CustomFilterProxyModel(self)
         self.proxy_model.setSourceModel(self.source_model)
         self.results_tree_view.setModel(self.proxy_model)
 
         header = self.results_tree_view.header()
-        # allow the user to drag‐resize any column, and even reorder them
         header.setSectionsClickable(True)
         header.setSectionsMovable(True)
-        # default to Interactive so users can drag edges
         header.setSectionResizeMode(QHeaderView.Interactive)
-        # for col in range(7):
-        #     header.setSectionResizeMode(col, QHeaderView.Stretch)
-        # # ensure the very last section also expands into any leftover pixels
         last = header.model().columnCount() - 1
         header.setSectionResizeMode(last, QHeaderView.Stretch)
-        # header.setStretchLastSection(True)
 
-        results_layout.addWidget(self.results_tree_view)
+        self.layout.addWidget(self.results_tree_view)
 
         # Summary
         self.summary_label = QLabel("No patterns detected yet.")
-        results_layout.addWidget(self.summary_label)
+        self.layout.addWidget(self.summary_label)
 
-        results_group.setLayout(results_layout)
-        # let the results section fill width & height
-        results_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setLayout(self.layout)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def _on_context_menu_requested(self, position):
+        index = self.results_tree_view.indexAt(position)
+        if not index.isValid():
+            return
+
+        menu = QMenu()
+        copy_row_action = menu.addAction("Copy Row")
+        copy_cell_action = menu.addAction("Copy Cell Value")
+
+        action = menu.exec_(self.results_tree_view.viewport().mapToGlobal(position))
+
+        if action == copy_row_action:
+            self._copy_selected_row(index)
+        elif action == copy_cell_action:
+            self._copy_selected_cell(index)
+
+    def _copy_selected_row(self, index: QModelIndex):
+        model = index.model()  # This could be the proxy model
+        row_data = []
+        for column in range(model.columnCount()):
+            sibling_index = model.index(index.row(), column, index.parent())
+            cell_value = model.data(sibling_index, Qt.DisplayRole)
+            row_data.append(str(cell_value) if cell_value is not None else "")
+
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\t".join(row_data))
+        logging.info("Copied row: %s", "\t".join(row_data))
+
+    def _copy_selected_cell(self, index: QModelIndex):
+        model = index.model()
+        cell_value = model.data(index, Qt.DisplayRole)
+        clipboard = QApplication.clipboard()
+        clipboard.setText(str(cell_value) if cell_value is not None else "")
+        logging.info("Copied cell: %s", cell_value)
+
+
+class PatternDisplayAdapter:
+    """Bridges pattern data with UI model."""
+
+    def __init__(self, source_model: QStandardItemModel):
+        self.model = source_model
+
+    def clear_model(self):
+        self.model.removeRows(0, self.model.rowCount())
+
+    def populate_model(self, patterns: List[PatternMatch]):
+        self.clear_model()
+        for pattern in patterns:
+            self.add_pattern(pattern)
+
+    def add_pattern(self, pattern: PatternMatch):
+        addr_item = QStandardItem(f"0x{pattern.ida_address:08X}")
+        addr_item.setData(pattern.ida_address, Qt.UserRole)
+
+        cat_text = pattern.category.name.replace("_", " ").title()
+        cat_item = QStandardItem(cat_text)
+
+        desc_item = QStandardItem(pattern.description)
+        name_item = QStandardItem(pattern.pattern_name)
+
+        insn_text = " ; ".join(
+            [f"{insn.mnemonic} {insn.op_str}" for insn in pattern.instructions[:3]]
+        )
+        if len(pattern.instructions) > 3:
+            insn_text += " ; ..."
+        insn_item = QStandardItem(insn_text)
+
+        junk_count_item = QStandardItem(str(pattern.junk_count))
+        junk_count_item.setData(pattern.junk_count, Qt.UserRole)
+
+        total_length_item = QStandardItem(str(pattern.total_length))
+        total_length_item.setData(pattern.total_length, Qt.UserRole)
+
+        row_items = [
+            addr_item,
+            cat_item,
+            desc_item,
+            name_item,
+            insn_item,
+            junk_count_item,
+            total_length_item,
+        ]
+        self.model.appendRow(row_items)
+
+
+class PatternDetectionWidget(QWidget):
+    """Main widget for pattern detection with composed UI components."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Obfuscation Pattern Detection")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.analysis_engine = PatternAnalysisEngine()
+        self.all_patterns = []
+        self.start_time = None
+        self.next_prompt_time = 120
+        self.enable_continue_prompt = False
+        self.text_segment_bytes: Optional[bytes] = None
+        self.text_segment_start_ea: int = 0
+
+        self.code_slicer = CodeRegionSlicer(
+            region_size_before=0,
+            region_size_after=MAX_PATTERN_LEN * 2,
+            max_total_region_size=MAX_PATTERN_LEN * 2,
+        )
+
+        self.thread_pool = QThreadPool.globalInstance()
+        self.thread_pool.setMaxThreadCount(
+            max(
+                QThreadPool.globalInstance().maxThreadCount(),
+                multiprocessing.cpu_count(),
+            )
+        )
+
+        self.active_runnables = 0
+        self.collected_matches_from_runnables = []
+        self.total_items_for_analysis = 0
+        self.items_processed_count = 0
+        self.candidates = []
+        self.current_candidate_idx = 0
+        self.candidates_data = []
+
+        self.ui_update_timer = QTimer(self)
+
+        self._setup_ui()
+        self._connect_signals()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Create UI components
+        self.control_panel = ControlPanel()
+        self.progress_display = ProgressDisplay()
+        self.results_view = ResultsView()
+        self.display_adapter = PatternDisplayAdapter(self.results_view.source_model)
 
         # Layout assembly
         splitter = QSplitter(Qt.Vertical)
-
         top_widget = QWidget()
         top_layout = QVBoxLayout()
-        top_layout.addWidget(control_group)
-        top_layout.addWidget(progress_group)
+        top_layout.addWidget(self.control_panel)
+        top_layout.addWidget(self.progress_display)
         top_widget.setLayout(top_layout)
-        # container for control+progress should also expand horizontally
         top_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         splitter.addWidget(top_widget)
-        splitter.addWidget(results_group)
-        splitter.setSizes([200, 400])  # Give more space to results
-        # give the splitter all excess space (stretch=1)
+        splitter.addWidget(self.results_view)
+        splitter.setSizes([200, 400])
         layout.addWidget(splitter, 1)
 
-        # and make the splitter itself expand in both directions
         splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setLayout(layout)
 
     def _connect_signals(self):
-        """Connect UI signals."""
-        self.start_btn.clicked.connect(self.start_detection)
-        self.cancel_btn.clicked.connect(self.cancel_detection)
-        self.filter_input.textChanged.connect(self.apply_filters)
-        self.category_filter.currentTextChanged.connect(self.apply_filters)
-        self.clear_filter_btn.clicked.connect(self.clear_filters)
-        self.results_tree_view.doubleClicked.connect(self.goto_pattern_tree_item)
+        # Connect UI signals
+        self.control_panel.start_btn.clicked.connect(self.start_detection)
+        self.control_panel.cancel_btn.clicked.connect(self.cancel_detection)
+        self.results_view.filter_input.textChanged.connect(self.apply_filters)
+        self.results_view.category_filter.currentTextChanged.connect(self.apply_filters)
+        self.results_view.clear_filter_btn.clicked.connect(self.clear_filters)
+        self.results_view.results_tree_view.doubleClicked.connect(
+            self.goto_pattern_tree_item
+        )
 
         # Connect Save/Load/Export/Clear buttons
-        self.save_btn.clicked.connect(self.save_results)
-        self.load_btn.clicked.connect(self.load_results)
-        self.export_csv_btn.clicked.connect(self.export_csv)
-        self.clear_btn.clicked.connect(self.clear_results)
+        self.control_panel.save_btn.clicked.connect(self.save_results)
+        self.control_panel.load_btn.clicked.connect(self.load_results)
+        self.control_panel.export_csv_btn.clicked.connect(self.export_csv)
+        self.control_panel.clear_btn.clicked.connect(self.clear_results)
 
         self.ui_update_timer.timeout.connect(self._update_runtime_display)
 
     def _update_runtime_display(self):
         """Periodically updates the elapsed time label."""
         if self.start_time is not None and (
-            self.cancel_btn.isEnabled() or not self.start_btn.isEnabled()
+            self.control_panel.cancel_btn.isEnabled()
+            or not self.control_panel.start_btn.isEnabled()
         ):  # Only update if running
             elapsed_time = time.time() - self.start_time
             minutes = int(elapsed_time / 60)
             seconds = int(elapsed_time % 60)
             time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-            self.time_label.setText(f"Elapsed: {time_str}")
+            self.progress_display.time_label.setText(f"Elapsed: {time_str}")
         # else:
         # If start_time is None or detection not active, could clear or set to "Elapsed: 0s"
         # self.time_label.setText("Elapsed: 0s") # Or keep last value if preferred
@@ -2526,8 +2744,8 @@ class PatternDetectionWidget(QWidget):
     def start_detection(self, *, segm_range: ida_range.range_t | None = None):
         """Start pattern detection on main thread."""
         try:
-            if not self.matcher:
-                self.matcher = FastPatternMatcher()
+            if not self.analysis_engine:
+                self.analysis_engine = PatternAnalysisEngine()
 
             if segm_range is None:
                 segm_range = ida_segment.get_segm_by_name(".text")
@@ -2553,19 +2771,26 @@ class PatternDetectionWidget(QWidget):
                 self.handle_error(f"Error reading .text segment: {e}")
                 return
 
-            self.start_btn.setEnabled(False)
-            self.cancel_btn.setEnabled(True)
-            self.progress_bar.setValue(0)
+            self.control_panel.start_btn.setEnabled(False)
+            self.control_panel.cancel_btn.setEnabled(True)
+            self.progress_display.progress_bar.setValue(0)
             self.all_patterns.clear()
-            self.source_model.removeRows(0, self.source_model.rowCount())
-            self.time_label.setText("Elapsed: 0s")  # Reset display at start
+            self.results_view.source_model.removeRows(
+                0, self.results_view.source_model.rowCount()
+            )
+            self.progress_display.time_label.setText(
+                "Elapsed: 0s"
+            )  # Reset display at start
+            self.start_time = time.time()  # Initialize start_time
             self.ui_update_timer.start(
                 1000
             )  # Start UI update timer (1 second interval)
 
-            self.progress_label.setText("Searching for pattern candidates...")
+            self.progress_display.progress_label.setText(
+                "Searching for pattern candidates..."
+            )
 
-            self.candidates = self.matcher.find_pattern_candidates(
+            self.candidates = self.analysis_engine.find_pattern_candidates(
                 segm_range.start_ea, segm_range.end_ea
             )
             logging.info("Found %d potential pattern candidates", len(self.candidates))
@@ -2574,8 +2799,8 @@ class PatternDetectionWidget(QWidget):
                 self.detection_finished([])
                 return
 
-            self.progress_bar.setValue(10)
-            self.progress_label.setText("Preparing candidate data...")
+            self.progress_display.progress_bar.setValue(10)
+            self.progress_display.progress_label.setText("Preparing candidate data...")
 
             # Phase 2: Prepare all candidate data in a single step
             self.candidates_data = []
@@ -2588,7 +2813,9 @@ class PatternDetectionWidget(QWidget):
                 logger=logging.getLogger(),
             )
             def progress_callback(idx: int):
-                if self.cancel_btn.isEnabled() == False:  # Check if cancelled
+                if (
+                    self.control_panel.cancel_btn.isEnabled() == False
+                ):  # Check if cancelled
                     logging.info("Data preparation cancelled.")
                     self.detection_finished([])  # Or handle cancellation more formally
                     return False
@@ -2599,8 +2826,8 @@ class PatternDetectionWidget(QWidget):
                     or idx == total_candidates - 1
                 ):  # Update roughly 100 times or at the end
                     progress = int(10 + (idx / total_candidates) * 40)
-                    self.progress_bar.setValue(progress)
-                    self.progress_label.setText(
+                    self.progress_display.progress_bar.setValue(progress)
+                    self.progress_display.progress_label.setText(
                         f"Preparing data for candidate {idx + 1}/{total_candidates}"
                     )
 
@@ -2613,7 +2840,7 @@ class PatternDetectionWidget(QWidget):
                 self.candidates_data.append(code_slice)
 
             # Check if cancel was pressed during the loop
-            if not self.cancel_btn.isEnabled():
+            if not self.control_panel.cancel_btn.isEnabled():
                 logging.info("Detection cancelled during data preparation.")
                 # self.detection_finished([]) # cancel_detection already handles this
                 return
@@ -2623,7 +2850,9 @@ class PatternDetectionWidget(QWidget):
                 self.detection_finished([])
                 return
 
-            self.progress_bar.setValue(50)  # Mark data preparation as complete
+            self.progress_display.progress_bar.setValue(
+                50
+            )  # Mark data preparation as complete
             self.start_analysis_phase()  # Proceed to analysis
         except Exception as e:
             tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
@@ -2636,16 +2865,16 @@ class PatternDetectionWidget(QWidget):
             self.detection_finished([])
             return
 
-        self.progress_label.setText(
+        self.progress_display.progress_label.setText(
             f"Starting Capstone analysis for {len(self.candidates_data)} data points..."
         )
-        self.progress_bar.setValue(50)
+        self.progress_display.progress_bar.setValue(50)
         self.active_runnables = 0
         self.collected_matches_from_runnables = []
         self.total_items_for_analysis = len(self.candidates_data)
         self.items_processed_count = 0
 
-        if self.matcher is None:
+        if self.analysis_engine is None:
             self.handle_error("Matcher not initialized before analysis phase.")
             return
 
@@ -2684,7 +2913,7 @@ class PatternDetectionWidget(QWidget):
                     ", ".join(hex(ea) for ea in chunk_candidate_eas),
                 )
 
-            runnable = CapstoneAnalysisRunnable(data_chunk, self.matcher)
+            runnable = CapstoneAnalysisRunnable(data_chunk, self.analysis_engine)
             # Connect to new signals
             runnable.signals.result.connect(self._handle_runnable_result)
             runnable.signals.error.connect(self._handle_runnable_error)
@@ -2732,8 +2961,8 @@ class PatternDetectionWidget(QWidget):
             new_progress_value = 50 + int(
                 progress_bar_increment
             )  # int() here, after division by 2.0
-            self.progress_bar.setValue(min(100, new_progress_value))
-            self.progress_label.setText(
+            self.progress_display.progress_bar.setValue(min(100, new_progress_value))
+            self.progress_display.progress_label.setText(
                 f"{base_text} (Processed: {round(analysis_phase_percentage_float, 2)}%)"
             )
 
@@ -2756,7 +2985,9 @@ class PatternDetectionWidget(QWidget):
             self.collected_matches_from_runnables.extend(found_matches)
             if self.total_items_for_analysis < 0:
                 # Fallback if total_items_for_analysis is 0, though should not happen if processing items.
-                self.progress_bar.setValue(self.progress_bar.value() + 1)
+                self.progress_display.progress_bar.setValue(
+                    self.progress_display.progress_bar.value() + 1
+                )
         else:
             logging.warning(
                 "A CapstoneAnalysisRunnable reported failure via result signal. Items reported by this chunk: %d",
@@ -2804,24 +3035,17 @@ class PatternDetectionWidget(QWidget):
         self.active_runnables = 0
         # When cancelling, ensure we call detection_finished with empty list or current if partial results are okay
         # For a clean cancel, pass empty.
-        self.progress_label.setText("Detection cancelled.")
-        self.progress_bar.setValue(
-            0
-        )  # Or 100 if treating cancel as "completion" of cancel op
-        self.start_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self.progress_display.progress_label.setText("Detection cancelled.")
+        self.progress_display.progress_bar.setValue(0)
+        self.control_panel.cancel_btn.setEnabled(False)
         self.update_buttons_state()  # Reflect that no patterns might be available if cleared
         # self.detection_finished([]) # This was the original line, let's ensure state is consistent
 
     def _prepare_analysis_dependencies(
         self,
-    ) -> Optional[Tuple[capstone.Cs, bool, bytes, int, FastPatternMatcher]]:
+    ) -> Optional[Tuple[capstone.Cs, bool, bytes, int, PatternAnalysisEngine]]:
         """Checks and prepares dependencies for the analysis phase, including the matcher itself."""
-        if (
-            self.matcher is None
-            or self.matcher.detector is None
-            or self.matcher.detector.cs is None
-        ):
+        if self.analysis_engine is None or self.analysis_engine.cs is None:
             logging.error(
                 "Matcher or its Capstone instance not available. Cannot proceed with detailed analysis."
             )
@@ -2833,7 +3057,7 @@ class PatternDetectionWidget(QWidget):
             )
             return None
 
-        cs_instance = self.matcher.detector.cs
+        cs_instance = self.analysis_engine.cs
         is_x64 = cs_instance.mode == capstone.CS_MODE_64
         mem_bytes = self.text_segment_bytes
         mem_start_ea = self.text_segment_start_ea
@@ -2842,7 +3066,7 @@ class PatternDetectionWidget(QWidget):
             is_x64,
             mem_bytes,
             mem_start_ea,
-            self.matcher,
+            self.analysis_engine,
         )  # Add matcher to returned tuple
 
     def _convert_pm_to_mchain(
@@ -2850,7 +3074,7 @@ class PatternDetectionWidget(QWidget):
         pm: PatternMatch,
         mem_start_ea: int,
         mem_bytes: bytes,
-        matcher: FastPatternMatcher,
+        matcher: PatternAnalysisEngine,
     ) -> Optional[MatchChain]:
         """Converts a PatternMatch object to a MatchChain for _analyze_chain."""
         if pm.category == PatternCategory.JUNK:
@@ -3019,51 +3243,65 @@ class PatternDetectionWidget(QWidget):
         all_resolved_ranges: List[Range] = []
         logging.info("Starting chain analysis for non-junk patterns.")
 
+        # Create a single AnalysisOrchestrator instance to be shared by tasks
+        analysis_orchestrator = AnalysisOrchestrator(
+            matcher_instance, self.text_segment_bytes, self.text_segment_start_ea
+        )
+
         thread_pool = QThreadPool.globalInstance()
-        active_tasks = []
+        analysis_tasks_submitted: List[AnalysisTask] = (
+            []
+        )  # To keep track of submitted tasks
+
         logging.info(
             "Submitting %d analysis tasks to the thread pool.", len(unique_matches)
         )
 
         for pm in unique_matches:
+            # Create an AnalysisTask for each PatternMatch
+            # Pass the shared orchestrator and other necessary details
             task = AnalysisTask(
-                self, pm, mem_start_ea, mem_bytes, matcher_instance, is_x64
+                pattern_detection_widget=self,  # Pass reference to the widget if needed by task
+                pm=pm,
+                mem_start_ea=mem_start_ea,
+                mem_bytes=mem_bytes,
+                analysis_engine=matcher_instance,  # Pass the engine instance
+                is_x64=is_x64,
+                analysis_orchestrator=analysis_orchestrator,  # Pass the shared orchestrator
             )
-            active_tasks.append(task)
+            analysis_tasks_submitted.append(task)
             thread_pool.start(task)
 
         logging.debug(
-            "All %d tasks submitted. Waiting for completion...", len(active_tasks)
+            "All %d tasks submitted. Waiting for completion...",
+            len(analysis_tasks_submitted),
         )
         thread_pool.waitForDone()  # Blocks until all submitted tasks are finished
 
         logging.debug("All tasks completed. Collecting results...")
 
-        for i, task in enumerate(active_tasks):
+        for i, task in enumerate(analysis_tasks_submitted):
             if task.error:
                 logging.warning(
-                    "Task %d for pm at 0x%X (originally 0x%X) encountered an error: %s. Skipping its results.",
-                    i + 1,  # 1-indexed task number
-                    task.pm_ida_address,
-                    task.pm.ida_address,  # In case pm_ida_address differs or for more info
+                    "Task %d for pm at 0x%X encountered an error: %s. Skipping its results.",
+                    i + 1,
+                    task.pm_ida_address,  # Access pm_ida_address from the task
                     task.error,
                 )
             else:
                 if task.result_ranges:  # Only extend if there are ranges
                     all_resolved_ranges.extend(task.result_ranges)
                     logging.debug(
-                        "Task %d for pm at 0x%X (originally 0x%X) completed, contributing %d ranges.",
+                        "Task %d for pm at 0x%X completed, contributing %d ranges.",
                         i + 1,
                         task.pm_ida_address,
-                        task.pm.ida_address,
                         len(task.result_ranges),
                     )
                 else:
                     logging.debug(
-                        "Task %d for pm at 0x%X (originally 0x%X) completed with no ranges.",
+                        "Task %d for pm at 0x%X completed with no ranges.",
                         i + 1,
                         task.pm_ida_address,
-                        task.pm.ida_address,
                     )
 
         logging.info(
@@ -3112,83 +3350,33 @@ class PatternDetectionWidget(QWidget):
     def detection_finished(self, patterns: List[PatternMatch]):
         """Handle detection completion."""
         self.ui_update_timer.stop()  # Stop UI update timer
-        self.start_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
-        self.progress_bar.setValue(100)
+        self.control_panel.start_btn.setEnabled(True)
+        self.control_panel.cancel_btn.setEnabled(False)
+        self.progress_display.progress_bar.setValue(100)
 
         if patterns:
-            self.progress_label.setText(
+            self.progress_display.progress_label.setText(
                 f"Detection complete! Found {len(patterns)} unique patterns."
             )
         else:
-            self.progress_label.setText("Detection complete. No patterns found.")
+            self.progress_display.progress_label.setText(
+                "Detection complete. No patterns found."
+            )
 
         elapsed_time = time.time() - self.start_time if self.start_time else 0
         minutes = int(elapsed_time / 60)
         seconds = int(elapsed_time % 60)
         time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-        self.time_label.setText(f"Completed in: {time_str}")
+        self.progress_display.time_label.setText(f"Completed in: {time_str}")
 
     def _populate_model_from_patterns(self):
-        """Refresh the results tree view with current patterns based on filters."""
-        # Clear existing model data before repopulating
-        self.source_model.removeRows(0, self.source_model.rowCount())
+        """Refresh the results tree view with current patterns."""
+        # Delegate the actual model population to the display_adapter,
+        # which knows about the correct source_model.
+        self.display_adapter.populate_model(self.all_patterns)
 
-        # The proxy model handles filtering, so we populate the source_model with all patterns
-        # that match the current self.all_patterns (which might have been loaded or detected)
-        # The actual filtering to display is done by CustomFilterProxyModel via invalidateFilter()
-
-        # Get patterns that match the current UI filter settings for display
-        # This step isn't strictly necessary here if proxy handles all, but good for summary.
-        # For direct model population, we iterate self.all_patterns
-        # The proxy model will decide what to show based on its internal filter state.
-
-        for pattern in self.all_patterns:  # Iterate all patterns, proxy will filter
-            addr_item = QStandardItem(
-                f"0x{pattern.ida_address:08X}"
-            )  # Changed to uppercase hex
-            addr_item.setData(pattern.ida_address, Qt.UserRole)
-
-            cat_text = pattern.category.name.replace("_", " ").title()
-            cat_item = QStandardItem(cat_text)
-            # No UserRole needed for category if sorting is by display text
-
-            desc_item = QStandardItem(pattern.description)
-
-            name_item = QStandardItem(pattern.pattern_name)
-
-            insn_text = " ; ".join(
-                [f"{insn.mnemonic} {insn.op_str}" for insn in pattern.instructions[:3]]
-            )
-            if len(pattern.instructions) > 3:
-                insn_text += " ; ..."
-            insn_item = QStandardItem(insn_text)
-
-            junk_count_item = QStandardItem(str(pattern.junk_count))
-            junk_count_item.setData(pattern.junk_count, Qt.UserRole)
-
-            total_length_item = QStandardItem(
-                str(pattern.total_length)
-            )  # Store as string for display
-            total_length_item.setData(
-                pattern.total_length, Qt.UserRole
-            )  # Store int for sorting
-
-            row_items = [
-                addr_item,
-                cat_item,
-                desc_item,
-                name_item,
-                insn_item,
-                junk_count_item,
-                total_length_item,
-            ]
-            self.source_model.appendRow(row_items)
-
-        # Trigger proxy model to re-filter/re-sort if needed based on its current settings
-        # This is usually handled by changes to filterRegularExpression or sortColumn.
-        # If populating for the first time or after clearing, this ensures view is up-to-date.
-        self.proxy_model.invalidate()  # Invalidate to ensure re-filtering and sorting
+        # Trigger the proxy model (which is part of results_view) to re-filter/re-sort.
+        self.results_view.proxy_model.invalidate()
         self.update_summary()
 
     def get_filtered_patterns(self) -> List[PatternMatch]:
@@ -3196,19 +3384,19 @@ class PatternDetectionWidget(QWidget):
         # This method now needs to iterate through the proxy model to see what's visible.
         # This is more complex than before. For summary, we might rely on proxy row count.
         # For export, we would iterate all_patterns and apply filters manually or export all.
-        # For now, let's make this simpler and assume summary can use proxy_model.rowCount()
+        # For now, let's make this simpler and assume summary can use self.results_view.proxy_model.rowCount()
 
         # If an accurate list of *PatternMatch objects* that are visible is needed:
         visible_patterns = []
-        if self.source_model and self.proxy_model:
-            for proxy_row in range(self.proxy_model.rowCount()):
-                source_index = self.proxy_model.mapToSource(
-                    self.proxy_model.index(proxy_row, 0)
+        if self.results_view.source_model and self.results_view.proxy_model:
+            for proxy_row in range(self.results_view.proxy_model.rowCount()):
+                source_index = self.results_view.proxy_model.mapToSource(
+                    self.results_view.proxy_model.index(proxy_row, 0)
                 )
                 if source_index.isValid():
                     # Find the original PatternMatch object. This is tricky if not stored directly.
                     # We stored ida_address in UserRole of column 0. Let's use that to find it in self.all_patterns
-                    ida_addr = self.source_model.data(
+                    ida_addr = self.results_view.source_model.data(
                         source_index.siblingAtColumn(0), Qt.UserRole
                     )
                     original_pattern = next(
@@ -3221,19 +3409,21 @@ class PatternDetectionWidget(QWidget):
 
     def apply_filters(self):
         """Apply current filters to results tree view via the proxy model."""
-        text_filter = self.filter_input.text()
-        self.proxy_model.setFilterRegularExpression(QRegularExpression(text_filter))
+        text_filter = self.results_view.filter_input.text()
+        self.results_view.proxy_model.setFilterRegularExpression(
+            QRegularExpression(text_filter)
+        )
 
-        category_filter_text = self.category_filter.currentText()
-        self.proxy_model.set_category_filter(category_filter_text)
+        category_filter_text = self.results_view.category_filter.currentText()
+        self.results_view.proxy_model.set_category_filter(category_filter_text)
 
         # No need to call _populate_model_from_patterns here, proxy handles it.
         self.update_summary()
 
     def clear_filters(self):
         """Clear all filters."""
-        self.filter_input.clear()  # This will trigger textChanged, updating proxy regex
-        self.category_filter.setCurrentIndex(
+        self.results_view.filter_input.clear()  # This will trigger textChanged, updating proxy regex
+        self.results_view.category_filter.setCurrentIndex(
             0
         )  # This will trigger currentTextChanged, updating proxy category
         # self.proxy_model.setFilterRegularExpression(QRegularExpression(""))
@@ -3243,41 +3433,41 @@ class PatternDetectionWidget(QWidget):
     def update_summary(self):
         """Update the summary label based on visible items in the proxy model."""
         total_source_patterns = len(self.all_patterns)
-        filtered_visible_count = self.proxy_model.rowCount()
+        filtered_visible_count = self.results_view.proxy_model.rowCount()
 
         if total_source_patterns == 0:
-            self.summary_label.setText("No patterns detected yet.")
+            self.results_view.summary_label.setText("No patterns detected yet.")
         elif (
             filtered_visible_count == total_source_patterns
-            and self.filter_input.text() == ""
-            and self.category_filter.currentText() == "All Categories"
+            and self.results_view.filter_input.text() == ""
+            and self.results_view.category_filter.currentText() == "All Categories"
         ):
             if self.all_patterns:
                 avg_junk = sum(p.junk_count for p in self.all_patterns) / len(
                     self.all_patterns
                 )
                 total_bytes = sum(p.total_length for p in self.all_patterns)
-                self.summary_label.setText(
+                self.results_view.summary_label.setText(
                     f"Found {total_source_patterns} patterns (avg {avg_junk:.1f} junk, {total_bytes} bytes)."
                 )
             else:
-                self.summary_label.setText(
+                self.results_view.summary_label.setText(
                     f"Found {total_source_patterns} patterns total."
                 )
         else:
             visible_patterns_for_stats = (
-                self.get_filtered_patterns()
-            )  # Get actual PatternMatch objects for stats
+                self.get_filtered_patterns()  # Get actual PatternMatch objects for stats
+            )
             if visible_patterns_for_stats:
                 avg_junk = sum(p.junk_count for p in visible_patterns_for_stats) / len(
                     visible_patterns_for_stats
                 )
                 total_bytes = sum(p.total_length for p in visible_patterns_for_stats)
-                self.summary_label.setText(
+                self.results_view.summary_label.setText(
                     f"Showing {filtered_visible_count} of {total_source_patterns} patterns (avg {avg_junk:.1f} junk, {total_bytes} bytes)."
                 )
             else:
-                self.summary_label.setText(
+                self.results_view.summary_label.setText(
                     f"Showing {filtered_visible_count} of {total_source_patterns} patterns (no matching for stats)."
                 )
 
@@ -3285,9 +3475,11 @@ class PatternDetectionWidget(QWidget):
         """Navigate to the selected pattern in IDA from tree view item."""
         if not proxy_index.isValid():
             return
-        source_index = self.proxy_model.mapToSource(proxy_index)
+        source_index = self.results_view.proxy_model.mapToSource(proxy_index)
         # Address is in column 0, UserRole
-        address = self.source_model.data(source_index.siblingAtColumn(0), Qt.UserRole)
+        address = self.results_view.source_model.data(
+            source_index.siblingAtColumn(0), Qt.UserRole
+        )
         if isinstance(address, int):
             idaapi.jumpto(address)
         else:
@@ -3569,16 +3761,18 @@ class PatternDetectionWidget(QWidget):
 
         if reply == QMessageBox.Yes:
             self.all_patterns.clear()
-            self.source_model.removeRows(0, self.source_model.rowCount())
+            self.results_view.source_model.removeRows(
+                0, self.results_view.source_model.rowCount()
+            )
             self.update_buttons_state()
             self.update_summary()
 
     def update_buttons_state(self):
         """Update the enabled state of buttons based on current patterns."""
         has_patterns = len(self.all_patterns) > 0
-        self.save_btn.setEnabled(has_patterns)
-        self.export_csv_btn.setEnabled(has_patterns)
-        self.clear_btn.setEnabled(has_patterns)
+        self.control_panel.save_btn.setEnabled(has_patterns)
+        self.control_panel.export_csv_btn.setEnabled(has_patterns)
+        self.control_panel.clear_btn.setEnabled(has_patterns)
 
     def _handle_runnable_error(self, error_info: tuple):
         """Handle errors reported by runnables."""
@@ -3591,9 +3785,6 @@ class PatternDetectionWidget(QWidget):
             "Worker Error",
             f"An error occurred in an analysis worker ({exc_type_name}):\n{exc_value_str}.\nSee logs for full traceback.",
         )
-        # Note: We don't stop other runnables here, they continue.
-        # The overall process will complete, potentially with partial results.
-        # The cancel_detection method can be used to stop everything if needed.
 
     def handle_error(self, error_msg: str):
         """Handle detection errors (typically for main thread errors or simple string errors)."""
@@ -3611,62 +3802,49 @@ class PatternDetectionWidget(QWidget):
             user_facing_msg = error_msg
 
         logging.error("handle_error called: %s", full_error_msg)
-        self.start_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
-        self.progress_label.setText("Error occurred during detection.")
+        self.control_panel.start_btn.setEnabled(True)
+        self.control_panel.cancel_btn.setEnabled(False)
+        self.progress_display.progress_label.setText("Error occurred during detection.")
         QMessageBox.critical(
             self, "Detection Error", f"An error occurred:\n{user_facing_msg}"
         )
 
 
+# =====================================================================
+# PLUGIN INTEGRATION
+# =====================================================================
 class PatternDetectionForm(ida_kernwin.PluginForm):
-    """
-    Dockable container understood by IDA.
-    We receive a weak-ref back to the plugin instance so we can
-    tell it when the form is closed.
-    """
+    """Dockable container for IDA integration."""
 
     def __init__(self, plugin_ref, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._plugin_ref = plugin_ref  # weakref to pattern_detect_t
+        self._plugin_ref = plugin_ref
 
-    # QWidget factory --------------------------------------------------
     def OnCreate(self, form):
-
-        # Get the parent widget and ensure it fills space
         parent = self.FormToPyQtWidget(form)
         parent.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # type: ignore
-
-        # Create layout for the parent
         parent_layout = QVBoxLayout(parent)
         parent_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Create and add our widget
         self.widget = PatternDetectionWidget(parent)
         parent_layout.addWidget(self.widget)
         return self.widget
 
-    # tidy-up ----------------------------------------------------------
     def OnClose(self, form):
         plugin = self._plugin_ref()
         if plugin is not None:
-            plugin._form = None  # allow GC to collect us
+            plugin._form = None
 
     @staticmethod
     def show_pattern_detection_form(plugin_ref):
         form = PatternDetectionForm(plugin_ref)
-        # show the dockable widget
-        # ida_kernwin.set_dock_pos(self.WINDOW_TITLE, "IDATopLevelDockArea", ida_kernwin.DP_RIGHT)
         form.Show(
             "Obfuscation Pattern Detection",
-            ida_kernwin.PluginForm.WOPN_DP_RIGHT  # dock on the right; change to taste
+            ida_kernwin.PluginForm.WOPN_DP_RIGHT
             | ida_kernwin.PluginForm.WOPN_DP_SZHINT,
-            # | ida_kernwin.PluginForm.WOPN_TAB,  # allow tab-docking
         )
         return form
 
 
-# ---------------------------------------------------------------------
 class pattern_detect_t(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
     wanted_name = "Pattern detector"
@@ -3675,22 +3853,20 @@ class pattern_detect_t(idaapi.plugin_t):
     def __init__(self):
         self._form: PatternDetectionForm | None = None
 
-    # helper -----------------------------------------------------------
     def _ensure_form(self) -> PatternDetectionForm:
-        if self._form is None:  # not created yet
+        if self._form is None:
             self._form = PatternDetectionForm.show_pattern_detection_form(
                 weakref.ref(self)
             )
         return self._form
 
-    # plugin entry-point ----------------------------------------------
     def run(self, arg):
         form = self._ensure_form()
         if form:
-            ida_kernwin.activate_widget(form, True)  # just bring it to front
+            ida_kernwin.activate_widget(form, True)
 
 
-def PLUGIN_ENTRY():  # IDA looks for this symbol
+def PLUGIN_ENTRY():
     return pattern_detect_t()
 
 
