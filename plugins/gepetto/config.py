@@ -2,10 +2,24 @@ import configparser
 import gettext
 import os
 
-from gepetto.models.base import get_model
+from gepetto.models.model_manager import instantiate_model, load_available_models, get_fallback_model
 
 model = None
 parsed_ini = None
+_translator = None
+
+
+def _get_translator():
+    global _translator
+    if _translator is None:
+        load_config()
+
+    return _translator
+
+
+def _(message):
+    """Translation function that lazy-loads the translator"""
+    return _get_translator()(message)
 
 
 def load_config():
@@ -14,9 +28,9 @@ def load_config():
     Also prepares an OpenAI client configured accordingly to the user specifications.
     :return:
     """
-    global model, parsed_ini
+    global model, parsed_ini, _translator
     parsed_ini = configparser.RawConfigParser()
-    parsed_ini.read(os.path.join(os.path.abspath(os.path.dirname(__file__)), "config.ini"))
+    parsed_ini.read(os.path.join(os.path.abspath(os.path.dirname(__file__)), "config.ini"), encoding="utf-8")
 
     # Set up translations
     language = parsed_ini.get('Gepetto', 'LANGUAGE')
@@ -24,11 +38,22 @@ def load_config():
                                     os.path.join(os.path.abspath(os.path.dirname(__file__)), "locales"),
                                     fallback=True,
                                     languages=[language])
-    translate.install("gepetto")  # Install the _() function in the gepetto namespace.
+    _translator = translate.gettext
 
     # Select model
     requested_model = parsed_ini.get('Gepetto', 'MODEL')
-    model = get_model(requested_model)
+    load_available_models()
+    # Attempt to load the requested model, otherwise get the first available one, or don't load Gepetto
+    try:
+        model = instantiate_model(requested_model)
+    except RuntimeError:
+        print(_("Attempting to load the first available model..."))
+        try:
+            model = get_fallback_model()
+            print(f"Defaulted to {str(model)}.")
+        except RuntimeError:
+            print(_("No model available. Please edit the configuration file and try again."))
+            model = None
 
 
 def get_config(section, option, environment_variable=None, default=None):
@@ -42,10 +67,20 @@ def get_config(section, option, environment_variable=None, default=None):
     :return: The value of the requested option.
     """
     global parsed_ini
-    if parsed_ini and parsed_ini.get(section, option):
-        return parsed_ini.get(section, option)
-    if environment_variable and os.environ.get(environment_variable):
-        return os.environ.get(environment_variable)
+    try:
+        if parsed_ini and parsed_ini.get(section, option):
+            return parsed_ini.get(section, option)
+        if environment_variable is not None:
+            if isinstance(environment_variable, (str,)):
+                environment_variable = [environment_variable]
+            for env_var in environment_variable:
+                if os.environ.get(env_var):
+                    return os.environ.get(env_var)
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        print(_("Warning: Gepetto's configuration doesn't contain option {option} in section {section}!").format(
+            option=option,
+            section=section
+        ))
     return default
 
 
@@ -59,7 +94,7 @@ def update_config(section, option, new_value):
     """
     path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "config.ini")
     config = configparser.RawConfigParser()
-    config.read(path)
+    config.read(path, encoding="utf-8")
     config.set(section, option, new_value)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         config.write(f)
