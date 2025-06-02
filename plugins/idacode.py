@@ -1,9 +1,12 @@
 import asyncio
 import inspect
 import json
+import logging
 import os
+import pathlib
 import signal
 import socket
+import stat
 import subprocess
 import sys
 
@@ -31,6 +34,7 @@ except ImportError:
     )
     exit(-1)
 
+import PyQt5.QtWidgets as QtWidgets
 
 VERSION = "0.3.0"
 initialized = False
@@ -38,12 +42,64 @@ initialized = False
 _STOP_SERVER = threading.Event()
 
 
+def get_python_interpreter():
+    """
+    Gets the path to a suitable Python interpreter.
+    Ensures we find a standalone Python executable.
+
+    >>> import pathlib, sys, stat
+    >>> interp: pathlib.Path = MultiprocessingHelper.get_python_interpreter()
+    ...
+    >>>
+    """
+    base_executable = getattr(sys, "_base_executable", None)
+    if base_executable and "python" in pathlib.Path(base_executable).name.lower():
+        return pathlib.Path(base_executable)
+
+    base_paths = [
+        sys.prefix,
+        sys.exec_prefix,
+        sys.executable,
+    ]
+    exe_suffix = ".exe" if os.name == "nt" else ""
+    python_name = f"python{exe_suffix}"
+
+    def base_dirs():
+        for dirname in map(pathlib.Path, base_paths):
+            yield dirname
+            yield dirname.parent
+            yield dirname.parent.parent
+
+    for dirname in base_dirs():
+        for basename in ["", "bin", "python"]:
+            interp_path = dirname / basename / python_name
+            if not interp_path.exists():
+                continue
+
+            if not interp_path.is_file() or not interp_path.is_symlink():
+                continue
+
+            if not interp_path.stat().st_mode & (
+                stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            ):
+                continue
+
+            print(f"[IDACode] Found Python interpreter at: {interp_path}")
+            return interp_path
+
+    print(
+        "[IDACode] Could not determine Python interpreter path, falling back to 'python' in PATH."
+    )
+    return pathlib.Path("python")
+
+
 class Settings:
     HOST = "127.0.0.1"
     PORT = 7065
     DEBUG_PORT = 7066
-    PYTHON = r"C:\\dev\\python\\313-ida\\python.exe"
+    PYTHON = get_python_interpreter()
     LOGGING = False
+    ALLOW_UNSAFE_ORIGIN = False
 
     @classmethod
     def load(cls):
@@ -77,7 +133,7 @@ class Dbg:
 
 class Hooks:
     script_folder = ""
-    getcwd_original = os.getcwd
+    getcwd_original = staticmethod(os.getcwd)
 
     @classmethod
     def getcwd_hook(cls):
@@ -137,6 +193,11 @@ def start_debug_server():
 
 
 class SocketHandler(tornado.websocket.WebSocketHandler):
+
+    def check_origin(self, origin):
+        # NOTE: This is called when connecting from a browser
+        return settings.ALLOW_UNSAFE_ORIGIN
+
     def open(self):
         print("[IDACode] Client connected")
 
@@ -171,205 +232,82 @@ def setup_patches():
     # sys.executable = settings.PYTHON
 
 
-class BackgroundTornadoServer:
-    server: typing.ClassVar
-    WAIT = threading.Event()
+def join_gui_thread(thread: threading.Thread, timeout=None):
+    iterations = 0
+    iteration_timeout = 0.1
+    while True:
+        if not thread.is_alive():
+            return True
+        thread.join(iteration_timeout)
+        QtWidgets.QApplication.processEvents()
+        if timeout is not None and iteration_timeout * iterations >= timeout:
+            return False
+        iterations += 1
 
-    def __init__(self, daemon=False):
-        self._thread = threading.Thread(target=self._run_server)
-        self._thread.daemon = daemon
-        self._started = concurrent.futures.Future()
-        self._stop_lock = threading.Lock()
-        self._stop_requested = False
 
-    def reset(self, force=False):
-        if not force:
-            force = self._thread.ident
-        if force:
-            is_daemon = self._thread.daemon
-            self._thread = threading.Thread(target=self._run_server)
-            self._thread.daemon = is_daemon
-            self._started = concurrent.futures.Future()
-        self.WAIT.clear()
+class Server:
+    def __init__(self):
+        self.started = False
+        self.server: tornado.httpserver.HTTPServer | None = None
+        self.thread: threading.Thread = threading.Thread(target=self.server_thread)
 
     def start(self):
-        self.reset()
-        self._thread.start()
-        try:
-            self._started.result()
-        except:
-            self._thread.join()
-            raise
-
-    def _run_server(self):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            # https://github.com/dask/distributed/blob/f6796f77f4adfc42cd1608ca1b8a22cba4432685/distributed/utils.py#L1048-L1067
-            if (
-                sys.platform == "win32"
-                and sys.version_info >= (3, 8)
-                and tornado.version_info <= (6, 0)
-            ):
-                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-            tornado.platform.asyncio.AsyncIOMainLoop()
-            self.loop = loop
-            loop.call_soon(self._start_server)
-            loop.run_forever()
-            loop.close()
-        except Exception as exc:
-            self._started.set_exception(exc)
-
-    def _start_server(self):
-        try:
-            self._attempt_to_start_server()
-            self._started.set_result(None)
-        except Exception as e:
-            self.loop.stop()
-            self._started.set_exception(e)
-
-    def _attempt_to_start_server(self):
-        raise NotImplementedError
-
-    def request_stop(self):
-        with self._stop_lock:
-            if not self._stop_requested:
-                self._stop_requested = True
-                self.loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(self._stop())
-                )
+        self.stop()
+        self.thread.start()
+        self.started = True
 
     def stop(self):
-        self.request_stop()
-        self.WAIT.wait(timeout=5.0)
-        if self._thread is not threading.current_thread():
-            self._thread.join()
-        print(
-            "loop is closed? ",
-            self.loop.is_closed(),
-            " loop is running?",
-            self.loop.is_running(),
-        )
-        print("is thread alive?", self._thread.is_alive())
-        # self._thread.join()
+        if not self.started:
+            return
 
-    async def _stop(self):
-        self.server.stop()
-        await tornado.platform.asyncio.to_asyncio_future(
-            self.server.close_all_connections()
-        )
-        self.loop.stop()
-        self.WAIT.set()
+        if self.server is not None:
+            self.io_loop.add_callback(self.server.stop)
+            self.io_loop.add_callback(self.server.close_all_connections)
+            self.io_loop.add_callback(self.io_loop.stop)
 
+        if not join_gui_thread(self.thread, 1.0):
+            print("[IDACode] Waiting for server to stop...")
+            if not join_gui_thread(self.thread, 5.0):
+                print(
+                    "[IDACode] deadlock while stopping server, please report an issue!\n"
+                )
+        self.thread = threading.Thread(target=self.server_thread)
+        self.server = None
+        print("[IDACode] Server stopped")
 
-class Server(BackgroundTornadoServer):
-    def __init__(self, config: Settings):
-        super().__init__(daemon=True)
-        self.config = config
-        self.app = tornado.web.Application(
+    def server_thread(self):
+        # Create a new event loop for the thread
+        # https://github.com/tornadoweb/tornado/issues/2308#issuecomment-372582005
+        loop = asyncio.new_event_loop()
+        loop.set_debug(False)
+        logging.getLogger("asyncio").setLevel(
+            logging.CRITICAL
+        )  # Remove some debug spam
+        asyncio.set_event_loop(loop)
+
+        # Before starting the event loop, instantiate a WebSocketClient and add a
+        # callback to the event loop to start it. This way the first thing the
+        # event loop does is to start the client.
+        self.io_loop = tornado.ioloop.IOLoop.current()
+        app = tornado.web.Application(
             [
                 (r"/ws", SocketHandler),
             ]
         )
-        self.server = tornado.httpserver.HTTPServer(self.app)
-        # self.thread = threading.Thread(target=self._start)
-        # self.thread.daemon = True
-        self.stopcheck: tornado.ioloop.PeriodicCallback
-        # self.ioloop: tornado.ioloop.IOLoop
-
-        # install signals once
-        for sig in [signal.SIGTERM, signal.SIGINT, signal.SIGABRT, signal.SIGSEGV]:
-            signal.signal(sig, self.on_signal)
-
-        self._initialized = False
-
-    @property
-    def running(self):
-        return self._thread.is_alive() and self._initialized
-
-    def _attempt_to_start_server(self):
-        """start server"""
-        if self.running:
-            return
-        setup_patches()
-        # if self._thread.ident is not None:
-        #     # threads can only be started once
-        #     self.thread = threading.Thread(target=self._start)
-        #     self.thread.daemon = True
-
-        # self.thread.start()
-        self._start()
-        self._initialized = True
-
-    def _start(self):
-        # asyncio.set_event_loop(asyncio.new_event_loop())
-
+        server = tornado.httpserver.HTTPServer(app)
         print(
             "[IDACode] Listening on {address}:{port}".format(
                 address=settings.HOST, port=settings.PORT
             )
         )
-        # every second checks if server should stop
-        # self.ioloop = tornado.ioloop.IOLoop.current()
-        self.stopcheck = tornado.ioloop.PeriodicCallback(self.handle_stop_event, 1000)
-        self.server.listen(address=self.config.HOST, port=self.config.PORT)
-        self.stopcheck.start()
-        # self.ioloop.start()
+        server.listen(address=settings.HOST, port=settings.PORT)
+        self.server = server
 
-    def on_signal(self, sig, frame):
-        print("[IDACode] Signal", signal.Signals(sig).name, "received.")
-        self.stop()
+        # Start the event loop.
+        self.io_loop.start()
 
-    def handle_stop_event(self):
-        if _STOP_SERVER.is_set():
-            print("[IDACode] Stop server event detected.")
-            _STOP_SERVER.clear()
-            print("[IDACode] Stopping server.")
-            self.stopcheck.stop()
-            super().stop()
-            print(
-                "[IDACode] Server stopped. Control thread alive? ",
-                self._thread.is_alive(),
-            )
-            self._initialized = False
-
-    def stop(self):
-        """stop server"""
-        if not self.running:
-            return
-        print("[IDACode] Signaling to server to stop")
-        _STOP_SERVER.set()
-
-    # def _stop(self):
-    #
-    # self.server.stop()  # no more requests are accepted (only if no_keep_alive=True)
-    # await self.server.close_all_connections()
-    # self.ioloop.close()
-    # self.ioloop.run_sync(self.server.close_all_connections)
-    # self.thread.join()
-    # self.stopcheck.stop()
-
-    # self.thread = threading.Thread(target=self._start)
-    # self.thread.daemon = True
-    # print("[IDACode] Server stopped. Control thread alive? ", self.thread.is_alive())
-    # def _close_server_socket(self):
-    #     self.app.default_router.named_rules["ws"]
-    # # self.ioloop.stop()
-    # # self.ioloop = None
-    # self.ioloop.add_callback(self.ioloop.stop)
-    # # asyncio.new_event_loop().run_until_complete(self.server.close_all_connections())
-    # self.server.stop()
-    # self.thread.join()
-
-    # self.thread = threading.Thread(target=self._start)
-    # self.thread.daemon = True
-
-    # if dbgsrv_running:
-    #     raise DebugServerCannotStopError(
-    #         "Debug server cannot be stopped currently.\ncheck here: https://github.com/microsoft/debugpy/issues/870"
-    #     )
+        # Signal that the service is finished
+        self.started = False
 
 
 def get_python_versions():
@@ -394,8 +332,8 @@ class IDACode(idaapi.plugin_t):
         self.server: Server
 
     @property
-    def running(self):
-        return self.server.running
+    def started(self):
+        return self.server.started
 
     def init(self):
         global initialized
@@ -427,29 +365,17 @@ class IDACode(idaapi.plugin_t):
         StartMenuHandle.register(self)
         StopMenuHandle.register(self)
         OptionMenuHandle.register(self)
-        self.server = Server(settings)
+        self.server = Server()
         return idaapi.PLUGIN_KEEP
 
     def run(self, args):
         pass
 
     def start(self):
-        _STOP_SERVER.clear()
         self.server.start()
-        # thread = threading.Thread(target=self.ioloop.start)
-        # thread.daemon = True
-        # thread.start()
 
     def stop(self):
-        # _STOP_SERVER.set()
-        # self.ioloop.stop()
         self.server.stop()
-
-        # dialog = ErrorDialog(
-        #     "Control server stoped, but debug server is still running and cannot be stopped currently.\nCheck here for more: https://github.com/microsoft/debugpy/issues/870"
-        # )
-        # dialog.Execute()
-        # dialog.Free()
 
     def term(self):
         self.stop()
@@ -469,7 +395,7 @@ class MenuHandle(ida_kernwin.action_handler_t):
     NAME = ""
     TEXT = ""
     TOOLTIP = ""
-    HOTKEY = None
+    HOTKEY = ""
     PATH = ""
 
     def __init__(self, plugin: IDACode) -> None:
@@ -497,7 +423,7 @@ class StartMenuHandle(MenuHandle):
         self.plugin.start()
 
     def update(self, ctx):
-        if self.plugin.running:
+        if self.plugin.started:
             return ida_kernwin.AST_DISABLE
         else:
             return ida_kernwin.AST_ENABLE
@@ -513,7 +439,7 @@ class StopMenuHandle(MenuHandle):
         self.plugin.stop()
 
     def update(self, ctx):
-        if self.plugin.running:
+        if self.plugin.started:
             return ida_kernwin.AST_ENABLE
         else:
             return ida_kernwin.AST_DISABLE
