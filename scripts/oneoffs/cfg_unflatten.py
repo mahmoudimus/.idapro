@@ -1,3 +1,4 @@
+import logging
 import re
 import typing
 from collections import defaultdict
@@ -19,6 +20,7 @@ class CFGRecovery:
             self.cfg_recovery = cfg_recovery_instance
             self.assignments_to_dispatcher_found = 0
             self.total_cot_asg_found = 0
+            self.logger = logging.getLogger(self.__class__.__name__)
 
         def visit_expr(self, expr):
             if expr.op == idaapi.cot_asg:
@@ -70,8 +72,15 @@ class CFGRecovery:
                     self.assignments_to_dispatcher_found += 1
                     target_case = expr.y.n._value
 
-                    print(
-                        f">>> [VISITOR_DISPATCHER_ASSIGNMENT] EA: {hex(expr.ea)}, Var_idx: {expr.x.v.idx} = {hex(target_case)} (Value: {expr.y.n._value})"
+                    # print(
+                    #     f">>> [VISITOR_DISPATCHER_ASSIGNMENT] EA: {hex(expr.ea)}, Var_idx: {expr.x.v.idx} = {hex(target_case)} (Value: {expr.y.n._value})"
+                    # )
+                    self.logger.debug(
+                        ">>> [VISITOR_DISPATCHER_ASSIGNMENT] EA: %s, Var_idx: %s = %s (Value: %s)",
+                        hex(expr.ea),
+                        expr.x.v.idx,
+                        hex(target_case),
+                        expr.y.n._value,
                     )
 
                     # Diagnostic print for parent, using visitor's self.parents
@@ -79,12 +88,25 @@ class CFGRecovery:
                         diag_parent_item = (
                             self.parents.back()
                         )  # self.parents is citem_vec_t
-                        print(
-                            f"    Parent (from visitor.parents.back()): op={ida_hexrays.get_ctype_name(diag_parent_item.op)}, ea={hex(diag_parent_item.ea)}, obj_id={diag_parent_item.obj_id if hasattr(diag_parent_item, 'obj_id') else 'N/A'}"
+                        # print(
+                        #     f"    Parent (from visitor.parents.back()): op={ida_hexrays.get_ctype_name(diag_parent_item.op)}, ea={hex(diag_parent_item.ea)}, obj_id={diag_parent_item.obj_id if hasattr(diag_parent_item, 'obj_id') else 'N/A'}"
+                        # )
+                        self.logger.debug(
+                            "    Parent (from visitor.parents.back()): op=%s, ea=%s, obj_id=%s",
+                            ida_hexrays.get_ctype_name(diag_parent_item.op),
+                            hex(diag_parent_item.ea),
+                            (
+                                diag_parent_item.obj_id
+                                if hasattr(diag_parent_item, "obj_id")
+                                else "N/A"
+                            ),
                         )
                     else:
-                        print(
-                            f"    Parent: visitor.parents is empty (expr is likely top-level in visited ctree block or statement)."
+                        # print(
+                        #     f"    Parent: visitor.parents is empty (expr is likely top-level in visited ctree block or statement)."
+                        # )
+                        self.logger.debug(
+                            "    Parent: visitor.parents is empty (expr is likely top-level in visited ctree block or statement)."
                         )
 
                     current_case = self.cfg_recovery._find_current_case_context(
@@ -100,17 +122,34 @@ class CFGRecovery:
                         self.cfg_recovery.edges.append(
                             (current_case, target_case, None)
                         )
-                        print(
-                            f"    [+] SUCCESS: Found transition: case {hex(current_case)} -> case {hex(target_case)}"
+                        # print(
+                        #     f"    [+] SUCCESS: Found transition: case {hex(current_case)} -> case {hex(target_case)}"
+                        # )
+                        self.logger.info(
+                            "    [+] SUCCESS: Found transition: case %s -> case %s",
+                            hex(current_case),
+                            hex(target_case),
                         )
                     else:
-                        print(
-                            f"    [-] FAILURE: No context for dispatcher assignment to {hex(target_case)} at {hex(expr.ea)}. Dispatcher var idx: {self.cfg_recovery.dispatcher_var}"
+                        # print(
+                        #     f"    [-] FAILURE: No context for dispatcher assignment to {hex(target_case)} at {hex(expr.ea)}. Dispatcher var idx: {self.cfg_recovery.dispatcher_var}"
+                        # )
+                        self.logger.warning(
+                            "    [-] FAILURE: No context for dispatcher assignment to %s at %s. Dispatcher var idx: %s",
+                            hex(target_case),
+                            hex(expr.ea),
+                            self.cfg_recovery.dispatcher_var,
                         )
 
                 elif lhs_is_dispatcher and not rhs_is_num:
-                    print(
-                        f"[VISITOR_WARN_DISPATCHER_ASSIGN_NON_NUM_RHS] EA: {hex(expr.ea)}, Dispatcher VarIdx: {expr.x.v.idx}, RHS_op: {expr.y.opname if expr.y else 'N/A'}"
+                    # print(
+                    #     f"[VISITOR_WARN_DISPATCHER_ASSIGN_NON_NUM_RHS] EA: {hex(expr.ea)}, Dispatcher VarIdx: {expr.x.v.idx}, RHS_op: {expr.y.opname if expr.y else 'N/A'}"
+                    # )
+                    self.logger.warning(
+                        "[VISITOR_WARN_DISPATCHER_ASSIGN_NON_NUM_RHS] EA: %s, Dispatcher VarIdx: %s, RHS_op: %s",
+                        hex(expr.ea),
+                        expr.x.v.idx,
+                        expr.y.opname if expr.y else "N/A",
                     )
 
             return 0
@@ -124,6 +163,7 @@ class CFGRecovery:
         self.edges = []  # (src_case, dst_case, condition)
         self.dispatcher_var = None
         self.graph = nx.DiGraph()
+        self.logger = logging.getLogger(self.__class__.__name__)
 
     def find_dispatcher_variable(self, cfunc):
         """
@@ -181,7 +221,10 @@ class CFGRecovery:
                         # else:
                         #     print(f"[!] Warning: Case value {case_val} (0x{case_val:X}) already processed. Skipping duplicate.")
         if not self.blocks:
-            print("[-] No case blocks extracted. Main switch not found or empty.")
+            # print("[-] No case blocks extracted. Main switch not found or empty.")
+            self.logger.error(
+                "[-] No case blocks extracted. Main switch not found or empty."
+            )
 
     def analyze_block_transitions(self, cfunc):
         """Analyze how each block sets the dispatcher variable"""
@@ -357,21 +400,34 @@ class CFGRecovery:
 
     def analyze_simple(self, cfunc):
         """Simpler analysis approach - look for pattern n2 = value, using a ctree visitor."""
-        print(
-            f"[ANALYSIS_SIMPLE_VISITOR] Starting. Dispatcher var idx: {self.dispatcher_var}"
+        # print(
+        #     f"[ANALYSIS_SIMPLE_VISITOR] Starting. Dispatcher var idx: {self.dispatcher_var}"
+        # )
+        self.logger.info(
+            "[ANALYSIS_SIMPLE_VISITOR] Starting. Dispatcher var idx: %s",
+            self.dispatcher_var,
         )
 
         visitor = CFGRecovery.AssignmentVisitor(self)
-        visitor.apply_to(cfunc.body, None)
+        visitor.apply_to(cfunc.body, None)  # type: ignore
 
         total_cot_asg_found = visitor.total_cot_asg_found
         assignments_to_dispatcher_found = visitor.assignments_to_dispatcher_found
 
-        print(
-            f"[ANALYSIS_SIMPLE_VISITOR_SUMMARY] Total cot_asg items processed by visitor: {total_cot_asg_found}"
+        # print(
+        #     f"[ANALYSIS_SIMPLE_VISITOR_SUMMARY] Total cot_asg items processed by visitor: {total_cot_asg_found}"
+        # )
+        self.logger.info(
+            "[ANALYSIS_SIMPLE_VISITOR_SUMMARY] Total cot_asg items processed by visitor: %s",
+            total_cot_asg_found,
         )
-        print(
-            f"[ANALYSIS_SIMPLE_VISITOR_SUMMARY] Assignments to dispatcher variable (idx {self.dispatcher_var}) with numeric RHS found by visitor: {assignments_to_dispatcher_found}"
+        # print(
+        #     f"[ANALYSIS_SIMPLE_VISITOR_SUMMARY] Assignments to dispatcher variable (idx {self.dispatcher_var}) with numeric RHS found by visitor: {assignments_to_dispatcher_found}"
+        # )
+        self.logger.info(
+            "[ANALYSIS_SIMPLE_VISITOR_SUMMARY] Assignments to dispatcher variable (idx %s) with numeric RHS found by visitor: %s",
+            self.dispatcher_var,
+            assignments_to_dispatcher_found,
         )
 
     def _find_current_case_context(self, item_to_check, item_parents_from_visitor):
@@ -383,25 +439,40 @@ class CFGRecovery:
                                    Note: This list does NOT include item_to_check itself.
         """
         if not item_to_check:
-            print(
-                f"---> [_FIND_CONTEXT_CALLED] item_to_check is falsey (None or invalid proxy?). Value: {str(item_to_check)}. Returning None."
+            # print(
+            #     f"---> [_FIND_CONTEXT_CALLED] item_to_check is falsey (None or invalid proxy?). Value: {str(item_to_check)}. Returning None."
+            # )
+            self.logger.debug(
+                "---> [_FIND_CONTEXT_CALLED] item_to_check is falsey (None or invalid proxy?). Value: %s. Returning None.",
+                str(item_to_check),
             )
             return None
 
         # For logging the path taken during search
         path_for_logging = []
-        print(
-            f"---> [_FIND_CONTEXT_DEBUG] item_to_check before op access: type={type(item_to_check)}, value={str(item_to_check)}"
+        # print(
+        #     f"---> [_FIND_CONTEXT_DEBUG] item_to_check before op access: type={type(item_to_check)}, value={str(item_to_check)}"
+        # )
+        self.logger.debug(
+            "---> [_FIND_CONTEXT_DEBUG] item_to_check before op access: type=%s, value=%s",
+            type(item_to_check),
+            str(item_to_check),
         )
 
         # --- BEGIN NEW DIAGNOSTICS & ERROR HANDLING ---
         try:
-            print(f"    DIR(item_to_check): {dir(item_to_check)}")  # Print attributes
+            # print(f"    DIR(item_to_check): {dir(item_to_check)}")  # Print attributes
+            self.logger.debug(
+                "    DIR(item_to_check): %s", dir(item_to_check)
+            )  # Print attributes
             item_op = item_to_check.op
             # --- BEGIN NEW DIAGNOSTIC ---
             if item_op is None:
-                print(
-                    f"!!! DIAGNOSTIC: item_op is None immediately after item_to_check.op assignment."
+                # print(
+                #     f"!!! DIAGNOSTIC: item_op is None immediately after item_to_check.op assignment."
+                # )
+                self.logger.warning(
+                    "!!! DIAGNOSTIC: item_op is None immediately after item_to_check.op assignment."
                 )
             # --- END NEW DIAGNOSTIC ---
             item_ea = item_to_check.ea
@@ -413,14 +484,26 @@ class CFGRecovery:
 
             current_item_desc = f"(Item: op={ida_hexrays.get_ctype_name(item_op)}, ea={hex(item_ea)}, obj_id={item_obj_id_str})"
         except AttributeError as e:
-            print(f"!!! ATTR_ERROR in _find_current_case_context: {e}")
-            print(
-                f"    item_to_check at time of error: type={type(item_to_check)}, value={str(item_to_check)}"
+            # print(f"!!! ATTR_ERROR in _find_current_case_context: {e}")
+            self.logger.error(
+                "!!! ATTR_ERROR in _find_current_case_context: %s", e, exc_info=True
+            )
+            # print(
+            #     f"    item_to_check at time of error: type={type(item_to_check)}, value={str(item_to_check)}"
+            # )
+            self.logger.error(
+                "    item_to_check at time of error: type=%s, value=%s",
+                type(item_to_check),
+                str(item_to_check),
             )
             if hasattr(item_to_check, "this") and item_to_check.this is None:
-                print(
+                # print(
+                #     "    item_to_check.this is None (underlying C++ object likely gone or invalid)"
+                # )
+                self.logger.error(
                     "    item_to_check.this is None (underlying C++ object likely gone or invalid)"
                 )
+
             current_item_desc = "(Item: ERROR RETRIEVING DETAILS)"
         # --- END NEW DIAGNOSTICS & ERROR HANDLING ---
         path_for_logging.append(current_item_desc)
@@ -448,8 +531,10 @@ class CFGRecovery:
 
                 # --- BEGIN ADDED NULL CHECK FOR PARENT_CITEM ---
                 if not parent_citem:
-                    print(
-                        f"    [!] Warning: Parent citem at index {i} in visitor parent stack is None or invalid. Skipping."
+                    # print(f"    [!] Warning: Parent citem at index {i} in visitor parent stack is None or invalid. Skipping.")
+                    self.logger.warning(
+                        "    [!] Warning: Parent citem at index %s in visitor parent stack is None or invalid. Skipping.",
+                        i,
                     )
                     continue
                 # --- END ADDED NULL CHECK FOR PARENT_CITEM ---
@@ -525,28 +610,36 @@ class CFGRecovery:
 
     def run(self):
         """Main function to run the CFG recovery"""
-        print(f"[*] Starting CFG recovery for function at 0x{self.func_ea:X}")
+        # print(f"[*] Starting CFG recovery for function at 0x{self.func_ea:X}")
+        self.logger.info("[*] Starting CFG recovery for function at 0x%X", self.func_ea)
 
         # Get decompiled function
         cfunc = idaapi.decompile(self.func_ea)
         if not cfunc:
-            print("[-] Failed to decompile function")
+            # print("[-] Failed to decompile function")
+            self.logger.error("[-] Failed to decompile function")
             return False
 
         # Find dispatcher variable
         if not self.find_dispatcher_variable(cfunc):
-            print("[-] Failed to find dispatcher variable")
+            # print("[-] Failed to find dispatcher variable")
+            self.logger.error("[-] Failed to find dispatcher variable")
             return False
 
-        print(f"[+] Found dispatcher variable at index: {self.dispatcher_var}")
+        # print(f"[+] Found dispatcher variable at index: {self.dispatcher_var}")
+        self.logger.info(
+            "[+] Found dispatcher variable at index: %s", self.dispatcher_var
+        )
 
         # Extract case blocks
         self.extract_case_blocks(cfunc)
-        print(f"[+] Extracted {len(self.blocks)} case blocks")
+        # print(f"[+] Extracted {len(self.blocks)} case blocks")
+        self.logger.info("[+] Extracted %s case blocks", len(self.blocks))
 
         # Use simple analysis approach
         self.analyze_simple(cfunc)
-        print(f"[+] Found {len(self.edges)} control flow edges")
+        # print(f"[+] Found {len(self.edges)} control flow edges")
+        self.logger.info("[+] Found %s control flow edges", len(self.edges))
 
         # Build graph
         self.build_graph()
@@ -556,20 +649,36 @@ class CFGRecovery:
         output_file = f"cfg_0x{self.func_ea:X}.dot"
         with open(output_file, "w") as f:
             f.write(dot_output)
-        print(f"[+] Saved DOT file to {output_file}")
-        print(f"[+] Visualize with: dot -Tpng {output_file} -o cfg.png")
+        # print(f"[+] Saved DOT file to {output_file}")
+        self.logger.info("[+] Saved DOT file to %s", output_file)
+        # print(f"[+] Visualize with: dot -Tpng {output_file} -o cfg.png")
+        self.logger.info("[+] Visualize with: dot -Tpng %s -o cfg.png", output_file)
 
         return True
 
 
 # Usage
 def main():
+    # Configure logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s:%(lineno)d: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Get a logger instance for this module if you plan to use it elsewhere in main,
+    # otherwise, the root logger configured by basicConfig will handle logs from CFGRecovery.
+    # For simplicity, the logger instance in CFGRecovery methods will use __name__ (i.e., the script's name as a module)
+
     # Get current function
     func_ea = idc.get_screen_ea()
     func = idaapi.get_func(func_ea)
 
     if not func:
-        print("[-] No function at current address")
+        # print("[-] No function at current address")
+        # It's better to log this with a logger available in main or use logging directly.
+        logging.error(
+            "[-] No function at current address"
+        )  # Using logging directly as logger instance might not be set up here yet if main is very simple.
         return
 
     # Run CFG recovery
