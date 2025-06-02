@@ -8,8 +8,9 @@
 # Author: Guillaume Delugré.
 #
 
-from idc import *
-from idautils import *
+import idaapi
+import idautils
+import idc
 
 global current_arch
 global summary_info
@@ -2347,27 +2348,30 @@ def identify_register(ea, access, sig, known_regs, cpu_reg = None, known_fields 
         print("%x: Cannot identify system register." % ea)
         set_cmt(ea, "[%s] Unknown system register." % access, 0)
 
+def aarch32_get_coproc_num(ea):
+    ins = idc.get_wide_dword(ea)
+    return (ins >> 8) & 0xf #bit[11:8]
+
 def markup_coproc_reg64_insn(ea):
-    if print_insn_mnem(ea)[1] == "R":
+    if idc.print_insn_mnem(ea)[1] == "R":
         access = '<'
     else:
         access = '>'
-    op1 = get_operand_value(ea, 0)
-    cp = "p%d" % DecodeInstruction(ea).Op1.specflag1
-    reg1, reg2, crm = print_operand(ea, 1).split(',')
+    op1 = idc.get_operand_value(ea, 0)
+    cp = "p%d" % aarch32_get_coproc_num(ea)
+    reg1, reg2, crm = idc.print_operand(ea, 1).split(',')
 
     sig = ( cp, op1, crm )
     identify_register(ea, access, sig, AARCH32_COPROC_REGISTERS_64)
 
 def markup_coproc_insn(ea):
-    if print_insn_mnem(ea)[1] == "R":
+    if idc.print_insn_mnem(ea)[1] == "R":
         access = '<'
     else:
         access = '>'
-    op1, op2 = get_operand_value(ea, 0), get_operand_value(ea, 2)
-    reg, crn, crm = print_operand(ea, 1).split(',')
-    cp = "p%d" % DecodeInstruction(ea).Op1.specflag1
-
+    op1, op2 = idc.get_operand_value(ea, 0), idc.get_operand_value(ea, 2)
+    reg, crn, crm = idc.print_operand(ea, 1).split(',')
+    cp = "p%d" % aarch32_get_coproc_num(ea)
     sig = ( cp, crn, op1, crm, op2 )
     identify_register(ea, access, sig, AARCH32_COPROC_REGISTERS, reg, AARCH32_COPROC_FIELDS)
 
@@ -2375,17 +2379,17 @@ def is_reserved_aarch64_register(sig):
     return sig[0] == 0b11 and (sig[2] in ("c15", "c11"))
 
 def markup_aarch64_sys_insn(ea):
-    if print_insn_mnem(ea)[1] == "R":
+    if idc.print_insn_mnem(ea)[1] == "R":
         reg_pos = 0
         access = '<'
     else:
         reg_pos = 4
         access = '>'
     base_args = (reg_pos + 1) % 5
-    op0 = 2 + ((get_wide_dword(ea) >> 19) & 1)
-    op1, op2 = get_operand_value(ea, base_args), get_operand_value(ea, base_args + 3)
-    crn, crm = print_operand(ea, base_args + 1), print_operand(ea, base_args + 2)
-    reg = print_operand(ea, reg_pos)
+    op0 = 2 + ((idc.get_wide_dword(ea) >> 19) & 1)
+    op1, op2 = idc.get_operand_value(ea, base_args), idc.get_operand_value(ea, base_args + 3)
+    crn, crm = idc.print_operand(ea, base_args + 1), idc.print_operand(ea, base_args + 2)
+    reg = idc.print_operand(ea, reg_pos)
 
     sig = ( op0, op1, crn, crm, op2 )
 
@@ -2393,60 +2397,60 @@ def markup_aarch64_sys_insn(ea):
         name = "S3_{}_{}_{}_{}".format(op1, crn, crm, op2).upper()
         desc = "IMPLEMENTATION DEFINED"
         cmt = "[%s] %s (%s)" % (access, name, desc)
-        set_cmt(ea, cmt, 0)
+        idc.set_cmt(ea, cmt, 0)
         print("%x: %s" % (ea, cmt))
         return
 
     identify_register(ea, access, sig, AARCH64_SYSTEM_REGISTERS, reg, AARCH64_SYSREG_FIELDS)
 
 def markup_aarch64_sys_coproc_insn(ea):
-    if print_insn_mnem(ea) == "SYSL":
+    if idc.print_insn_mnem(ea) == "SYSL":
         access = '<'
         reg_pos = 0
     else:
         access = '>'
         reg_pos = 4
     base_args = (reg_pos + 1) % 5
-    op1, op2 = get_operand_value(ea, base_args), get_operand_value(ea, base_args + 3)
-    crn, crm = print_operand(ea, base_args + 1), print_operand(ea, base_args + 2)
-    reg = print_operand(ea, reg_pos)
+    op1, op2 = idc.get_operand_value(ea, base_args), idc.get_operand_value(ea, base_args + 3)
+    crn, crm = idc.print_operand(ea, base_args + 1), idc.print_operand(ea, base_args + 2)
+    reg = idc.print_operand(ea, reg_pos)
 
     sig = ( op1, crn, crm, op2 )
     identify_register(ea, access, sig, AARCH64_SYSTEM_COPROC_REGISTERS, reg)
 
 def markup_psr_insn(ea):
-    if print_operand(ea,1)[0] == "#": # immediate
-        psr = get_operand_value(ea, 1)
+    if idc.print_operand(ea,1)[0] == "#": # immediate
+        psr = idc.get_operand_value(ea, 1)
         mode = ARM_MODES.get(psr & 0b11111, "Unknown")
         e = (psr & (1 << 9)) and 'E' or '-'
         a = (psr & (1 << 8)) and 'A' or '-'
         i = (psr & (1 << 7)) and 'I' or '-'
         f = (psr & (1 << 6)) and 'F' or '-'
         t = (psr & (1 << 5)) and 'T' or '-'
-        set_cmt(ea, "Set CPSR [%c%c%c%c%c], Mode: %s" % (e,a,i,f,t,mode), 0)
+        idc.set_cmt(ea, "Set CPSR [%c%c%c%c%c], Mode: %s" % (e,a,i,f,t,mode), 0)
 
 def markup_pstate_insn(ea):
-    if print_operand(ea,0)[0] == "#" and print_operand(ea,1)[0] == "#":
-        op = PSTATE_OPS.get(get_operand_value(ea, 0), "Unknown")
-        value = get_operand_value(ea, 1)
+    if idc.print_operand(ea,0)[0] == "#" and idc.print_operand(ea,1)[0] == "#":
+        op = PSTATE_OPS.get(idc.get_operand_value(ea, 0), "Unknown")
+        value = idc.get_operand_value(ea, 1)
         if op == "SPSel":
-            set_cmt(ea, "Select PSTATE.SP = SP_EL%c" % ('0', 'x')[value & 1], 0)
+            idc.set_cmt(ea, "Select PSTATE.SP = SP_EL%c" % ('0', 'x')[value & 1], 0)
         elif op[0:4] == "DAIF":
             d = (value & (1 << 3)) and 'D' or '-'
             a = (value & (1 << 2)) and 'A' or '-'
             i = (value & (1 << 1)) and 'I' or '-'
             f = (value & (1 << 0)) and 'F' or '-'
-            set_cmt(ea, "%s PSTATE.DAIF [%c%c%c%c]" % (op[4:7], d,a,i,f), 0)
+            idc.set_cmt(ea, "%s PSTATE.DAIF [%c%c%c%c]" % (op[4:7], d,a,i,f), 0)
 
 def markup_system_insn(ea):
-    mnem = print_insn_mnem(ea)
+    mnem = idc.print_insn_mnem(ea)
     if mnem[0:4] in ("MRRC", "MCRR"):
         markup_coproc_reg64_insn(ea)
     elif mnem[0:3] in ("MRC", "MCR"):
         markup_coproc_insn(ea)
     elif current_arch == 'aarch32' and mnem[0:3] == "MSR":
         markup_psr_insn(ea)
-    elif current_arch == 'aarch64' and mnem[0:3] == "MSR" and not print_operand(ea, 2):
+    elif current_arch == 'aarch64' and mnem[0:3] == "MSR" and not idc.print_operand(ea, 2):
         markup_pstate_insn(ea)
     elif current_arch == 'aarch64' and mnem[0:3] in ("MSR", "MRS"):
         markup_aarch64_sys_insn(ea)
@@ -2460,11 +2464,11 @@ def markup_system_insn(ea):
     elif mnem in CRYPTO_INSN:
         summary_info["Cryptography"].add(function_name_or_address(ea))
 
-    set_color(ea, CIC_ITEM, 0x00000000) # Black background, adjust to your own theme
+    idc.set_color(ea, idc.CIC_ITEM, 0x00000000) # Black background, adjust to your own theme
 
 def current_arch_size():
-    _, t, _ = parse_decl("void *", 0)
-    return SizeOf(t) * 8
+    _, t, _ = idc.parse_decl("void *", 0)
+    return idc.SizeOf(t) * 8
 
 def print_summary():
     print("SUMMARY:")
@@ -2474,16 +2478,30 @@ def print_summary():
         print("  {:<24}: {}".format(category, ", ".join(hex(addr) if isinstance(addr, int) else addr for addr in addrs)))
 
 def run_script():
-    for addr in Heads():
+    for addr in idautils.Heads():
         if is_system_insn(addr):
             markup_system_insn(addr)
     print_summary()
 
+class ArmSystemInsn(idaapi.plugin_t):
+    flags = idaapi.PLUGIN_UNL
+    comment = "This script will give you the list of ARM system instructions used in your IDA database. This is useful for locating specific low-level pieces of code (setting up the MMU, caches, fault handlers, etc.)."
+    help = "Highlight ARM system instructions"
+    wanted_name = "Highlight ARM instructions"
+    
+    def init(self):
+        return idaapi.PLUGIN_OK
+    
+    def run(self, arg):
+        if idc.get_inf_attr(idaapi.INF_PROCNAME) in ('ARM', 'ARMB'):
+            global current_arch
+            current_arch = 'aarch64' if current_arch_size() == 64 else 'aarch32'
+            run_script()
+        else:
+            Warning("This script can only work with ARM and AArch64 architectures.")
+
 #
 # Check we are running this script on an ARM architecture.
 #
-if get_inf_attr(INF_PROCNAME) in ('ARM', 'ARMB'):
-    current_arch = 'aarch64' if current_arch_size() == 64 else 'aarch32'
-    run_script()
-else:
-    Warning("This script can only work with ARM and AArch64 architectures.")
+def PLUGIN_ENTRY():
+    return ArmSystemInsn()
