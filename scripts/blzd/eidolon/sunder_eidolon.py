@@ -28,6 +28,7 @@ import time
 import typing
 import uuid
 import warnings
+from bisect import bisect_left, bisect_right
 
 import capstone
 import capstone.x86
@@ -573,7 +574,7 @@ class MultiPartPatternMetadata(RegexPatternMetadata):
 
     def __post_init__(self):
         # Compile to ensure group names are available.
-        _ = self.compile(re.DOTALL)
+        _ = self.compile(re.DOTALL | re.VERBOSE)
         required_groups = {"first_jump", "padding", "second_jump"}
         missing = required_groups - set(self.group_names)
         if missing:
@@ -587,7 +588,7 @@ class SinglePartPatternMetadata(RegexPatternMetadata):
     )
 
     def __post_init__(self):
-        _ = self.compile(re.DOTALL)
+        _ = self.compile(re.DOTALL | re.VERBOSE)
         required_groups = {"prefix", "padding", "jump"}
         missing = required_groups - set(self.group_names)
         if missing:
@@ -603,7 +604,7 @@ class JunkPatternMetadata(RegexPatternMetadata):
     )
 
     def __post_init__(self):
-        _ = self.compile(re.DOTALL)
+        _ = self.compile(re.DOTALL | re.VERBOSE)
         required_groups = {"junk"}
         missing = required_groups - set(self.group_names)
         if missing:
@@ -611,8 +612,16 @@ class JunkPatternMetadata(RegexPatternMetadata):
 
 
 # fmt: off
-PADDING_PATTERN = rb"(?:\xC0[\xE0-\xFF]\x00|(?:\x86|\x8A)[\xC0\xC9\xD2\xDB\xE4\xED\xF6\xFF])"
-
+# (We do not wrap this in a named group here so that we can reuse it inside other groups.)
+PADDING_PATTERN = rb"""
+    (?:
+        \xC0[\xE0-\xFF]\x00  # 3-byte SHL reg, 0 with random register encoding
+        |                     # OR
+        (?:\x86|\x8A)        # 2-byte XCHG or MOV instruction
+        [\xC0\xC9\xD2\xDB\xE4\xED\xF6\xFF]  # Specific register encodings
+    )
+"""
+    
 # Multi-part jump patterns: pairs of conditional jumps with optional padding
 MULTI_PART_PATTERNS = [
     MultiPartPatternMetadata(rb"(?P<first_jump>\x70.)(?P<padding>" + PADDING_PATTERN + rb")*(?P<second_jump>\x71.)", "JO ... JNO"),
@@ -635,68 +644,40 @@ MULTI_PART_PATTERNS = [
 
 # Single-part jump patterns: prefix instruction + optional padding + conditional jump
 SINGLE_PART_PATTERNS = [
-    SinglePartPatternMetadata(rb"(?P<prefix>\xF8)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "CLC ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xF9)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x76.)", "STC ... JBE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xF9)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x72.)", "STC ... JB"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xA8.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST AL, imm8 ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xA9....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST EAX, imm32 ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xF6..)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m8, imm8 ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xF7.....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m32, imm32 ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x84.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m8, r8 ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x85.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m32, r32 ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xA8.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST AL, imm8 ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xA9....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST EAX, imm32 ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xF6..)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m8, imm8 ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\xF7.....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m32, imm32 ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x84.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m8, r8 ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x85.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m32, r32 ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xE0-\xE7]\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "AND r/m8, 0xFF ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x24\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "AND AL, 0xFF ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xC8-\xCF]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "OR r/m8, 0x00 ... JNO"),
     SinglePartPatternMetadata(rb"(?P<prefix>\x0C\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "OR AL, 0x00 ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xF0-\xF7]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "XOR r/m8, 0x00 ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x34\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "XOR AL, 0x00 ... JNO"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xE0-\xE7]\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "AND r/m8, 0xFF ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x24\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "AND AL, 0xFF ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xC8-\xCF]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "OR r/m8, 0x00 ... JAE"),
     SinglePartPatternMetadata(rb"(?P<prefix>\x0C\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "OR AL, 0x00 ... JAE"),
-    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xF0-\xF7]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "XOR r/m8, 0x00 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x24\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "AND AL, 0xFF ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x24\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "AND AL, 0xFF ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x34\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "XOR AL, 0x00 ... JNO"),
     SinglePartPatternMetadata(rb"(?P<prefix>\x34\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "XOR AL, 0x00 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xC8-\xCF]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "OR r/m8, 0x00 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xC8-\xCF]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "OR r/m8, 0x00 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xE0-\xE7]\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "AND r/m8, 0xFF ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xE0-\xE7]\xFF)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "AND r/m8, 0xFF ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xF0-\xF7]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "XOR r/m8, 0x00 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x80[\xF0-\xF7]\x00)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "XOR r/m8, 0x00 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x84.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m8, r8 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x84.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m8, r8 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x85.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m32, r32 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\x85.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m32, r32 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xA8.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST AL, imm8 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xA8.)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST AL, imm8 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xA9....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST EAX, imm32 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xA9....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST EAX, imm32 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF6..)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m8, imm8 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF6..)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m8, imm8 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF7.....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x71.)", "TEST r/m32, imm32 ... JNO"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF7.....)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "TEST r/m32, imm32 ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF8)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x73.)", "CLC ... JAE"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF9)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x72.)", "STC ... JB"),
+    SinglePartPatternMetadata(rb"(?P<prefix>\xF9)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>\x76.)", "STC ... JBE"),
+    # CMP ESP,0x1C00h – always “above” on a real Win x64 stack, then JA short
+    # # 81 FC 00 44 00 00
+    # # 81 FC 00 3F 00 00
+    # # 81 FC 00 44 00 00
+    SinglePartPatternMetadata(rb"(?P<prefix>[\x80\x81\x83]\xFC\x00...)(?P<padding>" + PADDING_PATTERN + rb")?(?P<jump>(\x77|\x73).)", "CMP ESP,0x1C00 … JA/E"),
 ]
 
-
-JUNK_PATTERNS = [
-    JunkPatternMetadata(rb"(?P<junk>\x0F\x31)", "RDTSC"),
-    JunkPatternMetadata(rb"(?P<junk>\x0F[\x80-\x8F]..[\x00\x01]\x00)", "TwoByte Conditional Jump"),
-    JunkPatternMetadata(rb"(?P<junk>\xE8..[\x00\x01]\x00)", "Invalid CALL"),
-    JunkPatternMetadata(rb"(?P<junk>\x81[\xC0-\xC3\xC5-\xC7]....)", "ADD reg32, imm32"),
-    JunkPatternMetadata(rb"(?P<junk>\x80[\xC0-\xC3\xC5-\xC7].)", "ADD reg8, imm8"),
-    JunkPatternMetadata(rb"(?P<junk>\x83[\xC0-\xC3\xC5-\xC7].)", "ADD reg32, imm8"),
-    JunkPatternMetadata(rb"(?P<junk>\xC6[\xC0-\xC3\xC5-\xC7].)", "MOV reg8, imm8"),
-    JunkPatternMetadata(rb"(?P<junk>\xC7[\xC0-\xC3\xC5-\xC7]....)", "MOV reg32, imm32"),
-    JunkPatternMetadata(rb"(?P<junk>\xF6[\xD8-\xDB\xDD-\xDF])", "NEG reg8"),
-    JunkPatternMetadata(rb"(?P<junk>\x80[\xE8-\xEB\xED-\xEF].)", "AND reg8, imm8"),
-    JunkPatternMetadata(rb"(?P<junk>\x81[\xE8-\xEB\xED-\xEF]....)", "AND reg32, imm32"),
-    JunkPatternMetadata(rb"(?P<junk>\x68....)", "PUSH imm32"),
-    JunkPatternMetadata(rb"(?P<junk>\x6A.)", "PUSH imm8"),
-    JunkPatternMetadata(rb"(?P<junk>[\x70-\x7F].)", "Random 112-127"),
-    JunkPatternMetadata(rb"(?P<junk>[\x50-\x5F])", "Single-byte PUSH/POP"),
-    JunkPatternMetadata(rb"(?P<junk>(\x90\x90|\x66\x90))", "NOP"),
-]   
-
-SUPERFLULOUS_BYTE = 0xF4
-SINGLE_BYTE_OPCODE_SET = {
-    129, 5, 13, 21, 29, 160, 161, 162, 163, 37, 169, 45, 53, 
-    184, 185, 186, 187, 188, 61, 189, 190, 191, 199, 200, 104, 
-    232, 233, 105, 247
-}
-MED_OPCODE_SET = {
-    0, 1, 2, 3, 132, 133, 134, 135, 8, 9, 10, 11, 136, 137, 138, 
-    15, 16, 17, 18, 19, 139, 140, 141, 142, 24, 25, 26, 27, 128, 
-    131, 160, 161, 162, 163, 32, 33, 34, 35, 40, 41, 42, 43, 48, 
-    49, 50, 51, 56, 57, 58, 59, 143, 107, 246
-}
-BIG_OPCODE_SET = {128, 129, 192, 131, 193, 105, 107, 246}
 
 # Helper sets for checking specific registers based on the regex patterns
 # These patterns [\xC0-\xC3\xC5-\xC7] and [\xD8-\xDB\xDD-\xDF] and [\xE8-\xEB\xED-\xEF]
@@ -838,6 +819,93 @@ def stage1_find_patterns(
 
 
 @dataclasses.dataclass
+class Range:
+    """A range of addresses with a start (inclusive) and end (exclusive)."""
+
+    start: int
+    end: int
+
+    def __post_init__(self):
+        if self.start >= self.end:
+            raise ValueError("start must be less than end")
+
+    def __contains__(self, addr: int) -> bool:
+        """Check if an address is within this range."""
+        return self.start <= addr < self.end
+
+    def __len__(self) -> int:
+        """Return the size of the range in bytes."""
+        return self.end - self.start
+
+    def overlaps(self, other: "Range") -> bool:
+        """Check if this range overlaps with another range."""
+        return self.start < other.end and other.start < self.end
+
+    def merge(self, other: "Range") -> "Range":
+        return Range(min(self.start, other.start), max(self.end, other.end))
+
+
+class IntervalSet:
+    """
+    Sorted, non-overlapping list of Range objects with O(log n) insertion.
+    """
+
+    __slots__ = ("_ranges",)
+
+    def __init__(self) -> None:
+        self._ranges: list[Range] = []
+
+    def __iter__(self):
+        return iter(self._ranges)
+
+    def __len__(self):
+        return len(self._ranges)
+
+    # --- public ------------------------------------------------------------
+    def add(self, new: Range) -> None:
+        """
+        Insert `new` and coalesce any overlaps / adjacencies in-place.
+        """
+        # Fast-path: first interval
+        if not self._ranges:
+            self._ranges.append(new)
+            return
+
+        # Binary-search insertion point by *start*
+        idx = bisect_left(
+            self._ranges, new.start, key=lambda r: r.start
+        )  # Python 3.10+
+
+        # Extend backward if necessary
+        if idx > 0 and self._ranges[idx - 1].end >= new.start:
+            idx -= 1
+
+        # Merge forward while overlapping
+        while idx < len(self._ranges) and new.overlaps(self._ranges[idx]):
+            new = new.merge(self._ranges[idx])
+            del self._ranges[idx]
+
+        # Also coalesce “touching” intervals (…,end==new.start or vice-versa)
+        if idx < len(self._ranges) and new.end == self._ranges[idx].start:
+            new = new.merge(self._ranges[idx])
+            del self._ranges[idx]
+        if idx > 0 and self._ranges[idx - 1].end == new.start:
+            new = new.merge(self._ranges[idx - 1])
+            del self._ranges[idx - 1]
+            idx -= 1
+
+        self._ranges.insert(idx, new)
+
+    # ­— optional helpers ---------------------------------------------------
+    def covers(self, addr: int) -> bool:
+        i = bisect_right(self._ranges, addr, key=lambda r: r.start) - 1
+        return i >= 0 and addr < self._ranges[i].end
+
+    def as_tuples(self):
+        return [(r.start, r.end) for r in self._ranges]
+
+
+@dataclasses.dataclass
 class JunkInstruction:
     """Holds information about a single peeled junk instruction."""
 
@@ -922,148 +990,6 @@ class CapstoneDisasmContext:
             yield insn
 
 
-def peel_junk(buf: bytes, is_64: bool) -> typing.List[JunkInstruction]:
-    """
-    Disassembles the buffer using Capstone and returns a list of
-    contiguous instructions that match the criteria derived from the
-    original regex JUNK_PATTERNS, using a match statement.
-
-    Stops at the first instruction that does not match any of the junk criteria.
-
-    Args:
-        buf: The byte buffer to disassemble and peel junk from.
-        is_64: True if disassembling in 64-bit mode, False for 32-bit.
-    Returns:
-        A list of JunkInstruction objects for each matched junk instruction.
-        Returns an empty list if no junk is found or on error.
-    """
-    peeled_instructions: typing.List[JunkInstruction] = []
-    if not buf:
-        return peeled_instructions
-
-    current_offset = 0
-    stop_disasm = False
-    with CapstoneDisasmContext(is_64) as disasm_ctx:
-        for insn in disasm_ctx.disasm(buf, 0):
-            if stop_disasm:
-                break
-            logger.debug(
-                f"Disassembled instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset} - bytes: {insn.bytes.hex()}"
-            )
-            # Safety check: Ensure the instruction doesn't go past the buffer end
-            if current_offset + insn.size > len(buf):
-                logger.warning(
-                    f"Instruction {insn.mnemonic} at offset {current_offset} exceeds buffer bounds ({insn.size} bytes, buffer has {len(buf) - current_offset} remaining). Stopping."
-                )
-                break
-
-            junk_description = "Unknown Junk"  # Default description
-
-            # Check if the instruction's bytes match any junk regex pattern *exactly*
-            for rgx in JUNK_PATTERNS:
-                # Use match() to check from the beginning of the instruction bytes
-                match = rgx.compile().match(insn.bytes)
-
-                # Check if a match occurred AND it consumed the *entire* instruction
-                if match:
-                    if match.end() != insn.size:
-                        logger.warning(
-                            f"junk detected @ {insn.address} - {rgx.description} - matched {insn.bytes.hex()} and consumed {match.end()} bytes but expected {insn.size} bytes"
-                        )
-                    junk_description = rgx.description or "Junk"
-
-                    # logger.debug(f"  Instruction bytes {instruction_bytes.hex()} matched regex: {junk_meta.pattern.decode('latin-1')}")
-                    peeled_instructions.append(
-                        JunkInstruction(
-                            start_offset=current_offset,
-                            length=insn.size,
-                            description=junk_description,
-                            matched_bytes=insn.bytes,
-                        )
-                    )
-                    # found a junk instruction, break out of the loop
-                    break
-            else:
-                # Stop at the first non-junk instruction
-                # logger.debug(f"  Non-junk instruction: {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset}. Stopping.")
-                stop_disasm = True
-            current_offset += insn.size
-            # logger.debug(f"  Found junk: {junk_description} - {insn.mnemonic} {insn.op_str} ({insn.size} bytes) at offset {current_offset - insn.size}")
-    return peeled_instructions
-
-
-def find_junk_stage2_chain(
-    chain: MatchChain, buf: bytes, base_ea: int, is_64: bool
-) -> MatchChain:
-    """
-    Finds a contiguous block of junk instructions immediately following the
-    Stage 1 match in a single MatchChain using Capstone (peel_junk)
-    and adds each individual junk instruction as a segment.
-
-    Args:
-        chain: The MatchChain object representing the stage 1 match.
-        buf: The full byte buffer containing the function/memory region.
-        base_ea: The base effective address of the buffer.
-        is_64: True if disassembling in 64-bit mode, False for 32-bit.
-
-    Returns:
-        The updated MatchChain object with individual junk segments added.
-    """
-    # Calculate the offset in the buffer immediately after the Stage 1 match
-    # chain.overall_start() is the absolute EA of the start of the chain (Stage 1)
-    # base_ea is the base effective address of the buffer
-    # The offset in the buffer is (chain_start_ea - buffer_base_ea) + chain_length
-    stage1_end_ea = chain.overall_start() + chain.overall_length()
-    buffer_offset_after_stage1 = stage1_end_ea - base_ea
-
-    # Ensure the offset is within the buffer bounds
-    if buffer_offset_after_stage1 >= len(buf):
-        logger.debug(
-            f"No bytes available after stage 1 match at EA 0x{stage1_end_ea:X} to search for junk."
-        )
-        return chain  # No buffer left to search
-
-    # Get the sub-buffer starting after the Stage 1 match
-    sub_buffer = buf[buffer_offset_after_stage1:]
-
-    # Use peel_junk to find the individual contiguous junk segments
-    # The 'start' in these segments is relative to the start of 'sub_buffer'
-    js: list[JunkInstruction] = peel_junk(sub_buffer, is_64)
-
-    if js:
-        logger.debug(
-            f"Found {len(js)} individual junk instructions after stage 1 match at EA 0x{stage1_end_ea:X}"
-        )
-
-        # Add each individual junk segment to the chain
-        for relative_seg in js:
-            # Calculate the absolute start EA of this junk segment
-            absolute_start_ea = stage1_end_ea + relative_seg.start_offset
-
-            # Calculate the start offset relative to the chain's base_address
-            # This is what MatchSegment.start should store
-            offset_relative_to_chain_base = absolute_start_ea - chain.base_address
-
-            # Create a new MatchSegment for the chain
-            chain_segment = MatchSegment(
-                start=offset_relative_to_chain_base,
-                length=relative_seg.length,
-                description=relative_seg.description,
-                matched_bytes=relative_seg.matched_bytes,
-                segment_type=SegmentType.JUNK,
-                # matched_groups=relative_seg.matched_groups # Copy if peel_junk provided them
-            )
-            chain.add_segment(chain_segment)
-
-        # The junk_length and junk_segments properties on the chain will now be correct
-        logger.debug(f"Total peeled junk length added: {chain.junk_length} bytes.")
-
-    else:
-        logger.debug(f"No junk found after stage 1 match at EA 0x{stage1_end_ea:X}")
-
-    return chain
-
-
 @dataclasses.dataclass
 class BasicDecodedInstruction:
     """Holds standardized information about a decoded instruction."""
@@ -1073,6 +999,7 @@ class BasicDecodedInstruction:
     is_jump: bool = False
     jump_target: typing.Optional[int] = None
     is_nop: bool = False
+    dead_opaque_predicate: bool = False
 
 
 class InstructionDecoder(typing.Protocol):
@@ -1107,23 +1034,14 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         )
         self.md.detail = True
 
-    def decode(
-        self, ea: int, mem_bytes_at_ea: bytes
-    ) -> typing.Optional[BasicDecodedInstruction]:
-        """
-        Decodes instruction at ea using IDA's disassembler.
-        Ignores mem_bytes_at_ea, uses IDA's database.
-        Conforms to DecoderProtocol.
-        """
-        # Decode using Capstone
+    def get_next_insn(
+        self, mem_bytes_at_ea: bytes, ea: int
+    ) -> typing.Optional[capstone.CsInsn]:
         try:
             # Use list comprehension and next to get the first instruction or None
             insn = next(self.md.disasm(mem_bytes_at_ea, ea, count=1), None)
         except capstone.CsError as e:
             logger.error(f"Capstone decoding error at 0x{ea:X}: {e}")
-            return None
-
-        if insn is None:
             return None
         logger.debug(
             "Decoded instruction: %s %s (%X bytes) at offset %s - bytes: %s",
@@ -1133,6 +1051,21 @@ class CapstoneInstructionDecoder(InstructionDecoder):
             hex(ea),
             insn.bytes.hex(),
         )
+        return insn
+
+    def decode(
+        self, ea: int, mem_bytes_at_ea: bytes
+    ) -> typing.Optional[BasicDecodedInstruction]:
+        """
+        Decodes instruction at ea using IDA's disassembler.
+        Ignores mem_bytes_at_ea, uses IDA's database.
+        Conforms to DecoderProtocol.
+        """
+        # Decode using Capstone
+        insn = self.get_next_insn(mem_bytes_at_ea, ea)
+        if insn is None:
+            return None
+
         decoded = BasicDecodedInstruction(address=ea, size=insn.size)
         if insn.id == capstone.x86.X86_INS_NOP:
             decoded.is_nop = True
@@ -1145,6 +1078,28 @@ class CapstoneInstructionDecoder(InstructionDecoder):
             op1, op2 = insn.operands
             if op1.type == op2.type and op1.size == op2.size and op1.reg == op2.reg:
                 decoded.is_nop = True
+        elif insn.id == capstone.x86.X86_INS_PUSH and len(insn.operands) > 0:
+            # we have encountered this dead code:
+            # .text:0000000180188FB2 50                                                  push    rax
+            # .text:0000000180188FB3 EB FF                                               jmp     short near ptr loc_180188FB3+1
+            # .text:0000000180188FB5 C0 58 ? ?                                           rcr     byte ptr [rax-?], ?
+            if insn.operands[0].reg == capstone.x86.X86_REG_RAX:
+                next_insn = self.get_next_insn(
+                    mem_bytes_at_ea, insn.address + insn.size
+                )
+                if next_insn is not None and self._is_self_recursive_jump(insn):
+                    next_next_insn = self.get_next_insn(
+                        mem_bytes_at_ea, next_insn.address + next_insn.size
+                    )
+                    if next_next_insn is not None and next_next_insn.bytes.startswith(
+                        b"\xc0\x58"
+                    ):
+                        decoded.dead_opaque_predicate = True
+                        decoded.size = insn.size + next_insn.size + 2
+                    return decoded
+                else:
+                    decoded.is_nop = True
+                    return decoded
         elif capstone.CS_GRP_JUMP in insn.groups:
             if (
                 len(insn.operands) > 0
@@ -1153,6 +1108,30 @@ class CapstoneInstructionDecoder(InstructionDecoder):
                 decoded.is_jump = True
                 decoded.jump_target = insn.operands[0].imm
         return decoded
+
+    def _is_self_recursive_jump(self, insn: capstone.CsInsn) -> bool:
+        """
+        Heuristic detection of self-recursive jumps for Capstone.
+
+        Args:
+            insn: Capstone instruction object
+
+        Returns:
+            True if this appears to be a self-recursive jump
+        """
+        jump_source = insn.address
+        # Pattern detection for common dead opaque predicates
+        # EB FF - jump back 1 byte (into same instruction)
+        if (
+            insn.id == capstone.x86.X86_INS_JMP
+            and len(insn.bytes) == 2
+            and insn.bytes[0] == 0xEB
+            and insn.bytes[1] == 0xFF
+        ):
+            logger.debug(f"Self-recursive jump detected: EB FF at 0x{jump_source:X}")
+            return True
+
+        return False
 
 
 @dataclasses.dataclass
@@ -1294,6 +1273,16 @@ class JumpTargetAnalyzer:
                 trace_ea += decoded_insn.size
                 continue  # Continue the while loop to the next instruction
 
+            if decoded_insn.dead_opaque_predicate:
+                logger.debug(
+                    "%sDead opaque predicate found at 0x%X (size %X). Returning start: 0x%X.",
+                    indent,
+                    trace_ea,
+                    decoded_insn.size,
+                    current_ea,
+                )
+                return current_ea + decoded_insn.size
+
             if not decoded_insn.is_jump or decoded_insn.size != 2:
                 logger.debug(
                     "%sChain stopped at 0x%X: Instruction is not a 2-byte jump. Returning start: 0x%X",
@@ -1313,8 +1302,8 @@ class JumpTargetAnalyzer:
             )
 
             # --- Decide action based on the jump target (using absolute addresses) ---
-            # 1. Target is within the 'followable' range [match_start, match_end + 6)
-            if self.match_start <= target < match_end + 6:
+            # 1. Target is within the 'followable' range [match_start, match_end )
+            if self.match_start <= target < match_end:
                 logger.debug(
                     "%sFollowing jump from 0x%X to 0x%X (recursive call)",
                     indent,
@@ -1326,15 +1315,6 @@ class JumpTargetAnalyzer:
                     mem, target, match_end, decoder, visited, depth + 1
                 )
 
-            # 2. Target lands exactly at the potential start of the next stage
-            elif target == match_end + 6:
-                logger.debug(
-                    "%sJump chain ends: Reached potential next stage start 0x%X",
-                    indent,
-                    target,
-                )
-                return target  # Return the exact target address
-
             # 3. Target is within the overall Memory block, but *before* match_start.
             elif mem_start_ea <= target < self.match_start:
                 logger.debug(
@@ -1344,8 +1324,10 @@ class JumpTargetAnalyzer:
                     mem_start_ea,
                     mem_end_ea,
                     self.match_start,
-                    match_end + 6,
+                    match_end,
                 )
+                if depth == 0:  # this is a bs jump, ignore it.
+                    return None
                 return target  # Return the target address itself
 
             # 4. Target is out of the overall Memory bounds or otherwise unexpected.
@@ -1356,6 +1338,8 @@ class JumpTargetAnalyzer:
                     target,
                     current_ea,
                 )
+                if depth == 0:  # this is a bs jump, ignore it.
+                    return None
                 return current_ea  # Return the start address of the sequence containing the invalid jump
 
     def _decode_stream(self, decoder, start, match_bytes):
@@ -1384,35 +1368,60 @@ class JumpTargetAnalyzer:
           - stage1_type: SegmentType
         """
         decoder = CapstoneInstructionDecoder(is_x64)
-        match_end = chain.overall_start() + chain.overall_length()
+        match_end = chain.overall_start() + MAX_PATTERN_LEN
         logger.debug(
             "Processing jumps for chain @ 0x%X, match_end=0x%X",
             chain.overall_start(),
             match_end,
         )
+        match chain.stage1_type:
+            case SegmentType.STAGE1_SINGLE:
+                jump_offset = chain.segments[0].length - (
+                    len(chain.segments[0].matched_groups["jump"]) // 2
+                )
+                jump_ea = self.match_start + jump_offset
+            case SegmentType.STAGE1_MULTIPLE:
+                jump_offset = 0
+                jump_ea = self.match_start + jump_offset
+            case _:
+                raise ValueError(f"Invalid stage1_type: {chain.stage1_type}")
 
-        for insn in self._decode_stream(
-            decoder, chain.overall_start(), self.match_bytes
-        ):
-            # 1) filter out non jumps or non 2-byte jumps
-            if not insn.is_jump or insn.size != 2:
-                continue
-
-            final_target = self.follow_jump_chain(mem, insn.address, match_end, decoder)
-            if not final_target:
-                logger.debug("Bad target @0x%X", insn.address)
-                continue
-
-            if abs(final_target - match_end) > 6:
-                logger.debug("Out of range @0x%X", insn.address)
-                continue
-
-            # 2) process the hit
+        final_target = self.follow_jump_chain(mem, jump_ea, match_end, decoder)
+        if not final_target:
+            logger.debug(
+                "  Skipping jump at 0x%X: Invalid final target 0x%X",
+                jump_ea,
+                final_target if final_target else 0,
+            )
+        else:
             self.jump_targets[final_target] += 1
             if final_target not in self.target_type:
                 self.target_type[final_target] = chain.stage1_type
-            self.jump_details.append((insn.address, final_target, chain.stage1_type))
-            logger.debug("Found jump @0x%X → 0x%X", insn.address, final_target)
+            self.jump_details.append((jump_ea, final_target, chain.stage1_type))
+            logger.debug("Found jump @0x%X → 0x%X", jump_ea, final_target)
+        return self
+        # for insn in self._decode_stream(
+        #     decoder, chain.overall_start(), self.match_bytes
+        # ):
+        #     # 1) filter out non jumps or non 2-byte jumps
+        #     if not insn.is_jump or insn.size != 2:
+        #         continue
+
+        #     final_target = self.follow_jump_chain(mem, insn.address, match_end, decoder)
+        #     if not final_target:
+        #         logger.debug("Bad target @0x%X", insn.address)
+        #         continue
+
+        #     if abs(final_target - match_end) > 6:
+        #         logger.debug("Out of range @0x%X", insn.address)
+        #         continue
+
+        #     # 2) process the hit
+        #     self.jump_targets[final_target] += 1
+        #     if final_target not in self.target_type:
+        #         self.target_type[final_target] = chain.stage1_type
+        #     self.jump_details.append((insn.address, final_target, chain.stage1_type))
+        #     logger.debug("Found jump @0x%X → 0x%X", insn.address, final_target)
 
         return self
 
@@ -1437,149 +1446,13 @@ class JumpTargetAnalyzer:
             yield final_candidate
 
 
-def find_big_instruction(buffer_bytes: bytes, is_x64: bool = False) -> dict:
-    """
-    Find the 'big instruction' in a 6-byte buffer, checking specific positions from the end.
-    According to the constraints, the buffer will always be exactly 6 bytes.
-
-    Args:
-        buffer_bytes (bytes): The 6-byte buffer to analyze.
-        is_x64 (bool): Whether to check for REX prefixes (x64 mode).
-
-    Returns:
-        dict: A dictionary containing information about the found instruction.
-    """
-    assert len(buffer_bytes) == 6, "Buffer must be exactly 6 bytes"
-
-    # Ensure we have a 6-byte buffer
-    if len(buffer_bytes) != 6:
-        return {
-            "type": None,
-            "name": "Invalid buffer size",
-            "instruction": [],
-            "position": -1,
-            "junk_before": buffer_bytes,
-            "junk_after": [],
-        }
-
-    # 1. First check for 3-byte instructions in x64 mode (highest priority)
-    if is_x64:
-        # Check all possible positions for 3-byte instructions (REX + opcode + ModR/M)
-        for pos in range(4):  # Start positions 0, 1, 2, 3
-            if pos + 2 >= len(buffer_bytes):
-                continue
-
-            rex = buffer_bytes[pos]
-            opcode = buffer_bytes[pos + 1]
-            modrm = buffer_bytes[pos + 2]
-
-            if is_rex_prefix(rex):
-                # Check if it forms a valid 3-byte instruction
-                if opcode in MED_OPCODE_SET and is_valid_modrm(modrm):
-                    # Get junk bytes at the end (based on position)
-                    junk_after = buffer_bytes[pos + 3 :]
-
-                    # Verify junk bytes constraint for 3-byte instructions
-                    expected_junk_bytes = max(0, 3 - pos)
-                    if len(junk_after) == expected_junk_bytes:
-                        return {
-                            "type": "3-byte",
-                            "name": "REX + Two-byte Med instruction",
-                            "instruction": [rex, opcode, modrm],
-                            "position": pos,
-                            "junk_before": buffer_bytes[:pos],
-                            "junk_after": junk_after,
-                        }
-
-                elif opcode in BIG_OPCODE_SET and is_valid_modrm(modrm):
-                    # Get junk bytes at the end (based on position)
-                    junk_after = buffer_bytes[pos + 3 :]
-
-                    # Verify junk bytes constraint for 3-byte instructions
-                    expected_junk_bytes = max(0, 3 - pos)
-                    if len(junk_after) == expected_junk_bytes:
-                        return {
-                            "type": "3-byte",
-                            "name": "REX + Two-byte Big instruction",
-                            "instruction": [rex, opcode, modrm],
-                            "position": pos,
-                            "junk_before": buffer_bytes[:pos],
-                            "junk_after": junk_after,
-                        }
-
-    # 2. Next check for 2-byte instructions
-    for pos in range(5):  # Start positions 0, 1, 2, 3, 4
-        if pos + 1 >= len(buffer_bytes):
-            continue
-
-        opcode = buffer_bytes[pos]
-        modrm = buffer_bytes[pos + 1]
-
-        # Check if it forms a valid 2-byte instruction
-        if opcode in MED_OPCODE_SET and is_valid_modrm(modrm):
-            # Get junk bytes at the end (based on position)
-            junk_after = buffer_bytes[pos + 2 :]
-
-            # Verify junk bytes constraint for 2-byte instructions
-            expected_junk_bytes = max(0, 4 - pos)
-            if len(junk_after) == expected_junk_bytes:
-                return {
-                    "type": "2-byte",
-                    "name": "Two-byte Med instruction",
-                    "instruction": [opcode, modrm],
-                    "position": pos,
-                    "junk_before": buffer_bytes[:pos],
-                    "junk_after": junk_after,
-                }
-
-        elif opcode in BIG_OPCODE_SET and is_valid_modrm(modrm):
-            # Get junk bytes at the end (based on position)
-            junk_after = buffer_bytes[pos + 2 :]
-
-            # Verify junk bytes constraint for 2-byte instructions
-            expected_junk_bytes = max(0, 4 - pos)
-            if len(junk_after) == expected_junk_bytes:
-                return {
-                    "type": "2-byte",
-                    "name": "Two-byte Big instruction",
-                    "instruction": [opcode, modrm],
-                    "position": pos,
-                    "junk_before": buffer_bytes[:pos],
-                    "junk_after": junk_after,
-                }
-
-    # 3. Finally check for 1-byte instructions (lowest priority)
-    pos = 5  # Only valid position for 1-byte instruction (last byte)
-    if pos < len(buffer_bytes):
-        byte = buffer_bytes[pos]
-        if byte in SINGLE_BYTE_OPCODE_SET:
-            return {
-                "type": "1-byte",
-                "name": "Single-byte big instruction",
-                "instruction": [byte],
-                "position": pos,
-                "junk_before": buffer_bytes[:pos],
-                "junk_after": [],  # No junk after 1-byte instruction at the end
-            }
-
-    # No valid instruction found
-    return {
-        "type": None,
-        "name": "No match found",
-        "instruction": [],
-        "position": -1,
-        "junk_before": buffer_bytes,
-        "junk_after": [],
-    }
-
-
-def _stage4_is_chain_valid(
+def _analyze_chain(
     chain: MatchChain,
     mem: bytes,
     start_ea: int,
     is_x64: bool,
     max_size: int = MAX_PATTERN_LEN,
-) -> MatchSegment | None:
+) -> list[Range]:
     """
     Filter out false positive anti-disassembly patterns and handle overlaps.
     Integrates with existing big instruction detection code.
@@ -1594,16 +1467,12 @@ def _stage4_is_chain_valid(
         A single validated MatchChain object
     """
 
-    # Check if we already have a big instruction segment
-    for seg in chain.segments:
-        if seg.segment_type == SegmentType.BIG_INSTRUCTION:
-            return seg
-
     # Find the big instruction
     match_start = chain.overall_start()
     chain_end = match_start + max_size
+    ranges = []
 
-    logger.debug(f"Analyzing match: {chain.description} @ 0x{match_start:X}")
+    logger.info(f"Analyzing match: {chain.description} @ 0x{match_start:X}")
 
     # Determine possible jump targets - using your existing code
     jump_targets = JumpTargetAnalyzer(
@@ -1611,115 +1480,33 @@ def _stage4_is_chain_valid(
     ).process(mem=mem, chain=chain, is_x64=is_x64)
 
     for target in jump_targets:
-        # The most_likely_target represents the most likely jump target within the
-        # stub—likely the point where execution exits to the unobfuscated code.
-        # however, if we do not find a match, then we want to continue searching
-        # previous targets and use those in decending order until we find a match
-        logger.debug(f"most_likely_target: 0x{target:X}, block_end: 0x{chain_end:X}")
-        # Check for big instruction in the 6 bytes before target
-        # a big instruction (e.g., one with a 32-bit operand, up to 6 bytes)
-        # just before the final jump target to confuse disassemblers.
-        search_start = target - 6
-        if search_start < start_ea:
+        if target <= match_start:  # sanity-check
             continue
-
-        # Extract the 6-byte buffer
-        buffer_offset = search_start - start_ea
-        target_offset = target - start_ea
-        target_offset_forward = target - start_ea + 6
-        if buffer_offset < 0 or target_offset > len(mem):
-            continue
-
-        if target_offset_forward > len(mem):
-            logger.debug(
-                f"  Rejected: {chain.description} @ 0x{match_start:X} - target_offset_forward out of bounds: {target_offset_forward}"
-            )
-            continue
-        search_bytes_backwards = mem[buffer_offset:target_offset]
-        search_bytes_forwards = mem[target_offset:target_offset_forward]
-
-        for start_offset, search_bytes in [
-            (buffer_offset, search_bytes_backwards),
-            (target_offset, search_bytes_forwards),
-        ]:
-            logger.debug(f"search_bytes: {search_bytes.hex()}")
-            # up to 6 bytes to search for a big instruction.
-            if len(search_bytes) != 6:
-                logger.debug(
-                    f"  Rejected: {chain.description} @ 0x{match_start:X} - search_bytes too long: {len(search_bytes)} bytes"
-                )
-                continue
-            result = find_big_instruction(search_bytes, is_x64=is_x64)
-
-            if not result["type"]:
-                logger.debug("No valid instruction found.")
-                # if we do not find a match, then we want to find the previous targets and use those
-                # in decending order until we find a match
-                continue
-
-            # check for multiple anti-disassembly bytes after search_start + 6
-            # if found, then we want to add them to the new_bytes
-            new_len = (
-                len(result["junk_before"])
-                + len(result["instruction"])
-                + len(result["junk_after"])
-            )
-            new_bytes = (
-                bytes(result["junk_before"])
-                + bytes(result["instruction"])
-                + bytes(result["junk_after"])
-            )
-
-            # Check for additional anti-disassembly bytes
-            max_extra = max_size - new_len
-            mem_len = len(mem)
-            for _ in range(max_extra):
-                extra_offset = start_offset + new_len
-                if extra_offset >= mem_len:
-                    break
-                if mem[extra_offset] != SUPERFLULOUS_BYTE:
-                    break
-                logger.info(
-                    "* Found extra anti-disassembly byte @ 0x%X",
-                    start_ea + start_offset + new_len,
-                )
-                new_bytes += bytes([mem[extra_offset]])
-                new_len += 1
-
-            return MatchSegment(
-                start=start_offset,
-                length=new_len,
-                description=result["name"],
-                matched_bytes=new_bytes,
-                segment_type=SegmentType.BIG_INSTRUCTION,
-            )
+        logger.info(f"most_likely_target: 0x{target:X}, block_end: 0x{chain_end:X}")
+        ranges.append(Range(match_start, target))
+    return ranges
 
 
-def resolve_overlaps(chains: list[MatchChain]) -> list[MatchChain]:
+def resolve_overlaps(ranges: list[Range]) -> IntervalSet:
     """
     Fast, linear-time overlap resolution: keep only the first chain
     whose start is ≥ the furthest end so far.
     """
-    logger.info(f"Resolving overlaps among {len(chains)} chains")
+    logger.info(f"Resolving overlaps among {len(ranges)} ranges")
+    intervals = IntervalSet()
 
-    # 1) Sort by start EA
-    sorted_chains = sorted(chains, key=lambda c: c.overall_start())
+    for r in ranges:
+        intervals.add(r)
 
-    # 2) One‐pass acceptor
-    final: list[MatchChain] = []
-    max_end = -1  # highest end of any accepted chain so far
+        # decide whether to keep the chain object itself
+        last_end = intervals.as_tuples()[-1][1]  # rightmost byte so far
+        target = r.end
+        if target == last_end:  # this chain extended the interval set
+            logger.info(f"  Accepted (or widened): {r.start:X}-{r.end:X}")
+        else:
+            logger.info(f"  Rejected overlap: {r.start:X}-{r.end:X}")
 
-    for c in sorted_chains:
-        s = c.overall_start()
-        e = s + c.overall_length()
-        if s >= max_end:
-            final.append(c)
-            max_end = e
-
-    logger.info(
-        f"Overlap resolution complete: {len(final)} of {len(chains)} chains accepted"
-    )
-    return final
+    return intervals
 
 
 # ─── Async deobfuscator ───────────────────────────────────
@@ -1797,104 +1584,13 @@ def process_chunk(args):
                     break
             # ────────────────────────────────────────────────────────────
 
-            # — Stage 2 + 3
-            s2_3 = []
-            for orig in s1_chains:
+            for chain in s1_chains:
                 # IMPORTANT: buf starts at padded_start, so bump base_ea accordingly
-                chain = find_junk_stage2_chain(
-                    orig, full_buf_mv, base_ea + padded_start, is_64
-                )
-                kept = (
-                    MIN_PATTERN_LEN <= chain.overall_length() <= MAX_PATTERN_LEN
-                    and chain.junk_length > 0
-                )
-                if kept:
-                    s2_3.append(chain)
-                # ─── TRACEPOINT: Stage 2/3 drop ────────────────────────
-                if (
-                    orig.overall_start()
-                    <= TARGET_EA
-                    < orig.overall_start() + orig.overall_length()
-                    and not kept
-                ):
-                    logger.warning(
-                        "[TRACE][Stage2/3 DROP] 0x%X dropped: length=%d junk_length=%d",
-                        orig.overall_start(),
-                        chain.overall_length(),
-                        chain.junk_length,
-                    )
-                # ────────────────────────────────────────────────────────
-
-            # ─── TRACEPOINT: Stage 2/3 ──────────────────────────────────
-            for chain in s2_3:
-                s = chain.overall_start()
-                e = s + chain.overall_length()
-                if s <= TARGET_EA < e:
-                    logger.warning(f"[TRACE][Stage2/3] covers 0x{TARGET_EA:X}: {chain}")
-                    for seg in chain.segments:
-                        abs_s = chain.base_address + seg.start
-                        logger.warning(
-                            f"    seg @0x{abs_s:X} len={seg.length} desc={seg.description}"
-                        )
-                    break
-            # ────────────────────────────────────────────────────────────
-
-            # — Stage 4
-            validated = []
-            for chain in s2_3:
-                # Same deal here: real EA base needs the padded_start offset
-                seg = _stage4_is_chain_valid(
+                ranges = _analyze_chain(
                     chain, full_buf_mv, base_ea + padded_start, is_64
                 )
-                if seg:
-                    chain.add_segment(seg)
-                    validated.append(chain)
-                # ─── TRACEPOINT: Stage 4 drop ─────────────────────────
-                elif (
-                    chain.overall_start()
-                    <= TARGET_EA
-                    < chain.overall_start() + chain.overall_length()
-                ):
-                    logger.warning(
-                        "[TRACE][Stage4 DROP] 0x%X dropped: no BIG_INSTR segment",
-                        chain.overall_start(),
-                    )
-                # ────────────────────────────────────────────────────────
+                core_valid.extend(ranges)
 
-            # ─── TRACEPOINT: Stage 4 ───────────────────────────────────
-            for chain in validated:
-                s = chain.overall_start()
-                e = s + chain.overall_length()
-                if s <= TARGET_EA < e:
-                    logger.warning(f"[TRACE][Stage4] covers 0x{TARGET_EA:X}: {chain}")
-                    for seg in chain.segments:
-                        abs_s = chain.base_address + seg.start
-                        logger.warning(
-                            f"    seg @0x{abs_s:X} len={seg.length} type={seg.segment_type}"
-                        )
-                    break
-            # ────────────────────────────────────────────────────────────
-
-            # — Filter out duplicates from the overlap padding: only keep those
-            #    whose start-offset falls in [core_start, core_end)
-            for c in validated:
-                rel_off = c.overall_start() - base_ea
-                if core_start <= rel_off < core_end:
-                    core_valid.append(c)
-
-                # Sanity check
-                start = c.overall_start()
-                length = c.overall_length()
-                end = start + length
-                if length > MAX_PATTERN_LEN or end > base_ea + shm.size:
-                    logger.warning(
-                        "🚨 chain @ 0x%X length=%d end=0x%X (core=[%d, %d])",
-                        start,
-                        length,
-                        end,
-                        core_start + base_ea,
-                        core_end + base_ea,
-                    )
         finally:
             del full_buf_mv
     return core_valid
@@ -1978,13 +1674,9 @@ class AsyncDeobfuscator(AsyncEventEmitter):
 
         # 3) wait, flatten, resolve overlaps globally
         per_chunk = await asyncio.gather(*futures)
-        all_chains = [c for grp in per_chunk for c in grp]
+        all_ranges = [r for grp in per_chunk for r in grp]
+        final: IntervalSet = resolve_overlaps(all_ranges)
 
-        # now de-dupe any remaining overlaps
-        final = resolve_overlaps(all_chains)
-
-        # emit & return
-        final.sort(key=lambda c: c.overall_start())
         await self.emit("run_finished", final)
         return final
 
@@ -2373,11 +2065,11 @@ def worker_main():
         # Format results
         asjson = [
             {
-                "address": c.overall_start(),
-                "length": c.overall_length(),
-                "end": c.overall_start() + c.overall_length(),
+                "address": s,
+                "length": e - s,
+                "end": e,
             }
-            for c in results
+            for s, e in results.as_tuples()
         ]
 
         logger.info(f"Processed {len(asjson)} results.")

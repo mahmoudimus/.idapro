@@ -2104,14 +2104,14 @@ PSTATE_OPS = {
 }
 
 def function_name_or_address(ea):
-    func = get_func_name(ea)
+    func = idc.get_func_name(ea)
     return func if len(func) > 0 else ea
 
 def function_offset_or_address(ea):
-    func_name = get_func_name(ea)
+    func_name = idc.get_func_name(ea)
     if len(func_name) == 0:
         return ea
-    start_ea = get_func_attr(ea, FUNCATTR_START)
+    start_ea = idc.get_func_attr(ea, idc.FUNCATTR_START)
     off = ea - start_ea
     if off < 0:
         return ea
@@ -2142,30 +2142,30 @@ def find_bitfield(bitmap, offset, width):
         return bitmap.get(offset, None) or bitmap.get((offset, width), None)
 
 def is_interrupt_return(ea):
-    mnem = print_insn_mnem(ea)
+    mnem = idc.print_insn_mnem(ea)
     return (len(mnem) > 0 and (mnem in ('ERET', 'RFE') or
-                               (mnem[0:3] == "LDM" and print_operand(ea, 1)[-1:] == "^") or
-                               (mnem[0:4] in ("SUBS", "MOVS") and print_operand(ea, 0) == "PC" and print_operand(ea, 1) == "LR") ))
+                               (mnem[0:3] == "LDM" and idc.print_operand(ea, 1)[-1:] == "^") or
+                               (mnem[0:4] in ("SUBS", "MOVS") and idc.print_operand(ea, 0) == "PC" and idc.print_operand(ea, 1) == "LR") ))
 
 def is_system_insn(ea):
-    mnem = print_insn_mnem(ea)
+    mnem = idc.print_insn_mnem(ea)
     return len(mnem) > 0 and ((mnem in SYSTEM_INSN) or is_interrupt_return(ea))
 
 def is_same_register(reg0, reg1):
     return (reg0 == reg1) or (current_arch == 'aarch64' and reg0[1:] == reg1[1:] and ((reg0[0] == 'W' and reg1[0] == 'X') or (reg0[0] == 'X' and reg1[0] == 'W')))
 
 def backtrack_can_skip_insn(ea, reg):
-    mnem = print_insn_mnem(ea)
+    mnem = idc.print_insn_mnem(ea)
     if mnem in ("NOP", "ISB", "DSB", "DMB", "MSR", "MCR", "MCRR", "MCRR", "MCRR2", "CMP") or mnem[0:3] in ("STR", "STM"):
         return True
 
     if mnem[0:2] == "B.": # Skip conditional branch.
         return True
 
-    if mnem[0:3] == "UBF" and not is_same_register(print_operand(ea, 0), reg):
+    if mnem[0:3] == "UBF" and not is_same_register(idc.print_operand(ea, 0), reg):
         return True
 
-    if mnem in ("LDR", "MRS", "ORR", "AND", "EOR", "BIC", "MOV", "MOVK", "MOVT", "LSR", "LSL", "ADD", "SUB") and not is_same_register(print_operand(ea, 0), reg):
+    if mnem in ("LDR", "MRS", "ORR", "AND", "EOR", "BIC", "MOV", "MOVK", "MOVT", "LSR", "LSL", "ADD", "SUB") and not is_same_register(idc.print_operand(ea, 0), reg):
         return True
 
     return False
@@ -2179,12 +2179,12 @@ def is_general_register(operand):
         return operand[0] == 'R' and operand[1:].isdigit()
 
 def movk_operand_value(ea):
-    imm = get_operand_value(ea, 1)
-    shift = int(print_operand(ea, 1).split(',')[1][4:])
+    imm = idc.get_operand_value(ea, 1)
+    shift = int(idc.print_operand(ea, 1).split(',')[1][4:])
     return imm << shift
 
 def movt_operand_value(ea):
-    imm = get_operand_value(ea, 1)
+    imm = idc.get_operand_value(ea, 1)
     return imm << 16
 
 def register_size(reg):
@@ -2205,18 +2205,18 @@ def backtrack_fields(ea, reg, fields, cmt_type = None):
     }
 
     while True:
-        ea = prev_head(ea)
-        mnem = print_insn_mnem(ea)
+        ea = idc.prev_head(ea)
+        mnem = idc.print_insn_mnem(ea)
         reduced_mnem = mnem[0:3]
 
-        if reduced_mnem in ("LDR", "MOV", "ORR", "BIC", "AND") and is_same_register(print_operand(ea, 0), reg):
+        if reduced_mnem in ("LDR", "MOV", "ORR", "BIC", "AND") and is_same_register(idc.print_operand(ea, 0), reg):
             #
             # LDR Rd, =imm
             #
-            if reduced_mnem == "LDR" and print_operand(ea, 1)[0] == "=":
-                bits = extract_set_fields(fields, get_wide_dword(get_operand_value(ea, 1)))
+            if reduced_mnem == "LDR" and idc.print_operand(ea, 1)[0] == "=":
+                bits = extract_set_fields(fields, idc.get_wide_dword(idc.get_operand_value(ea, 1)))
                 if len(bits) > 0:
-                    set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), 0)
+                    idc.set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), False)
                 break
             #
             # MOVK Rd, #imm,LSL#shift
@@ -2224,37 +2224,37 @@ def backtrack_fields(ea, reg, fields, cmt_type = None):
             elif mnem == "MOVK":
                 bits = extract_set_fields(fields, movk_operand_value(ea))
                 if len(bits) > 0:
-                    set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), 0)
+                    idc.set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), False)
             #
             # MOVT Rd, #imm
             #
             elif mnem == "MOVT":
                 bits = extract_set_fields(fields, movt_operand_value(ea))
                 if len(bits) > 0:
-                    set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), 0)
+                    idc.set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), False)
             #
             # MOV Rd, #imm
             #
-            elif reduced_mnem == "MOV" and print_operand(ea, 1)[0] == "#":
-                bits = extract_set_fields(fields, get_operand_value(ea, 1))
+            elif reduced_mnem == "MOV" and idc.print_operand(ea, 1)[0] == "#":
+                bits = extract_set_fields(fields, idc.get_operand_value(ea, 1))
                 if len(bits) > 0:
-                    set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), 0)
+                    idc.set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), False)
                 break
             #
             # MOV Rd, Rn
             #
-            elif reduced_mnem == "MOV" and is_general_register(print_operand(ea, 1)):
-                backtrack_fields(ea, print_operand(ea, 1), fields, (cmt_type or reduced_mnem))
+            elif reduced_mnem == "MOV" and is_general_register(idc.print_operand(ea, 1)):
+                backtrack_fields(ea, idc.print_operand(ea, 1), fields, (cmt_type or reduced_mnem))
                 break
             #
             # ORR Rd, Rn, #imm
             # BIC Rd, Rn, #imm
             #
-            elif reduced_mnem in ("ORR", "BIC")  and print_operand(ea, 2)[0] == "#":
-                reg1 = print_operand(ea, 1)
-                bits = extract_set_fields(fields, get_operand_value(ea, 2))
+            elif reduced_mnem in ("ORR", "BIC")  and idc.print_operand(ea, 2)[0] == "#":
+                reg1 = idc.print_operand(ea, 1)
+                bits = extract_set_fields(fields, idc.get_operand_value(ea, 2))
                 if len(bits) > 0:
-                    set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), 0)
+                    idc.set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), False)
                 if not is_same_register(reg1, reg):
                     backtrack_fields(ea, reg1, fields, (cmt_type or reduced_mnem))
                     break
@@ -2262,8 +2262,8 @@ def backtrack_fields(ea, reg, fields, cmt_type = None):
             # ORR Rd, Rn, Rm
             # BIC Rd, Rn, Rm
             #
-            elif reduced_mnem in ("ORR", "BIC") and is_general_register(print_operand(ea, 2)):
-                reg1, reg2 = print_operand(ea, 1), print_operand(ea, 2)
+            elif reduced_mnem in ("ORR", "BIC") and is_general_register(idc.print_operand(ea, 2)):
+                reg1, reg2 = idc.print_operand(ea, 1), idc.print_operand(ea, 2)
                 if not is_same_register(reg1, reg):
                     backtrack_fields(ea, reg1, fields, (cmt_type or reduced_mnem))
                 if not is_same_register(reg2, reg):
@@ -2273,12 +2273,12 @@ def backtrack_fields(ea, reg, fields, cmt_type = None):
             #
             # AND Rd, Rn, #imm
             #
-            elif reduced_mnem == "AND" and print_operand(ea, 2)[0] == "#":
-                reg1 = print_operand(ea, 1)
-                mask = get_operand_value(ea, 2)
-                bits = extract_test_fields(fields, ((~mask) & ((1 << (register_size(print_operand(ea, 0)) * 8)) - 1)))
+            elif reduced_mnem == "AND" and idc.print_operand(ea, 2)[0] == "#":
+                reg1 = idc.print_operand(ea, 1)
+                mask = idc.get_operand_value(ea, 2)
+                bits = extract_test_fields(fields, ((~mask) & ((1 << (register_size(idc.print_operand(ea, 0)) * 8)) - 1)))
                 if len(bits) > 0:
-                    set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), 0)
+                    idc.set_cmt(ea, cmt_formatter[cmt_type or reduced_mnem](bits), False)
                 if not is_same_register(reg1, reg):
                     backtrack_fields(ea, reg1, fields, (cmt_type or reduced_mnem))
                     break
@@ -2291,31 +2291,31 @@ def backtrack_fields(ea, reg, fields, cmt_type = None):
 
 def track_fields(ea, reg, fields):
     while True:
-        ea += get_item_size(ea)
-        next_mnem = print_insn_mnem(ea)
-        if next_mnem[0:3] in ("TST", "TEQ", "CMP") and is_same_register(print_operand(ea, 0), reg) and print_operand(ea, 1)[0] == "#":
-            bits = extract_set_fields(fields, get_operand_value(ea, 1))
+        ea += idc.get_item_size(ea)
+        next_mnem = idc.print_insn_mnem(ea)
+        if next_mnem[0:3] in ("TST", "TEQ", "CMP") and is_same_register(idc.print_operand(ea, 0), reg) and idc.print_operand(ea, 1)[0] == "#":
+            bits = extract_set_fields(fields, idc.get_operand_value(ea, 1))
             if len(bits) > 0:
-                set_cmt(ea, "Test field %s" % ", ".join(name for (name, desc) in bits), 0)
-        elif next_mnem[0:3] == "AND" and is_same_register(print_operand(ea, 1), reg) and print_operand(ea, 2)[0] == "#":
-            bits = extract_test_fields(fields, get_operand_value(ea, 2))
+                idc.set_cmt(ea, "Test field %s" % ", ".join(name for (name, desc) in bits), False)
+        elif next_mnem[0:3] == "AND" and is_same_register(idc.print_operand(ea, 1), reg) and idc.print_operand(ea, 2)[0] == "#":
+            bits = extract_test_fields(fields, idc.get_operand_value(ea, 2))
             if len(bits) > 0:
-                set_cmt(ea, "Field %s" % ", ".join(desc for (name, desc) in bits), 0)
-            if is_same_register(print_operand(ea, 0), reg):
+                idc.set_cmt(ea, "Field %s" % ", ".join(desc for (name, desc) in bits), False)
+            if is_same_register(idc.print_operand(ea, 0), reg):
                 break
-        elif next_mnem[0:3] == "LSL" and GetDisasm(ea)[3] == "S" and is_same_register(print_operand(ea, 1), reg) and print_operand(ea, 2)[0] == "#":
-            bits = extract_test_fields(fields, 1 << (31 - get_operand_value(ea, 2)))
+        elif next_mnem[0:3] == "LSL" and idc.GetDisasm(ea)[3] == "S" and is_same_register(idc.print_operand(ea, 1), reg) and idc.print_operand(ea, 2)[0] == "#":
+            bits = extract_test_fields(fields, 1 << (31 - idc.get_operand_value(ea, 2)))
             if len(bits) > 0:
-                set_cmt(ea, "Test bit %s" % ", ".join(desc for (name, desc) in bits), 0)
-            if is_same_register(print_operand(ea, 0), reg):
+                idc.set_cmt(ea, "Test bit %s" % ", ".join(desc for (name, desc) in bits), False)
+            if is_same_register(idc.print_operand(ea, 0), reg):
                 break
-        elif next_mnem == "UBFX" and is_same_register(print_operand(ea, 1), reg):
-            lsb = get_operand_value(ea, 2)
-            width = get_operand_value(ea, 3)
+        elif next_mnem == "UBFX" and is_same_register(idc.print_operand(ea, 1), reg):
+            lsb = idc.get_operand_value(ea, 2)
+            width = idc.get_operand_value(ea, 3)
             field = find_bitfield(fields, lsb, width)
             if field:
-                set_cmt(ea, "Extract %s" % field[1], 0)
-            if is_same_register(print_operand(ea, 0), reg):
+                idc.set_cmt(ea, "Extract %s" % field[1], False)
+            if is_same_register(idc.print_operand(ea, 0), reg):
                 break
         elif backtrack_can_skip_insn(ea, reg):
             continue
@@ -2332,7 +2332,7 @@ def identify_register(ea, access, sig, known_regs, cpu_reg = None, known_fields 
     desc = known_regs.get(sig, None)
     if desc:
         cmt = ("[%s] " + "\n or ".join(["%s (%s)"] * (len(desc) // 2))) % ((access,) + desc)
-        set_cmt(ea, cmt, 0)
+        idc.set_cmt(ea, cmt, False)
         print("%x: %s" % (ea, cmt))
 
         save_summary_info(ea, desc[0])
@@ -2346,7 +2346,7 @@ def identify_register(ea, access, sig, known_regs, cpu_reg = None, known_fields 
                 track_fields(ea, cpu_reg, fields)
     else:
         print("%x: Cannot identify system register." % ea)
-        set_cmt(ea, "[%s] Unknown system register." % access, 0)
+        idc.set_cmt(ea, "[%s] Unknown system register." % access, False)
 
 def aarch32_get_coproc_num(ea):
     ins = idc.get_wide_dword(ea)
@@ -2397,7 +2397,7 @@ def markup_aarch64_sys_insn(ea):
         name = "S3_{}_{}_{}_{}".format(op1, crn, crm, op2).upper()
         desc = "IMPLEMENTATION DEFINED"
         cmt = "[%s] %s (%s)" % (access, name, desc)
-        idc.set_cmt(ea, cmt, 0)
+        idc.set_cmt(ea, cmt, False)
         print("%x: %s" % (ea, cmt))
         return
 
@@ -2427,20 +2427,20 @@ def markup_psr_insn(ea):
         i = (psr & (1 << 7)) and 'I' or '-'
         f = (psr & (1 << 6)) and 'F' or '-'
         t = (psr & (1 << 5)) and 'T' or '-'
-        idc.set_cmt(ea, "Set CPSR [%c%c%c%c%c], Mode: %s" % (e,a,i,f,t,mode), 0)
+        idc.set_cmt(ea, "Set CPSR [%c%c%c%c%c], Mode: %s" % (e,a,i,f,t,mode), False)
 
 def markup_pstate_insn(ea):
     if idc.print_operand(ea,0)[0] == "#" and idc.print_operand(ea,1)[0] == "#":
         op = PSTATE_OPS.get(idc.get_operand_value(ea, 0), "Unknown")
         value = idc.get_operand_value(ea, 1)
         if op == "SPSel":
-            idc.set_cmt(ea, "Select PSTATE.SP = SP_EL%c" % ('0', 'x')[value & 1], 0)
+            idc.set_cmt(ea, "Select PSTATE.SP = SP_EL%c" % ('0', 'x')[value & 1], False)
         elif op[0:4] == "DAIF":
             d = (value & (1 << 3)) and 'D' or '-'
             a = (value & (1 << 2)) and 'A' or '-'
             i = (value & (1 << 1)) and 'I' or '-'
             f = (value & (1 << 0)) and 'F' or '-'
-            idc.set_cmt(ea, "%s PSTATE.DAIF [%c%c%c%c]" % (op[4:7], d,a,i,f), 0)
+            idc.set_cmt(ea, "%s PSTATE.DAIF [%c%c%c%c]" % (op[4:7], d,a,i,f), False)
 
 def markup_system_insn(ea):
     mnem = idc.print_insn_mnem(ea)

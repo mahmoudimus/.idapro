@@ -42,19 +42,18 @@ initialized = False
 _STOP_SERVER = threading.Event()
 
 
-def get_python_interpreter():
+def get_python_interpreter() -> str:
     """
     Gets the path to a suitable Python interpreter.
     Ensures we find a standalone Python executable.
 
-    >>> import pathlib, sys, stat
-    >>> interp: pathlib.Path = MultiprocessingHelper.get_python_interpreter()
+    >>> interp: str = MultiprocessingHelper.get_python_interpreter()
     ...
     >>>
     """
     base_executable = getattr(sys, "_base_executable", None)
     if base_executable and "python" in pathlib.Path(base_executable).name.lower():
-        return pathlib.Path(base_executable)
+        return str(pathlib.Path(base_executable))
 
     base_paths = [
         sys.prefix,
@@ -85,12 +84,12 @@ def get_python_interpreter():
                 continue
 
             print(f"[IDACode] Found Python interpreter at: {interp_path}")
-            return interp_path
+            return str(interp_path)
 
     print(
         "[IDACode] Could not determine Python interpreter path, falling back to 'python' in PATH."
     )
-    return pathlib.Path("python")
+    return str(pathlib.Path("python"))
 
 
 class Settings:

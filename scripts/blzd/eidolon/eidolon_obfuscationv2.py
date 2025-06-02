@@ -774,19 +774,6 @@ class PatternMatch:
         )
 
 
-@dataclass
-class PatternDetector:
-    """Base class for instruction pattern detection using Capstone."""
-
-    cs: Optional[capstone.Cs] = field(default=None, init=False)
-
-    def __post_init__(self):
-        """Initialize capstone with detailed instruction information."""
-        if USE_CAPSTONE:
-            self.cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-            self.cs.detail = True
-
-
 def simple_pattern_generator():
 
     # Signature patterns for fast initial search
