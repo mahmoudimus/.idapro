@@ -11,7 +11,7 @@ import idaapi
 import idautils
 import idc
 
-
+idaapi.calc_switch_cases
 class CFGRecovery:
     # --- BEGIN NEW AssignmentVisitor CLASS ---
     class AssignmentVisitor(ida_hexrays.ctree_visitor_t):
@@ -131,15 +131,29 @@ class CFGRecovery:
                             hex(target_case),
                         )
                     else:
-                        # print(
-                        #     f"    [-] FAILURE: No context for dispatcher assignment to {hex(target_case)} at {hex(expr.ea)}. Dispatcher var idx: {self.cfg_recovery.dispatcher_var}"
-                        # )
                         self.logger.warning(
                             "    [-] FAILURE: No context for dispatcher assignment to %s at %s. Dispatcher var idx: %s",
                             hex(target_case),
                             hex(expr.ea),
                             self.cfg_recovery.dispatcher_var,
                         )
+                        # NEW: Record this as a potential CFF entry setup point
+                        # If multiple assignments to the same target_case exist without context,
+                        # this will store the last one encountered by the visitor.
+                        # For initial CFF setup, usually only one such assignment to the initial state exists.
+                        if target_case not in self.cfg_recovery.cff_entry_setup_points:
+                            self.cfg_recovery.cff_entry_setup_points[target_case] = (
+                                expr.ea
+                            )
+                            self.logger.info(
+                                "        Recording potential CFF entry setup: state %s assigned at 0x%X",
+                                hex(target_case),
+                                expr.ea,
+                            )
+                        else:
+                            # If we already have an entry for this target_case, we might be in a loop
+                            # or complex pre-dispatcher logic. For now, we keep the first one found.
+                            pass  # Keep the first one
 
                 elif lhs_is_dispatcher and not rhs_is_num:
                     # print(
@@ -164,6 +178,10 @@ class CFGRecovery:
         self.dispatcher_var = None
         self.graph = nx.DiGraph()
         self.logger = logging.getLogger(self.__class__.__name__)
+        # NEW: Store EAs of assignments to dispatcher var that have no context,
+        # potentially indicating pre-dispatcher setup.
+        # Maps target_case_value -> ea_of_assignment
+        self.cff_entry_setup_points: typing.Dict[int, int] = {}
 
     def find_dispatcher_variable(self, cfunc):
         """
