@@ -824,8 +824,14 @@ def main():
 
     # 'list-hashes' subcommand: List all hashes in the static database
     subparsers.add_parser("list-hashes", help="List all hashes in the static database")
-    subparsers.add_parser(
+    dev_mode_parser = subparsers.add_parser(
         "dev-mode", help="Run lookups hashes in def target_hashes() function"
+    )
+    dev_mode_parser.add_argument(
+        "--hash",
+        choices=["fnv32", "fnv64"],
+        help="Target hashes to lookup",
+        default="fnv32",
     )
 
     # 'dump' subcommand: Dump exports from a process
@@ -861,32 +867,51 @@ def main():
                 sys.exit(1)
         dump_exports(pid)
     elif args.command == "dev-mode":
-        for target_hash in [
-            0x0F42198D,  # kernel32.dll
-            0xEFACCA19,  # ntdll.dll
-            0x5D756A21,  # NtQueryInformationThread
-            0xE049C205,  # NtClose
-            0xC1BE16A6,  # NtProtectVirtualMemory
-            0x97085561,  # NtSetInformationThread
-            0x57F739B7,  # NtDuplicateObject
-        ]:
-            result = find_name_by_hash(target_hash=target_hash)
-            if not result:
-                print(
-                    f"Module with hash {target_hash:#010x} not found in the simulated list."
+        if args.hash == "fnv32":
+            for target_hash in [
+                0x0F42198D,  # kernel32.dll
+                0xEFACCA19,  # ntdll.dll
+                0x5D756A21,  # NtQueryInformationThread
+                0xE049C205,  # NtClose
+                0xC1BE16A6,  # NtProtectVirtualMemory
+                0x97085561,  # NtSetInformationThread
+                0x57F739B7,  # NtDuplicateObject
+            ]:
+                result = find_name_by_hash(
+                    target_hash=target_hash, hash_function=fnv1a_32
                 )
-            else:
-                print(result)
-
-        # Verify hash calculation for ntdll.dll using the assembly's method
-        ntdll_bytes = apidb["ntdll"]["name"]
-        ntdll_hash_variant = fnv1a_32(ntdll_bytes)
-        print(
-            f"\nVerification: Hash for 'ntdll.dll' using assembly variant: {ntdll_hash_variant:#010x}"
-        )
-        print(
-            f"Target hash from assembly constant calculation:             {0x0F42198D:#010x}"
-        )
+                if not result:
+                    print(
+                        f"Module with hash {target_hash:#010x} not found in the simulated list."
+                    )
+                else:
+                    print(result)
+        elif args.hash == "fnv64":
+            for target_hash in [
+                0xE14B18A7ACF9C443,
+                0xA8F42DD374017C56,
+                0xACD80F50F7102617,
+                0xBB7BB9A74C2F14FB,
+            ]:  # kernel32.dll
+                result = find_name_by_hash(
+                    target_hash=target_hash, hash_function=fnv1a_64
+                )
+                if not result:
+                    print(
+                        f"Module with hash {target_hash:#010x} not found in the simulated list."
+                    )
+                else:
+                    print(result)
+        else:
+            # Verify hash calculation for ntdll.dll using the assembly's method
+            ntdll_bytes = apidb["ntdll"]["name"]
+            ntdll_hash_variant = fnv1a_32(ntdll_bytes)
+            print(
+                f"\nVerification: Hash for 'ntdll.dll' using assembly variant: {ntdll_hash_variant:#010x}"
+            )
+            print(
+                f"Target hash from assembly constant calculation:             {0x0F42198D:#010x}"
+            )
         # print_hash_table(apidb, debug=True)
 
 
