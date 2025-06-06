@@ -9,12 +9,15 @@ pip install --target=<IDA>/python python-triton==1.1 networkx graphviz
 
 from __future__ import annotations
 
+import dataclasses
+import enum
 import functools
 import logging
 import re
 import struct
 import tempfile
 import time
+import traceback
 from collections import namedtuple
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -35,7 +38,7 @@ import idc
 # ──────────────────────────────────────────────────────────────────────
 # USER SETTINGS ─ change these if needed
 # ──────────────────────────────────────────────────────────────────────
-FUNC_EA = idc.get_name_ea_simple("VirtualizedApiResolver")  # start EA
+FUNC_EA = idaapi.get_func(idaapi.get_screen_ea()).start_ea  # start EA
 SEED_VALUE = 0  # argv[2]
 ENABLE_PATCHING = True  # True → rewrite code
 MAX_STEPS = 250000  # safety
@@ -50,7 +53,7 @@ COL_EDGE_FALSE = 0x70A0FF
 # 1. Gather basic info
 # ──────────────────────────────────────────────────────────────────────
 if FUNC_EA == idc.BADADDR:
-    raise RuntimeError("label 'VirtualizedApiResolver' not found")
+    raise RuntimeError(f"label {FUNC_EA:X} not found")
 
 func_end = idc.get_func_attr(FUNC_EA, idc.FUNCATTR_END)
 print(f"[+] analysing 0x{FUNC_EA:X}..0x{func_end:X}")
@@ -1026,56 +1029,182 @@ def is_state_store(ea: int, imm: int | None = None) -> bool:
     return imm is None or insn.ops[1].value == imm
 
 
-if ENABLE_PATCHING:
-    # Patch dispatcher head to jump to case 0
-    head_start = switch_info.startea
-    head_end = DISPATCH_EA + idc.get_item_size(DISPATCH_EA)
-    head_len = head_end - head_start
-    entry_ea = block_ea[0]
-    disp = entry_ea - (head_start + 5)
-    if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
-        head_patch = b"\xe9" + struct.pack("<i", disp)
-    else:
-        head_patch = b"\x48\xb8" + struct.pack("<Q", entry_ea) + b"\xff\xe0"
-    ida_bytes.patch_bytes(head_start, head_patch.ljust(head_len, b"\x90"))
-    print(f"[+] Dispatcher patched to jump to case 0 at 0x{entry_ea:X}")
+class PatchManager:
+    """Manages deferred patch operations."""
 
-    # Patch each block's state-setting instructions
-    for state in sorted(block_ea.keys()):
-        ea = block_ea[state]
-        # Determine block end (next block or function end)
-        next_state = min([s for s in block_ea if s > state], default=None)
-        next_ea = block_ea[next_state] if next_state is not None else func_end
+    class Mode(enum.Enum):
+        PATCH = enum.auto()  # Use ida_bytes.patch_bytes
+        PUT = enum.auto()  # Use ida_bytes.put_bytes
 
-        # Patch all mov [state], imm instructions
-        for head in idautils.Heads(ea, next_ea):
-            if is_state_store(head):
-                imm = idc.get_operand_value(head, 1)
-                if imm in block_ea:
-                    target_ea = block_ea[imm]
-                    disp = target_ea - (head + 5)
-                    if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
-                        patch = b"\xe9" + struct.pack("<i", disp)
-                    else:
-                        patch = b"\x48\xb8" + struct.pack("<Q", target_ea) + b"\xff\xe0"
-                    mov_size = idc.get_item_size(head)  # Typically 7 bytes
-                    ida_bytes.patch_bytes(head, patch.ljust(mov_size, b"\x90"))
-                    print(
-                        f"[+] 0x{head:X}: Patched mov [state], {imm} to jmp 0x{target_ea:X}"
-                    )
+    def __init__(
+        self,
+        patch_mode: Mode = Mode.PATCH,
+        dry_run: bool = False,
+        auto_clear: bool = True,
+    ):
+        self.dry_run = dry_run
+        self.patch_mode = patch_mode
+        self.pending_patches: list[DeferredPatchOp] = []
+        self.auto_clear = auto_clear
+        logging.info(
+            "PatchManager initialized (dry_run=%s, mode=%s)",
+            self.dry_run,
+            self.patch_mode.name,
+        )
 
-        # Patch tail jump to NOPs (assumes last instruction is jmp)
-        tail_ea = idc.prev_head(next_ea, ea)
-        if idc.print_insn_mnem(tail_ea) == "jmp":
-            jmp_size = idc.get_item_size(tail_ea)
-            ida_bytes.patch_bytes(tail_ea, b"\x90" * jmp_size)
-            print(f"[+] 0x{tail_ea:X}: Tail jump patched to NOPs")
+    def add_patch(self, address: int, byte_values: bytes):
+        """Creates and queues a DeferredPatchOp."""
+        op = DeferredPatchOp(address, byte_values, self.patch_mode)
+        self.pending_patches.append(op)
+        logging.debug("Queued patch operation: %s", op)
 
-    # Clean up and re-analyze
-    ida_xref.delete_switch_table(DISPATCH_EA, switch_info)
-    ida_nalt.del_switch_info(DISPATCH_EA)
-    ida_auto.auto_mark_range(FUNC_EA, func_end, ida_auto.AU_USED)
-    ida_auto.auto_wait()
-    print("[+] Patching complete – press <Space> in IDA to re-decompile")
+    def apply_all(self, dry_run_override: bool | None = None) -> bool:
+        """Applies all queued patch operations."""
+        logging.info("Applying %d queued patches...", len(self))
+        success_count = 0
+        fail_count = 0
+
+        if dry_run_override is None:
+            # None is a sentinel value here that represents "use the default"
+            dry_run_override = self.dry_run
+
+        for op in self.pending_patches:
+            if op.apply(dry_run_override):
+                success_count += 1
+            else:
+                fail_count += 1
+
+        logging.info(
+            "Patch application complete. Success: %d, Failed: %d",
+            success_count,
+            fail_count,
+        )
+        if self.auto_clear:
+            self.pending_patches.clear()  # Clear the list after applying
+        return fail_count == 0  # Return True if all patches were applied successfully
+
+    def __len__(self) -> int:
+        return len(self.pending_patches)
+
+
+@dataclasses.dataclass(repr=False)
+class DeferredPatchOp:
+    """Class to store patch operations that will be applied later."""
+
+    address: int
+    byte_values: bytes
+    mode: PatchManager.Mode
+    dry_run: bool = False
+
+    @classmethod
+    def patch(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PATCH, dry_run)
+
+    @classmethod
+    def put(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PUT, dry_run)
+
+    def apply(self, dry_run_override: bool = False) -> bool:
+        """Apply the patch operation using either patch_bytes or put_bytes based on mode."""
+        is_dry_run = dry_run_override or self.dry_run
+        logging.debug(
+            "[*] %sPatching decrypted chunk %s at 0x%X (size: %d)",
+            "(Dry Run) " if is_dry_run else "",
+            ("revertably" if self.mode == PatchManager.Mode.PATCH else "destructively"),
+            self.address,
+            len(self.byte_values),
+        )
+        success = True
+        if is_dry_run:
+            return success
+
+        try:
+            func = (
+                idaapi.put_bytes
+                if self.mode == PatchManager.Mode.PUT
+                else idaapi.patch_bytes
+            )
+            func(self.address, self.byte_values)
+        except Exception as e:
+            logging.error(f"Failed to apply patch {self}: {e}", exc_info=True)
+            success = False
+        return success
+
+    def __str__(self):
+        """String representation with hex formatting."""
+        dry_run_str = " (dry run)" if self.dry_run else ""
+        return f"{self.__class__.__name__}({len(self.byte_values)} bytes, mode={self.mode.name}{dry_run_str} @ address=0x{self.address:X})"
+
+    __repr__ = __str__
+
+
+pm = PatchManager(dry_run=not ENABLE_PATCHING)
+
+# Patch dispatcher head to jump to case 0
+head_start = switch_info.startea
+head_end = DISPATCH_EA + idc.get_item_size(DISPATCH_EA)
+head_len = head_end - head_start
+entry_ea = block_ea[0]
+disp = entry_ea - (head_start + 5)
+if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
+    head_patch = b"\xe9" + struct.pack("<i", disp)
+else:
+    head_patch = b"\x48\xb8" + struct.pack("<Q", entry_ea) + b"\xff\xe0"
+pm.add_patch(head_start, head_patch.ljust(head_len, b"\x90"))
+print(f"[+] Dispatcher patched to jump to case 0 at 0x{entry_ea:X}")
+
+# Patch each block's state-setting instructions
+for state in sorted(block_ea.keys()):
+    ea = block_ea[state]
+    # Determine block end (next block or function end)
+    next_state = min([s for s in block_ea if s > state], default=None)
+    next_ea = block_ea[next_state] if next_state is not None else func_end
+
+    # Patch all mov [state], imm instructions
+    for head in idautils.Heads(ea, next_ea):
+        try:
+            is_state_var = is_state_store(head)
+        except Exception as e:
+            print(f"[!] Error checking state store at 0x{head:X}: {e}")
+            print(f"[!] {idc.generate_disasm_line(head, 0)}")
+            tb_str = "".join(
+                traceback.format_exception(e.__class__, e, e.__traceback__)
+            )
+            print(tb_str)
+            exit(1)
+        else:
+            if not is_state_var:
+                continue
+
+        imm = idc.get_operand_value(head, 1)
+        if imm not in block_ea:
+            continue
+
+        target_ea = block_ea[imm]
+        disp = target_ea - (head + 5)
+        if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
+            patch = b"\xe9" + struct.pack("<i", disp)
+        else:
+            patch = b"\x48\xb8" + struct.pack("<Q", target_ea) + b"\xff\xe0"
+        mov_size = idc.get_item_size(head)  # Typically 7 bytes
+        pm.add_patch(head, patch.ljust(mov_size, b"\x90"))
+        print(f"[+] 0x{head:X}: Patched mov [state], {imm} to jmp 0x{target_ea:X}")
+
+    # Patch tail jump to NOPs (assumes last instruction is jmp)
+    tail_ea = idc.prev_head(next_ea, ea)
+    if not idc.print_insn_mnem(tail_ea) == "jmp":
+        continue
+    jmp_size = idc.get_item_size(tail_ea)
+    pm.add_patch(tail_ea, b"\x90" * jmp_size)
+    print(f"[+] 0x{tail_ea:X}: Tail jump patched to NOPs")
+
+pm.apply_all()
+
+# Clean up and re-analyze
+ida_xref.delete_switch_table(DISPATCH_EA, switch_info)
+ida_nalt.del_switch_info(DISPATCH_EA)
+ida_auto.auto_mark_range(FUNC_EA, func_end, ida_auto.AU_USED)
+ida_auto.auto_wait()
+print("[+] Patching complete – press <Space> in IDA to re-decompile")
 
 print("[✓] done")
