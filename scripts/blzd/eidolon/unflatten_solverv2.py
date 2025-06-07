@@ -21,7 +21,6 @@ import traceback
 from collections import namedtuple
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
-import typing
 
 import triton
 from triton import ARCH, CALLBACK, MODE, Instruction, TritonContext
@@ -29,6 +28,7 @@ from triton import ARCH, CALLBACK, MODE, Instruction, TritonContext
 import ida_allins
 import ida_auto
 import ida_bytes
+import ida_hexrays
 import ida_kernwin
 import ida_nalt
 import ida_xref
@@ -36,19 +36,22 @@ import idaapi
 import idautils
 import idc
 
+logging.basicConfig(level=logging.DEBUG)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # USER SETTINGS ─ change these if needed
 # ──────────────────────────────────────────────────────────────────────
-FUNC_EA = idaapi.get_func(idaapi.get_screen_ea()).start_ea  # start EA
-SEED_VALUE = 0  # argv[2]
+FUNC = idaapi.get_func(idaapi.get_screen_ea())
+FUNC_EA = FUNC.start_ea  # start EA
+FUNC_END = FUNC.end_ea
 ENABLE_PATCHING = True  # True → rewrite code
 MAX_STEPS = 250000  # safety
+GRAPH_DOT = False
 
-# Convenience colours
-COL_DISPATCHER = 0x0080FF
-COL_CASE = 0x00FF80
-COL_EDGE_TRUE = 0xF07070
-COL_EDGE_FALSE = 0x70A0FF
+# ── map an artificial 64‑KiB stack so Triton accepts all [rsp+disp] accesses
+STACK_TOP = 0x7FFF0000
+STACK_SIZE = 0x10000
 
 # ──────────────────────────────────────────────────────────────────────
 # 1. Gather basic info
@@ -56,21 +59,185 @@ COL_EDGE_FALSE = 0x70A0FF
 if FUNC_EA == idc.BADADDR:
     raise RuntimeError(f"label {FUNC_EA:X} not found")
 
-func_end = idc.get_func_attr(FUNC_EA, idc.FUNCATTR_END)
-print(f"[+] analysing 0x{FUNC_EA:X}..0x{func_end:X}")
 
-# Locate the first switch (dispatcher).  Hex-Rays normally creates a
-# switch_xrefs structure we can query; fall back to pattern search.
-switch_info = None
-for ea in idautils.FuncItems(FUNC_EA):
-    if (si := idaapi.get_switch_info(ea)) is not None:
-        switch_info = si
-        DISPATCH_EA = ea
-        break
-if not switch_info:
-    raise RuntimeError("can't find the switch dispatcher")
+class PatchManager:
+    """Manages deferred patch operations."""
 
-print(f"[+] dispatcher at 0x{DISPATCH_EA:X}, {switch_info.ncases} cases")
+    class Mode(enum.Enum):
+        PATCH = enum.auto()  # Use ida_bytes.patch_bytes
+        PUT = enum.auto()  # Use ida_bytes.put_bytes
+
+    def __init__(
+        self,
+        patch_mode: Mode = Mode.PATCH,
+        dry_run: bool = False,
+        auto_clear: bool = True,
+    ):
+        self.dry_run = dry_run
+        self.patch_mode = patch_mode
+        self.pending_patches: list[DeferredPatchOp] = []
+        self.auto_clear = auto_clear
+        logging.info(
+            "PatchManager initialized (dry_run=%s, mode=%s)",
+            self.dry_run,
+            self.patch_mode.name,
+        )
+
+    def add_patch(self, address: int, byte_values: bytes):
+        """Creates and queues a DeferredPatchOp."""
+        op = DeferredPatchOp(address, byte_values, self.patch_mode)
+        self.pending_patches.append(op)
+        logging.debug("Queued patch operation: %s", op)
+
+    def apply_all(self, dry_run_override: bool | None = None) -> bool:
+        """Applies all queued patch operations."""
+        logging.info("Applying %d queued patches...", len(self))
+        success_count = 0
+        fail_count = 0
+
+        if dry_run_override is None:
+            # None is a sentinel value here that represents "use the default"
+            dry_run_override = self.dry_run
+
+        for op in self.pending_patches:
+            if op.apply(dry_run_override):
+                success_count += 1
+            else:
+                fail_count += 1
+
+        logging.info(
+            "Patch application complete. Success: %d, Failed: %d",
+            success_count,
+            fail_count,
+        )
+        if self.auto_clear:
+            self.pending_patches.clear()  # Clear the list after applying
+        return fail_count == 0  # Return True if all patches were applied successfully
+
+    def __len__(self) -> int:
+        return len(self.pending_patches)
+
+
+@dataclasses.dataclass(repr=False)
+class DeferredPatchOp:
+    """Class to store patch operations that will be applied later."""
+
+    address: int
+    byte_values: bytes
+    mode: PatchManager.Mode
+    dry_run: bool = False
+
+    @classmethod
+    def patch(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PATCH, dry_run)
+
+    @classmethod
+    def put(cls, address: int, byte_values: bytes, dry_run: bool = False):
+        return cls(address, byte_values, PatchManager.Mode.PUT, dry_run)
+
+    def apply(self, dry_run_override: bool = False) -> bool:
+        """Apply the patch operation using either patch_bytes or put_bytes based on mode."""
+        is_dry_run = dry_run_override or self.dry_run
+        logging.debug(
+            "[*] %sPatching decrypted chunk %s at 0x%X (size: %d)",
+            "(Dry Run) " if is_dry_run else "",
+            ("revertably" if self.mode == PatchManager.Mode.PATCH else "destructively"),
+            self.address,
+            len(self.byte_values),
+        )
+        success = True
+        if is_dry_run:
+            return success
+
+        try:
+            func = (
+                idaapi.put_bytes
+                if self.mode == PatchManager.Mode.PUT
+                else idaapi.patch_bytes
+            )
+            func(self.address, self.byte_values)
+        except Exception as e:
+            logging.error(f"Failed to apply patch {self}: {e}", exc_info=True)
+            success = False
+        return success
+
+    def __str__(self):
+        """String representation with hex formatting."""
+        dry_run_str = " (dry run)" if self.dry_run else ""
+        return f"{self.__class__.__name__}({len(self.byte_values)} bytes, mode={self.mode.name}{dry_run_str} @ address=0x{self.address:X})"
+
+    __repr__ = __str__
+
+
+class UserCanceledError(Exception):
+    pass
+
+
+@dataclass
+class CheckContinuePrompt:
+    """Decorator that checks if user wants to continue after elapsed time.
+
+    Args:
+        metadata: Dictionary containing metadata to format into the prompt message
+        cancel_func: Function to call if user cancels
+        enable_prompt: Whether to enable the continue prompt
+        start_time: Optional start time, will be initialized if None
+        prompt_interval: Initial time before first prompt in seconds
+        logger: Optional logger instance
+    """
+
+    metadata: dict | None = None
+    cancel_func: Callable[[], None] | None = None
+    enable_prompt: bool = True
+    start_time: float = 0.0
+    prompt_interval: int = 120
+    logger: logging.Logger | None = None
+
+    def __post_init__(self):
+        current_time = time.time()
+        self.start_time = current_time if self.start_time == 0.0 else self.start_time
+        self.next_prompt_time = self.start_time + self.prompt_interval
+
+    @property
+    def elapsed_time(self) -> float:
+        return time.time() - self.start_time
+
+    def __call__(self, func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not self.enable_prompt:
+                return func(*args, **kwargs)
+
+            if self.elapsed_time < self.next_prompt_time:
+                return func(*args, **kwargs)
+
+            minutes = int(self.elapsed_time / 60)
+            seconds = int(self.elapsed_time % 60)
+            time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+            # Format metadata into message
+            message = f"{func.__name__} has been running for {time_str}.\n\n"
+            if self.metadata:
+                for key, value in self.metadata.items():
+                    message += f"{key}: {value}\n"
+            message += "\nContinue?"
+
+            reply = ida_kernwin.ask_yn(0, message)
+            if reply == 0:
+                if self.cancel_func:
+                    return self.cancel_func()
+                raise UserCanceledError("User canceled")
+
+            self.next_prompt_time *= 2
+            if self.logger is not None:
+                self.logger.info(
+                    "Next prompt will be at %d seconds (%.1f minutes)",
+                    self.next_prompt_time,
+                    self.next_prompt_time / 60.0,
+                )
+            return func(*args, **kwargs)
+
+        return wrapper
 
 
 class IDAToTritonRegisterMapper:
@@ -384,6 +551,263 @@ class IDAToTritonRegisterMapper:
         return False
 
 
+class TraversalEnum(enum.IntEnum):
+    CONTINUE = 0
+    STOP = 1
+    SKIP = 2
+
+
+class CTreeSwitchFinder(ida_hexrays.ctree_visitor_t):
+    """A ctree visitor to find all switch statements in a function."""
+
+    def __init__(self):
+        super().__init__(ida_hexrays.CV_FAST)
+        self.switches: list[ida_hexrays.cinsn_t] = []
+
+    def visit_insn(self, insn: ida_hexrays.cinsn_t) -> TraversalEnum:
+        if insn.op == ida_hexrays.cit_switch:
+            self.switches.append(insn.cswitch)
+        return TraversalEnum.CONTINUE
+
+
+class CTreeContainsVisitor(ida_hexrays.ctree_visitor_t):
+    """A ctree visitor to check if a ctree fragment contains a specific item."""
+
+    def __init__(self, state_var_idx: int):
+        super().__init__(ida_hexrays.CV_FAST)
+        self.state_var_idx = state_var_idx
+        self.found = False
+        self.level = 0
+        self.nodes = [
+            "cot_comma",
+            "cot_asg",
+            "cot_asgbor",
+            "cot_asgxor",
+            "cot_asgband",
+            "cot_asgadd",
+            "cot_asgsub",
+            "cot_asgmul",
+            "cot_asgsshr",
+            "cot_asgushr",
+            "cot_asgshl",
+            "cot_asgsdiv",
+            "cot_asgudiv",
+            "cot_asgsmod",
+            "cot_asgumod",
+            "cot_tern",
+            "cot_lor",
+            "cot_land",
+            "cot_bor",
+            "cot_xor",
+            "cot_band",
+            "cot_eq",
+            "cot_ne",
+            "cot_sge",
+            "cot_uge",
+            "cot_sle",
+            "cot_ule",
+            "cot_sgt",
+            "cot_ugt",
+            "cot_slt",
+            "cot_ult",
+            "cot_sshr",
+            "cot_ushr",
+            "cot_shl",
+            "cot_add",
+            "cot_sub",
+            "cot_mul",
+            "cot_sdiv",
+            "cot_udiv",
+            "cot_smod",
+            "cot_umod",
+            "cot_fadd",
+            "cot_fsub",
+            "cot_fmul",
+            "cot_fdiv",
+            "cot_fneg",
+            "cot_neg",
+            "cot_cast",
+            "cot_lnot",
+            "cot_bnot",
+            "cot_ptr",
+            "cot_ref",
+            "cot_postinc",
+            "cot_postdec",
+            "cot_preinc",
+            "cot_predec",
+            "cot_call",
+            "cot_idx",
+            "cot_memref",
+            "cot_memptr",
+            "cot_num",
+            "cot_fnum",
+            "cot_str",
+            "cot_obj",
+            "cot_var",
+            "cot_insn",
+            "cot_sizeof",
+            "cot_helper",
+            "cot_type",
+        ]
+
+    def visit_insn(self, insn: ida_hexrays.cinsn_t) -> TraversalEnum:
+        print(
+            "looking for",
+            self.state_var_idx,
+            " and im currently at",
+            idc.generate_disasm_line(insn.ea, 0),
+        )
+        print(
+            insn.op,
+            " looking for",
+            ida_hexrays.cot_asg,
+            " -- ",
+            idc.get_operand_value(insn.ea, 0),
+            " ++ ",
+            idc.get_operand_value(insn.ea, 1),
+        )
+        if self.found:
+            return 1  # Stop traversal
+        # We are looking for an assignment instruction, e.g., `v1 = 0;`
+        if idc.get_operand_value(insn.ea, 1) == ida_hexrays.cot_asg:
+            print(
+                "HERE!!!",
+                idc.print_operand(insn.ea, 0),
+                idc.generate_disasm_line(insn.ea, 0),
+            )
+            dest_expr = insn.cexpr.x
+            # Check if the destination of the assignment is a variable
+            if dest_expr.op == ida_hexrays.cot_var:
+                # Check if the variable's index matches our state variable
+                if dest_expr.v.idx == self.state_var_idx:
+                    self.found = True
+                    return TraversalEnum.STOP  # Stop traversal
+        return TraversalEnum.CONTINUE
+
+    def visit_expr(self, e):
+        for node in self.nodes:
+            if e.op == idaapi.__dict__[node]:
+                print((" " * self.level) + "{} at {}".format(node, hex(e.ea)))
+                self.level += 1
+        return TraversalEnum.CONTINUE
+
+    def leave_expr(self, e):
+        for node in self.nodes:
+            if e.op == idaapi.__dict__[node]:
+                self.level -= 1
+        return TraversalEnum.CONTINUE
+
+
+def find_obfuscation_entry_point(func_ea: int) -> tuple[int, idaapi.switch_info_t, int]:
+    """
+    Analyzes the decompiled C-tree to find the main state machine dispatcher
+    and the argument value required to enter it.
+
+    Returns:
+        A tuple of (main_dispatcher_ea, main_dispatcher_si, trigger_seed_value).
+    """
+    try:
+        cfunc = ida_hexrays.decompile(func_ea)
+    except ida_hexrays.DecompilationFailure:
+        raise RuntimeError(f"Failed to decompile function at 0x{func_ea:X}")
+
+    if not cfunc:
+        raise RuntimeError(f"Could not decompile function at 0x{func_ea:X}")
+
+    finder = CTreeSwitchFinder()
+    finder.apply_to(cfunc.body, None)
+    all_switches = finder.switches
+
+    if not all_switches:
+        raise RuntimeError("Could not find any switch dispatcher in the function.")
+
+    if len(all_switches) == 1:
+        print("[+] Found a single switch dispatcher. Assuming default seed.")
+        main_dispatcher_insn = all_switches[0]
+        # CORRECT: Address is on the expression.
+        main_dispatcher_ea = main_dispatcher_insn.expr.ea
+        main_dispatcher_si = idaapi.get_switch_info(main_dispatcher_ea)
+        if not main_dispatcher_si:
+            raise RuntimeError(
+                f"Could not get switch info for dispatcher at 0x{main_dispatcher_insn.ea:X}"
+            )
+        return main_dispatcher_insn.ea, main_dispatcher_si, 1
+
+    pre_dispatcher_insn = None
+    main_dispatcher_insn = None
+    lvars = cfunc.get_lvars()
+
+    for s_insn in all_switches:
+        is_on_argument = False
+        # Access the switch data via .cswitch
+        if s_insn.expr.op == ida_hexrays.cot_var:
+            var_idx = s_insn.expr.v.idx
+            if lvars[var_idx].is_arg_var:
+                is_on_argument = True
+
+        if is_on_argument:
+            pre_dispatcher_insn = s_insn
+        else:
+            main_dispatcher_insn = s_insn
+
+    if not pre_dispatcher_insn or not main_dispatcher_insn:
+        pre_dispatcher_insn, main_dispatcher_insn = all_switches[0], all_switches[1]
+        print(
+            "[!] Could not identify dispatchers by variable type, falling back to order."
+        )
+    # print(dir(pre_dispatcher_insn))
+    # Use .ea to get the address for printing and analysis
+    print(f"[+] Identified pre-dispatcher at 0x{pre_dispatcher_insn.expr.ea:X}")
+    print(f"[+] Identified main dispatcher at 0x{main_dispatcher_insn.expr.ea:X}")
+
+    # Identify the state variable from the main dispatcher's expression
+    main_dispatcher_expr = main_dispatcher_insn.expr
+    if main_dispatcher_expr.op != ida_hexrays.cot_var:
+        print("Main dispatcher does not switch on a simple variable.")
+        return None, None, None
+
+    state_var_idx = main_dispatcher_expr.v.idx
+    state_var_name = lvars[state_var_idx].name
+    print(
+        f"[+] Main state variable identified as '{state_var_name}' (index {state_var_idx})"
+    )
+
+    # Now, search each case of the pre-dispatcher for an assignment to this variable
+    for case in pre_dispatcher_insn.cases:
+        checker = CTreeContainsVisitor(state_var_idx)
+        checker.apply_to(case, pre_dispatcher_insn.expr)
+        if checker.found:
+            print(f"[+] Found state variable initialization in case at 0x{case.ea:X}")
+            if not case.values:
+                raise RuntimeError(
+                    "Main dispatcher is in the default case, cannot determine seed."
+                )
+
+            trigger_value = case.values[0]
+            main_dispatcher_si = idaapi.get_switch_info(main_dispatcher_insn.expr.ea)
+            if not main_dispatcher_si:
+                raise RuntimeError(
+                    f"Could not get switch info for dispatcher at 0x{main_dispatcher_insn.ea:X}"
+                )
+
+            print(f"[+] Found trigger value: {trigger_value}")
+            return main_dispatcher_insn.expr.ea, main_dispatcher_si, trigger_value
+
+    print("Could not find a path from pre-dispatcher to main dispatcher!")
+    return None, None, None
+
+
+print(f"[+] analysing 0x{FUNC_EA:X}..0x{FUNC_END:X}")
+
+# Use the new Hex-Rays based function to get all the info we need
+DISPATCH_EA, switch_info, SEED_VALUE = find_obfuscation_entry_point(FUNC_EA)
+if not all((DISPATCH_EA, switch_info, SEED_VALUE)):
+    raise RuntimeError("Failed to find obfuscation entry point")
+
+print(f"[+] Main dispatcher at 0x{DISPATCH_EA:X} -> {switch_info.ncases} cases")
+print(f"[+] Using seed value {SEED_VALUE} for the second function argument (RDX).")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 2. Triton initialisation
 # ──────────────────────────────────────────────────────────────────────
@@ -392,31 +816,7 @@ tc.setArchitecture(ARCH.X86_64)
 tc.setMode(MODE.ALIGNED_MEMORY, True)
 tc.setMode(MODE.SYMBOLIZE_LOAD, False)
 tc.setMode(MODE.SYMBOLIZE_STORE, False)
-
-# Stubs: every non-returning helper call returns 0 (or a constant if
-# you want).  Adjust for your binary as necessary.
-CALL_STUB_RETVAL = 0
-helper_re = re.compile(r"sub_180[0-9A-F]{5,}")
 mapper = IDAToTritonRegisterMapper(tc)
-
-
-def is_helper_call(ea):
-    callee = idc.print_operand(ea, 0)
-    return callee and helper_re.match(callee)
-
-
-# def hook_call_old(ctx):
-#     ip = ctx.getConcreteRegisterValue(ctx.registers.rip)
-#     callee_str = idc.print_operand(ip, 0)
-#     if not callee_str:
-#         return
-#     # Force the stub return value in RAX / EAX depending on op size
-#     sz = 8 if ctx.isRegister(ctx.registers.rax) else 4
-#     ctx.setConcreteRegisterValue(
-#         ctx.registers.rax, CALL_STUB_RETVAL & ((1 << (sz * 8)) - 1)
-#     )
-#     # Skip over the call
-#     ctx.setConcreteRegisterValue(ctx.registers.rip, ip + idc.get_item_size(ip))
 
 
 def hook_call(ctx, mem):
@@ -439,9 +839,6 @@ tc.addCallback(CALLBACK.GET_CONCRETE_MEMORY_VALUE, hook_call)
 for ea in idautils.FuncItems(FUNC_EA):
     tc.setConcreteMemoryAreaValue(ea, idc.get_bytes(ea, idc.get_item_size(ea)))
 
-# ── map an artificial 64‑KiB stack so Triton accepts all [rsp+disp] accesses
-STACK_TOP = 0x7FFF0000
-STACK_SIZE = 0x10000
 
 tc.setConcreteMemoryAreaValue(STACK_TOP - STACK_SIZE, bytearray(STACK_SIZE))
 tc.setConcreteRegisterValue(tc.registers.rip, FUNC_EA)
@@ -562,11 +959,11 @@ def get_operand_displacement_safe(insn: idaapi.insn_t, op: idaapi.op_t) -> int:
         _, _, _, disp = get_sib_components(insn, op)
         return idaapi.as_signed(disp, op.dtype)
     elif op.type == idaapi.o_displ:
-        return idaapi.as_signed(op.disp, op.dtype)  # type: ignore
+        return idaapi.as_signed(op.disp, op.dtype)
     elif op.type == idaapi.o_mem:
         return idaapi.as_signed(op.addr, op.dtype)
     elif op.type == idaapi.o_phrase and hasattr(op, "disp"):
-        return idaapi.as_signed(op.disp, op.dtype)  # type: ignore
+        return idaapi.as_signed(op.disp, op.dtype)
     else:
         return 0
 
@@ -669,72 +1066,6 @@ def guess_state_var() -> tuple[str, str | int, int | None]:
     return ("reg", idaapi.get_reg_name(tracked, insn.ops[0].dtype), None)  # type: ignore
 
 
-# def guess_state_var() -> tuple[str, str | int, int | None]:
-#     """
-#     Detect the 'state' location used by the virtualised switch.
-
-#     Returns one of
-#         ("reg",  "rax")               - 32-bit value in a register
-#         ("stk",  "rsp", 0x30)         - DWORD at [rsp+0x30]
-#         ("mem",  0x14001234, None)    - absolute DWORD in .data
-#     """
-#     insn = idaapi.insn_t()
-#     if not idaapi.decode_insn(insn, DISPATCH_EA):
-#         raise RuntimeError("cannot decode dispatcher @0x{:X}".format(DISPATCH_EA))
-
-#     # The operand feeding “jmp rax”
-#     jop = insn.ops[0]  # type: ignore
-
-#     if jop.type == idaapi.o_displ:
-#         base = idaapi.get_reg_name(jop.reg, jop.dtype)
-#         disp = idaapi.as_signed(jop.disp, 32)  # sign-extend 32-bit disp
-#         return ("stk", base, disp)  # («rsp», -0xF0) for example
-#         # return ("stk", base, jop.addr if jop.addr else jop.disp)
-#     elif jop.type != idaapi.o_reg:
-#         raise RuntimeError("unrecognised jmp operand")
-
-#     tracked_reg: int = jop.reg  # type: ignore
-#     # Walk backwards inside same BB to find the *last* def of tracked_reg
-#     fc = idaapi.FlowChart(idaapi.get_func(DISPATCH_EA))
-#     bb = next(b for b in fc if b.start_ea <= DISPATCH_EA < b.end_ea)
-
-#     ea = ida_bytes.prev_head(DISPATCH_EA, bb.start_ea)
-#     while ea != idaapi.BADADDR:
-#         idaapi.decode_insn(insn, ea)
-#         print(f"[+] insn: {idaapi.print_insn_mnem(ea)}, {hex(ea)}")
-#         if (
-#             insn.itype
-#             in (
-#                 ida_allins.NN_mov,
-#                 ida_allins.NN_lea,
-#                 ida_allins.NN_movsxd,
-#                 ida_allins.NN_movzx,
-#                 ida_allins.NN_movsx,
-#             )
-#             and insn.ops[0].type == idaapi.o_reg  # type: ignore
-#             and insn.ops[0].reg == tracked_reg  # type: ignore
-#         ):
-#             src = insn.ops[1]  # type: ignore
-
-#             if src.type == idaapi.o_reg:
-#                 return ("reg", idaapi.get_reg_name(src.reg, src.dtype), None)
-
-#             if src.type == idaapi.o_displ:
-#                 base = idaapi.get_reg_name(src.reg, src.dtype)
-#                 print(f"[+] base: {base}, disp: {src.addr}")
-#                 disp = idaapi.as_signed(src.addr, 32)  # sign-extend 32-bit disp
-#                 return ("stk", base, disp)  # («rsp», -0xF0) for example
-#                 # return ("stk", base, src.disp)
-
-#             if src.type == idaapi.o_mem:
-#                 return ("mem", src.addr, None)
-
-#         ea = ida_bytes.prev_head(ea, bb.start_ea)
-
-#     # fallback: state *is* the tracked register
-#     return ("reg", idaapi.get_reg_name(tracked_reg, insn.ops[0].dtype), None)  # type: ignore
-
-
 state_kind, *state_desc = guess_state_var()
 print(f"[+] state variable is a {state_kind}: {state_desc}")
 
@@ -750,6 +1081,95 @@ if state_kind == "stk":
 # ──────────────────────────────────────────────────────────────────────
 # 3. Emulation loop – record transitions
 # ──────────────────────────────────────────────────────────────────────
+
+
+def simplify_control_flow_graph(
+    block_ea: dict[int, int], func_end: int
+) -> dict[int, int]:
+    """
+    Resolves redirector blocks in a state machine.
+    A redirector block is a case that only contains a 'goto' to another case's label.
+
+    Args:
+        block_ea: A map of {state: address}.
+        func_end: The end address of the function.
+
+    Returns:
+        A simplified map of {state: resolved_address}.
+    """
+    print("[+] Simplifying control flow graph...")
+    resolved_ea = {}
+
+    # Create a reverse map for easy label lookup
+    addr_to_state = {v: k for k, v in block_ea.items()}
+
+    for state in sorted(block_ea.keys()):
+        current_addr = block_ea[state]
+
+        # Follow the chain of jumps
+        visited_addrs = {current_addr}
+        while True:
+            # Determine the end of the current block
+            next_state_addr = min(
+                [addr for addr in block_ea.values() if addr > current_addr],
+                default=func_end,
+            )
+
+            # Check if this block is just a single, unconditional jump
+            heads = list(idautils.Heads(current_addr, next_state_addr))
+
+            # Find the first non-NOP instruction
+            first_real_insn_ea = idaapi.BADADDR
+            for head in heads:
+                if idc.print_insn_mnem(head) not in ("nop", ""):
+                    first_real_insn_ea = head
+                    break
+
+            if first_real_insn_ea == idaapi.BADADDR:
+                # Empty block, something is wrong or it's a dead end. Stop.
+                break
+
+            insn = idaapi.insn_t()
+            if not (
+                idaapi.decode_insn(insn, first_real_insn_ea)
+                and insn.itype == ida_allins.NN_jmp
+            ):
+                # This block has real code (it doesn't start with a jmp). This is our final target.
+                break
+
+            # It's a jump. Is it the *only* instruction?
+            # A simple check: is the next instruction address the end of our block?
+            next_head = idaapi.next_head(first_real_insn_ea, next_state_addr)
+            if next_head != idaapi.BADADDR and next_head < next_state_addr:
+                # There are more instructions after the jump. This is real code.
+                break
+
+            # This is a redirector block. Get the target.
+            target_addr = insn.ops[0].addr
+
+            if target_addr in visited_addrs:
+                print(
+                    f"[!] Detected loop in jump chain at 0x{target_addr:X}. Stopping resolution."
+                )
+                current_addr = (
+                    target_addr  # Break the loop but resolve to the loop start
+                )
+                break
+
+            # Continue chasing the jump
+            current_addr = target_addr
+            visited_addrs.add(current_addr)
+
+        if block_ea[state] != current_addr:
+            print(
+                f"[+]   State {state} (0x{block_ea[state]:X}) resolved to 0x{current_addr:X}"
+            )
+
+        resolved_ea[state] = current_addr
+
+    return resolved_ea
+
+
 def get_switch_mapping(si: idaapi.switch_info_t) -> dict[int, int]:
     cat = idaapi.calc_switch_cases(DISPATCH_EA, si)  # IDA ≥ 8.0 form
     cases, targets = cat.cases, cat.targets
@@ -764,7 +1184,8 @@ Edge = namedtuple("Edge", "src dst ip")
 
 
 edges: set[Edge] = set()
-block_ea: dict[int, int] = get_switch_mapping(switch_info)
+original_block_ea: dict[int, int] = get_switch_mapping(switch_info)
+block_ea = simplify_control_flow_graph(original_block_ea, FUNC_END)
 visited: set[int] = set()
 steps = 0
 
@@ -788,7 +1209,7 @@ def store_dword(addr: int, value: int):
 # ----------------------------------------------------------------------
 # read/write the dispatcher state
 # ----------------------------------------------------------------------
-def read_state(tc: TritonContext) -> int:
+def read_state() -> int:
     """
     Return the current value of the dispatcher's state variable.
 
@@ -798,12 +1219,12 @@ def read_state(tc: TritonContext) -> int:
         ("mem",  absolute_ea)
     """
     if state_kind == "reg":
-        reg = getattr(tc.registers, typing.cast(str, state_desc[0]).lower())
+        reg = getattr(tc.registers, state_desc[0].lower())
         return tc.getConcreteRegisterValue(reg) & 0xFFFFFFFF
 
     if state_kind == "stk":
         base_reg, disp = state_desc
-        base = tc.getConcreteRegisterValue(getattr(tc.registers, typing.cast(str, base_reg).lower()))
+        base = tc.getConcreteRegisterValue(getattr(tc.registers, base_reg.lower()))
         return int.from_bytes(tc.getConcreteMemoryAreaValue(base + disp, 4), "little")
 
     if state_kind == "mem":
@@ -813,92 +1234,21 @@ def read_state(tc: TritonContext) -> int:
     raise RuntimeError(f"unknown state_kind {state_kind!r}")
 
 
-def write_state(tc: TritonContext, value: int):
+def write_state(value: int):
     """Update the dispatcher's state variable (32-bit)."""
     value &= 0xFFFFFFFF
     if state_kind == "reg":
         (reg_name,) = state_desc
-        tc.setConcreteRegisterValue(triton_reg(typing.cast(str, reg_name)), value)
+        tc.setConcreteRegisterValue(triton_reg(reg_name), value)
     elif state_kind == "stk":
         base_reg_name, disp = state_desc
-        base = tc.getConcreteRegisterValue(triton_reg(typing.cast(str, base_reg_name)))
+        base = tc.getConcreteRegisterValue(triton_reg(base_reg_name))
         store_dword(base + disp, value)
     elif state_kind == "mem":
         (ea,) = state_desc
-        store_dword(int(typing.cast(int, ea)), value)
+        store_dword(int(ea), value)
     else:
         raise RuntimeError(f"unknown state_kind {state_kind!r}")
-
-
-class UserCanceledError(Exception):
-    pass
-
-
-@dataclass
-class CheckContinuePrompt:
-    """Decorator that checks if user wants to continue after elapsed time.
-
-    Args:
-        metadata: Dictionary containing metadata to format into the prompt message
-        cancel_func: Function to call if user cancels
-        enable_prompt: Whether to enable the continue prompt
-        start_time: Optional start time, will be initialized if None
-        prompt_interval: Initial time before first prompt in seconds
-        logger: Optional logger instance
-    """
-
-    metadata: dict | None = None
-    cancel_func: Callable[[], None] | None = None
-    enable_prompt: bool = True
-    start_time: float = 0.0
-    prompt_interval: int = 120
-    logger: logging.Logger | None = None
-
-    def __post_init__(self):
-        current_time = time.time()
-        self.start_time = current_time if self.start_time == 0.0 else self.start_time
-        self.next_prompt_time = self.start_time + self.prompt_interval
-
-    @property
-    def elapsed_time(self) -> float:
-        return time.time() - self.start_time
-
-    def __call__(self, func: Callable) -> Callable:
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            if not self.enable_prompt:
-                return func(*args, **kwargs)
-
-            if self.elapsed_time < self.next_prompt_time:
-                return func(*args, **kwargs)
-
-            minutes = int(self.elapsed_time / 60)
-            seconds = int(self.elapsed_time % 60)
-            time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-
-            # Format metadata into message
-            message = f"{func.__name__} has been running for {time_str}.\n\n"
-            if self.metadata:
-                for key, value in self.metadata.items():
-                    message += f"{key}: {value}\n"
-            message += "\nContinue?"
-
-            reply = ida_kernwin.ask_yn(0, message)
-            if reply == 0:
-                if self.cancel_func:
-                    return self.cancel_func()
-                raise UserCanceledError("User canceled")
-
-            self.next_prompt_time *= 2
-            if self.logger is not None:
-                self.logger.info(
-                    "Next prompt will be at %d seconds (%.1f minutes)",
-                    self.next_prompt_time,
-                    self.next_prompt_time / 60.0,
-                )
-            return func(*args, **kwargs)
-
-        return wrapper
 
 
 def is_ret(ea: int, strict: bool = True) -> bool:
@@ -1015,117 +1365,24 @@ def run_solver(si: idaapi.switch_info_t):
 
 run_solver(switch_info)
 
-# ──────────────────────────────────────────────────────────────────────
-# 4. Build graph and show
-# ──────────────────────────────────────────────────────────────────────
-import networkx as nx
 
-G = nx.DiGraph()
-for e in edges:
-    G.add_edge(e.src, e.dst)
+if GRAPH_DOT:
+    # ──────────────────────────────────────────────────────────────────────
+    # 4. Build graph and show
+    # ──────────────────────────────────────────────────────────────────────
+    import networkx as nx
 
-# Save .dot & render to PDF
-with tempfile.NamedTemporaryFile(dir="herpa", suffix=".dot", delete=False) as dot_file:
-    dot_name = dot_file.name
-    nx.drawing.nx_pydot.write_dot(G, dot_name)
-    print(f"[+] graph written to {dot_name}")
+    G = nx.DiGraph()
+    for e in edges:
+        G.add_edge(e.src, e.dst)
 
-# Show in IDA graph view
-# gv = idaapi.create_generic_graph("Unflattened CFG", len(G.nodes), True)
-# for n in G.nodes:
-#     idx = gv.add_node(n, str(n))
-#     gv[node_t(idx)].color = COL_CASE
-# for src, dst in G.edges:
-#     eid = gv.add_edge(src, dst, "")
-#     gv[edge_t(eid)].color = COL_EDGE_TRUE
-# idaapi.display_generic_graph(gv, False)
-
-# ──────────────────────────────────────────────────────────────────────
-# 5. (optional) patch dispatcher → direct jumps
-# ──────────────────────────────────────────────────────────────────────
-# ──────────────────────────────────────────────────────────────────────
-# 5. (optional) fully de‑virtualise control‑flow
-#     – patch every ‘mov [state], imm; jmp dispatcher’ tail
-#     – patch the dispatcher head
-#     – drop switch‑info so Hex‑Rays re‑decompiles cleanly
-# ──────────────────────────────────────────────────────────────────────
-
-# def is_state_store(ea: int) -> bool:
-#     """Return True if instruction is  mov dword ptr [state], imm32."""
-#     if ida_bytes.get_byte(ea) != 0xC7:        # C7 /0
-#         return False
-#     insn = idaapi.insn_t()
-#     idaapi.decode_insn(insn, ea)
-#     if insn.itype != ida_allins.NN_mov:
-#         return False
-#     op0, op1 = insn.ops[0], insn.ops[1]
-#     if op0.type != idaapi.o_displ or op1.type != idaapi.o_imm:
-#         return False
-#     base = _wide(idaapi.get_reg_name(op0.reg, op0.dtype))
-#     disp = idaapi.as_signed(op0.disp, 32)
-#     return (base, disp) == tuple(state_desc[:2])
-
-
-# def patch_case_tails():
-#     disp_blk = DISPATCH_EA  # jmp rax
-#     state_base, state_disp = state_desc  # ('rsp', 0x30)
-
-#     for tail in idautils.CodeRefsTo(disp_blk, 0):
-#         # tail points at the *jmp*; the previous instruction should
-#         # store the next state value
-#         mov_ea = idc.prev_head(tail)
-#         if idc.print_insn_mnem(mov_ea) != "mov":
-#             continue
-
-#         # Is it  mov dword ptr [state], imm ?
-#         insn = idaapi.insn_t()
-#         idaapi.decode_insn(insn, mov_ea)
-#         op0, op1 = insn.ops[0], insn.ops[1]
-
-#         if (
-#             op0.type == idaapi.o_displ
-#             and _wide(idaapi.get_reg_name(op0.reg, op0.dtype)) == state_base
-#             and idaapi.as_signed(op0.disp, 32) == state_disp
-#             and op1.type == idaapi.o_imm
-#         ):
-#             imm = op1.value & 0xFFFFFFFF
-#             tgt = block_ea.get(imm)
-#             if tgt is None:
-#                 continue  # sparse/default → skip
-
-#             disp = tgt - (mov_ea + 5)
-#             if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
-#                 jmp_bytes = b"\xe9" + struct.pack("<i", disp)  # near-jmp
-#             else:
-#                 jmp_bytes = b"\x48\xb8" + struct.pack("<Q", tgt) + b"\xff\xe0"
-
-#             size = idc.get_item_size(mov_ea) + idc.get_item_size(tail)
-#             ida_bytes.patch_bytes(mov_ea, jmp_bytes.ljust(size, b"\x90"))
-#             print(f"[+] tail @0x{mov_ea:X} patched → 0x{tgt:X}")
-
-
-# def is_state_store(ea: int, imm: int | None = None) -> bool:
-#     """True if "ea" is  mov dword [state], imm  (optionally matching imm)."""
-#     # C7 /0   mov r/m32, imm32
-#     if ida_bytes.get_byte(ea) != 0xC7 or idc.print_insn_mnem(ea) != "mov":
-#         return False
-#     insn = idaapi.insn_t()
-#     idaapi.decode_insn(insn, ea)
-#     if insn.itype != ida_allins.NN_mov or insn.ops[0].type != idaapi.o_displ:
-#         return False
-#     if not has_sib(insn.ops[0]):
-#         base = _wide(idaapi.get_reg_name(insn.ops[0].reg, insn.ops[0].dtype))
-#         disp = idaapi.as_signed(insn.ops[0].disp, 32)
-#     else:
-#         base, scale, index, disp = get_sib_components(insn, insn.ops[0])
-#         base = _wide(idaapi.get_reg_name(base, scale))
-
-#     if (base, disp) != tuple(state_desc):  # the slot we identified
-#         print(
-#             f"[+] {hex(ea)} - {idc.generate_disasm_line(ea, 0)} - not state store ({state_desc}) (base: {base}, disp: {disp})"
-#         )
-#         return False
-#     return imm is None or insn.ops[1].value == imm
+    # Save .dot & render to PDF
+    with tempfile.NamedTemporaryFile(
+        dir="herpa", suffix=".dot", delete=False
+    ) as dot_file:
+        dot_name = dot_file.name
+        nx.drawing.nx_pydot.write_dot(G, dot_name)
+        print(f"[+] graph written to {dot_name}")
 
 
 def is_state_store(ea: int, imm: int | None = None) -> bool:
@@ -1160,181 +1417,148 @@ def is_state_store(ea: int, imm: int | None = None) -> bool:
     return imm is None or insn.ops[1].value == imm
 
 
-class PatchManager:
-    """Manages deferred patch operations."""
+# Find the true entry state from the emulation trace.
+# It's the destination state from the initial state (which we know is 0).
+try:
+    entry_state = next(edge.dst for edge in edges if edge.src == 0)
+except StopIteration:
+    raise RuntimeError(
+        "Could not determine the entry state from the emulation trace. "
+        "The state machine may not have been entered correctly."
+    )
 
-    class Mode(enum.Enum):
-        PATCH = enum.auto()  # Use ida_bytes.patch_bytes
-        PUT = enum.auto()  # Use ida_bytes.put_bytes
-
-    def __init__(
-        self,
-        patch_mode: Mode = Mode.PATCH,
-        dry_run: bool = False,
-        auto_clear: bool = True,
-    ):
-        self.dry_run = dry_run
-        self.patch_mode = patch_mode
-        self.pending_patches: list[DeferredPatchOp] = []
-        self.auto_clear = auto_clear
-        logging.info(
-            "PatchManager initialized (dry_run=%s, mode=%s)",
-            self.dry_run,
-            self.patch_mode.name,
-        )
-
-    def add_patch(self, address: int, byte_values: bytes):
-        """Creates and queues a DeferredPatchOp."""
-        op = DeferredPatchOp(address, byte_values, self.patch_mode)
-        self.pending_patches.append(op)
-        logging.debug("Queued patch operation: %s", op)
-
-    def apply_all(self, dry_run_override: bool | None = None) -> bool:
-        """Applies all queued patch operations."""
-        logging.info("Applying %d queued patches...", len(self))
-        success_count = 0
-        fail_count = 0
-
-        if dry_run_override is None:
-            # None is a sentinel value here that represents "use the default"
-            dry_run_override = self.dry_run
-
-        for op in self.pending_patches:
-            if op.apply(dry_run_override):
-                success_count += 1
-            else:
-                fail_count += 1
-
-        logging.info(
-            "Patch application complete. Success: %d, Failed: %d",
-            success_count,
-            fail_count,
-        )
-        if self.auto_clear:
-            self.pending_patches.clear()  # Clear the list after applying
-        return fail_count == 0  # Return True if all patches were applied successfully
-
-    def __len__(self) -> int:
-        return len(self.pending_patches)
-
-
-@dataclasses.dataclass(repr=False)
-class DeferredPatchOp:
-    """Class to store patch operations that will be applied later."""
-
-    address: int
-    byte_values: bytes
-    mode: PatchManager.Mode
-    dry_run: bool = False
-
-    @classmethod
-    def patch(cls, address: int, byte_values: bytes, dry_run: bool = False):
-        return cls(address, byte_values, PatchManager.Mode.PATCH, dry_run)
-
-    @classmethod
-    def put(cls, address: int, byte_values: bytes, dry_run: bool = False):
-        return cls(address, byte_values, PatchManager.Mode.PUT, dry_run)
-
-    def apply(self, dry_run_override: bool = False) -> bool:
-        """Apply the patch operation using either patch_bytes or put_bytes based on mode."""
-        is_dry_run = dry_run_override or self.dry_run
-        logging.debug(
-            "[*] %sPatching decrypted chunk %s at 0x%X (size: %d)",
-            "(Dry Run) " if is_dry_run else "",
-            ("revertably" if self.mode == PatchManager.Mode.PATCH else "destructively"),
-            self.address,
-            len(self.byte_values),
-        )
-        success = True
-        if is_dry_run:
-            return success
-
-        try:
-            func = (
-                idaapi.put_bytes
-                if self.mode == PatchManager.Mode.PUT
-                else idaapi.patch_bytes
-            )
-            func(self.address, self.byte_values)
-        except Exception as e:
-            logging.error(f"Failed to apply patch {self}: {e}", exc_info=True)
-            success = False
-        return success
-
-    def __str__(self):
-        """String representation with hex formatting."""
-        dry_run_str = " (dry run)" if self.dry_run else ""
-        return f"{self.__class__.__name__}({len(self.byte_values)} bytes, mode={self.mode.name}{dry_run_str} @ address=0x{self.address:X})"
-
-    __repr__ = __str__
-
+print(f"[+] True entry state determined to be: {entry_state}")
 
 pm = PatchManager(dry_run=not ENABLE_PATCHING)
 
-# Patch dispatcher head to jump to case 0
-head_start = switch_info.startea
-head_end = DISPATCH_EA + idc.get_item_size(DISPATCH_EA)
-head_len = head_end - head_start
-entry_ea = block_ea[0]
-disp = entry_ea - (head_start + 5)
-if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
-    head_patch = b"\xe9" + struct.pack("<i", disp)
-else:
-    head_patch = b"\x48\xb8" + struct.pack("<Q", entry_ea) + b"\xff\xe0"
-pm.add_patch(head_start, head_patch.ljust(head_len, b"\x90"))
-print(f"[+] Dispatcher patched to jump to case 0 at 0x{entry_ea:X}")
 
+# Patch dispatcher head to jump to the TRUE entry case.
+def patch_head():
+    head_start = switch_info.startea
+    head_end = DISPATCH_EA + idc.get_item_size(DISPATCH_EA)
+    head_len = head_end - head_start
+
+    if entry_state not in block_ea:
+        raise RuntimeError(
+            f"Entry state {entry_state} not found in block map. Emulation may have failed."
+        )
+    entry_ea = block_ea[entry_state]  # Use the dynamically found entry state
+
+    disp = entry_ea - (head_start + 5)
+    if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
+        head_patch = b"\xe9" + struct.pack("<i", disp)
+    else:
+        head_patch = b"\x48\xb8" + struct.pack("<Q", entry_ea) + b"\xff\xe0"
+    pm.add_patch(head_start, head_patch.ljust(head_len, b"\x90"))
+    # Update the log message to be accurate.
+    print(f"[+] Dispatcher patched to jump to case {entry_state} at 0x{entry_ea:X}")
+
+
+print("[+] Preserving pre-dispatcher logic at case 0")
 # Patch each block's state-setting instructions
-for state in sorted(block_ea.keys()):
-    ea = block_ea[state]
-    # Determine block end (next block or function end)
-    next_state = min([s for s in block_ea if s > state], default=None)
-    next_ea = block_ea[next_state] if next_state is not None else func_end
+# for state in sorted(block_ea.keys()):
+#     ea = block_ea[state]
+#     # Determine block end (next block or function end)
+#     next_state = min([s for s in block_ea if s > state], default=None)
+#     next_ea = block_ea[next_state] if next_state is not None else FUNC_END
 
-    # Patch all mov [state], imm instructions
-    for head in idautils.Heads(ea, next_ea):
-        try:
-            is_state_var = is_state_store(head)
-        except Exception as e:
-            print(f"[!] Error checking state store at 0x{head:X}: {e}")
-            print(f"[!] {idc.generate_disasm_line(head, 0)}")
-            tb_str = "".join(
-                traceback.format_exception(e.__class__, e, e.__traceback__)
-            )
-            print(tb_str)
-            exit(1)
-        else:
-            if not is_state_var:
-                continue
+#     # Patch all mov [state], imm instructions
+#     for head in idautils.Heads(ea, next_ea):
+#         try:
+#             is_state_var = is_state_store(head)
+#         except Exception as e:
+#             print(f"[!] Error checking state store at 0x{head:X}: {e}")
+#             print(f"[!] {idc.generate_disasm_line(head, 0)}")
+#             tb_str = "".join(
+#                 traceback.format_exception(e.__class__, e, e.__traceback__)
+#             )
+#             print(tb_str)
+#             exit(1)
+#         else:
+#             if not is_state_var:
+#                 continue
 
-        imm = idc.get_operand_value(head, 1)
-        if imm not in block_ea:
+#         imm = idc.get_operand_value(head, 1)
+#         if imm not in block_ea:
+#             continue
+
+#         target_ea = block_ea[imm]
+#         disp = target_ea - (head + 5)
+#         if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
+#             patch = b"\xe9" + struct.pack("<i", disp)
+#         else:
+#             patch = b"\x48\xb8" + struct.pack("<Q", target_ea) + b"\xff\xe0"
+#         mov_size = idc.get_item_size(head)  # Typically 7 bytes
+#         pm.add_patch(head, patch.ljust(mov_size, b"\x90"))
+#         print(f"[+] 0x{head:X}: Patched mov [state], {imm} to jmp 0x{target_ea:X}")
+# Patch each block's state-setting instructions USING THE SIMPLIFIED MAP
+for state in sorted(original_block_ea.keys()):  # Iterate over original states
+    ea = original_block_ea[state]  # The physical address of the block
+
+    # Determine block end (next physical block or function end)
+    next_state_addr = min(
+        [addr for addr in original_block_ea.values() if addr > ea], default=FUNC_END
+    )
+
+    # Patch all mov [state], imm instructions within this physical block
+    for head in idautils.Heads(ea, next_state_addr):
+        if not is_state_store(head):
             continue
 
+        imm = idc.get_operand_value(head, 1)
+        if imm not in block_ea:  # Use the resolved map here
+            # This state transition leads to a block we couldn't map.
+            # Could be an exit state.
+            continue
+
+        # The magic is here: we get the *final* target from our simplified map
         target_ea = block_ea[imm]
+
         disp = target_ea - (head + 5)
         if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
             patch = b"\xe9" + struct.pack("<i", disp)
         else:
             patch = b"\x48\xb8" + struct.pack("<Q", target_ea) + b"\xff\xe0"
-        mov_size = idc.get_item_size(head)  # Typically 7 bytes
+        mov_size = idc.get_item_size(head)
         pm.add_patch(head, patch.ljust(mov_size, b"\x90"))
         print(f"[+] 0x{head:X}: Patched mov [state], {imm} to jmp 0x{target_ea:X}")
+    # --- CORRECTED TAIL JUMP PATCHING LOGIC ---
 
-    # Patch tail jump to NOPs (assumes last instruction is jmp)
-    tail_ea = idc.prev_head(next_ea, ea)
-    if not idc.print_insn_mnem(tail_ea) == "jmp":
-        continue
-    jmp_size = idc.get_item_size(tail_ea)
-    pm.add_patch(tail_ea, b"\x90" * jmp_size)
-    print(f"[+] 0x{tail_ea:X}: Tail jump patched to NOPs")
+    # Patch the tail jump to NOPs ONLY if it's a jmp to the main dispatcher
+    tail_ea = idc.prev_head(next_state_addr, ea)
+    insn = idaapi.insn_t()
+    if idaapi.decode_insn(insn, tail_ea) and insn.itype == ida_allins.NN_jmp:
+        # Check if it's an unconditional jmp (not a jcc)
+        # For x86/x64, NN_jmp is unconditional.
 
+        # Get the jump target address
+        op = insn.ops[0]
+        target_ea = idaapi.BADADDR
+        if op.type == idaapi.o_near:
+            target_ea = op.addr
+
+        # Only patch the jump if it explicitly goes back to the dispatcher head
+        if target_ea == DISPATCH_EA:
+            jmp_size = idc.get_item_size(tail_ea)
+            pm.add_patch(tail_ea, b"\x90" * jmp_size)
+            print(f"[+] 0x{tail_ea:X}: Tail jump to dispatcher patched to NOPs")
+        else:
+            # This is a jump, but not to our dispatcher. Leave it alone.
+            # This is critical for preserving the logic of nested dispatchers.
+            print(
+                f"[+] 0x{tail_ea:X}: Skipping tail jump patch (target is 0x{target_ea:X}, not dispatcher)"
+            )
+    else:
+        # The last instruction is not a jmp, so there's nothing to patch.
+        # This is expected for blocks that end in 'retn'.
+        print(f"[+] 0x{tail_ea:X}: Skipping tail patch (not a jmp instruction)")
+        
 pm.apply_all()
 
 # Clean up and re-analyze
 ida_xref.delete_switch_table(DISPATCH_EA, switch_info)
 ida_nalt.del_switch_info(DISPATCH_EA)
-ida_auto.auto_mark_range(FUNC_EA, func_end, ida_auto.AU_USED)
+ida_auto.auto_mark_range(FUNC_EA, FUNC_END, ida_auto.AU_USED)
 ida_auto.auto_wait()
 print("[+] Patching complete – press <Space> in IDA to re-decompile")
 
