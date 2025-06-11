@@ -19,8 +19,9 @@ from collections import namedtuple
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+import networkx as nx
 import triton
-from triton import ARCH, CALLBACK, MODE, Instruction, TritonContext
+from triton import ARCH, AST_NODE, CALLBACK, MODE, OPERAND, Instruction, TritonContext
 
 import ida_allins
 import ida_auto
@@ -42,14 +43,19 @@ logging.basicConfig(level=logging.DEBUG)
 FUNC = idaapi.get_func(idaapi.get_screen_ea())
 FUNC_EA = FUNC.start_ea  # start EA
 FUNC_END = FUNC.end_ea
-ENABLE_PATCHING = True  # True → rewrite code
+ENABLE_PATCHING = False  # True → rewrite code
 MAX_STEPS = 250000  # safety
 GRAPH_DOT = False
 
 # ── map an artificial 64‑KiB stack so Triton accepts all [rsp+disp] accesses
 STACK_TOP = 0x7FFF0000
 STACK_SIZE = 0x10000
-
+# Crucial for emulating TLS Callbacks that use gs:[offset]
+TEB_AREA = 0x100000
+TEB_SIZE = 0x2000
+# A dummy memory region for the pointer passed as the first argument (RCX)
+DUMMY_ARG_REGION = 0x600000
+DUMMY_ARG_SIZE = 0x1000
 # ──────────────────────────────────────────────────────────────────────
 # 1. Gather basic info
 # ──────────────────────────────────────────────────────────────────────
@@ -669,7 +675,7 @@ class CTreeContainsVisitor(ida_hexrays.ctree_visitor_t):
         if self.found:
             return TraversalEnum.STOP  # Stop traversal
         # We are looking for an assignment instruction, e.g., `v1 = 0;`
-        if idc.get_operand_value(insn.ea, 1) == ida_hexrays.cot_asg:
+        if insn.cexpr is not None and insn.cexpr.op == ida_hexrays.cot_asg:
             print(
                 "HERE!!!",
                 idc.print_operand(insn.ea, 0),
@@ -695,6 +701,60 @@ class CTreeContainsVisitor(ida_hexrays.ctree_visitor_t):
         for node in self.nodes:
             if e.op == idaapi.__dict__[node]:
                 self.level -= 1
+        return TraversalEnum.CONTINUE
+
+
+class SpecificSwitchVisitor(ida_hexrays.ctree_visitor_t):
+    """
+    A ctree visitor that performs a deep search to find the switch
+    statement at a specific address.
+    """
+
+    def __init__(self, target_ea):
+        super().__init__(ida_hexrays.CV_FAST)
+        self.target_ea = target_ea
+        self.found_switch = None
+
+    def visit_insn(self, insn: ida_hexrays.cinsn_t) -> TraversalEnum:
+        if self.found_switch:
+            return TraversalEnum.STOP  # Stop traversal if found
+
+        # We are looking for a switch statement whose corresponding
+        # instruction address matches our target dispatcher address.
+        if insn.op == ida_hexrays.cit_switch and insn.ea == self.target_ea:
+            self.found_switch = insn.cswitch
+            return TraversalEnum.STOP  # Stop traversal
+
+        return TraversalEnum.CONTINUE
+
+
+class StateStoreVisitor(ida_hexrays.ctree_visitor_t):
+    """
+    A ctree visitor that finds all assignments of a constant value
+    to our specific state variable, e.g., `state_var = 5;`
+    """
+
+    def __init__(self, state_var_idx):
+        super().__init__(ida_hexrays.CV_FAST)
+        self.state_var_idx = state_var_idx
+        # List to store tuples of: (address_of_assignment, next_state_value)
+        self.found_stores: list[tuple[int, int]] = []
+
+    def visit_insn(self, insn: ida_hexrays.cinsn_t) -> TraversalEnum:
+        # We are looking for an assignment instruction: cit_asg
+        if insn.cexpr is not None and insn.cexpr.op == ida_hexrays.cot_asg:
+            # Destination must be a variable: cot_var
+            dest = insn.cexpr.x
+            # Source must be a number/constant: cot_num
+            src = insn.cexpr.y
+            if dest.op == ida_hexrays.cot_var and src.op == ida_hexrays.cot_num:
+                if dest.v.getv() == self.state_var_idx:
+                    print(
+                        f"[+] found store to state variable at 0x{insn.ea:X} - {dest.dstr()} = {src.dstr()}"
+                    )
+                    addr = insn.ea
+                    value = src.n.value(insn.cexpr.type)
+                    self.found_stores.append((addr, value))
         return TraversalEnum.CONTINUE
 
 
@@ -861,7 +921,53 @@ def _wide(reg: str) -> str:
     return {"sp": "rsp", "bp": "rbp", "esp": "rsp", "ebp": "rbp"}.get(reg, reg)
 
 
-def guess_state_var(DISPATCH_EA: int) -> tuple[str, str | int, int | None]:
+def guess_state_var2(
+    cfunc: ida_hexrays.cfuncptr_t, dispatch_ea: int, stack_offset: int
+) -> tuple[str, Any, Any]:
+    """
+    Finds the state variable by inspecting the decompiler's ctree.
+    This version uses a deep visitor to find the switch, making it robust against nesting.
+
+    Returns: ("stk", base_reg_name, displacement) or ("reg", reg_name, None).
+    """
+    print("[+] Guessing state variable using decompiler ctree...")
+
+    # Use our new visitor to find the switch statement, regardless of nesting depth.
+    visitor = SpecificSwitchVisitor(dispatch_ea)
+    visitor.apply_to(cfunc.body, None)
+
+    main_dispatcher_switch = visitor.found_switch
+
+    if not main_dispatcher_switch:
+        raise RuntimeError(
+            f"Could not find ctree switch item for dispatcher at 0x{dispatch_ea:X}"
+        )
+
+    # The switch expression is our state variable
+    switch_expr = main_dispatcher_switch.expr
+    if switch_expr.op != idaapi.cot_var:
+        raise RuntimeError("Dispatcher switch expression is not a simple variable.")
+
+    lvar = switch_expr.v.getv()  # Get the lvar_t object for the variable
+
+    if lvar.is_stk_var():
+        # It's a stack variable. The offset is relative to the frame pointer (RBP).
+        stk_offset = lvar.get_stkoff() - stack_offset
+        # NOTE: IDA's decompiler considers the frame pointer to be RBP for stack vars.
+        return ("stk", "rbp", stk_offset)
+
+    if lvar.is_reg_var():
+        # It's a register variable.
+        reg_info = cfunc.get_reg_info(lvar.get_reg1())
+        reg_name = reg_info.reg_name if reg_info else f"reg{lvar.get_reg1()}"
+        return ("reg", reg_name, None)
+
+    raise RuntimeError("State variable is not a register or stack variable.")
+
+
+def guess_state_var(
+    cfunc: ida_hexrays.cfuncptr_t, DISPATCH_EA: int
+) -> tuple[str, str | int, int | None]:
     """Return ("reg",name) or ("stk",base,disp) or ("mem",ea)."""
     insn = idaapi.insn_t()
     if not idaapi.decode_insn(insn, DISPATCH_EA):
@@ -928,91 +1034,80 @@ def guess_state_var(DISPATCH_EA: int) -> tuple[str, str | int, int | None]:
     return ("reg", idaapi.get_reg_name(tracked, insn.ops[0].dtype), None)  # type: ignore
 
 
-def simplify_control_flow_graph(
-    block_ea: dict[int, int], func_end: int
-) -> dict[int, int]:
+def resolve_jump_chains(edges: set[Edge], block_ea: dict[int, int]) -> dict[int, int]:
     """
-    Resolves redirector blocks in a state machine.
-    A redirector block is a case that only contains a 'goto' to another case's label.
+    Analyzes the execution trace (edges) to resolve jump chains.
+    For a chain A -> B -> C, it will map state A directly to the address of C.
 
     Args:
-        block_ea: A map of {state: address}.
-        func_end: The end address of the function.
+        edges: A set of Edge tuples (src, dst, ip) from the emulation.
+        block_ea: The original map of {state: address}.
 
     Returns:
-        A simplified map of {state: resolved_address}.
+        A new map of {state: final_resolved_address}.
     """
-    print("[+] Simplifying control flow graph...")
-    resolved_ea = {}
+    print("[+] Pass 2: Resolving jump chains from execution trace...")
 
-    # Create a reverse map for easy label lookup
-    addr_to_state = {v: k for k, v in block_ea.items()}
+    # Create a simple directed graph from the state transitions
+    successors = {edge.src: edge.dst for edge in edges}
 
-    for state in sorted(block_ea.keys()):
-        current_addr = block_ea[state]
+    # Memoization cache for resolved states
+    resolved_cache = {}
 
-        # Follow the chain of jumps
-        visited_addrs = {current_addr}
-        while True:
-            # Determine the end of the current block
-            next_state_addr = min(
-                [addr for addr in block_ea.values() if addr > current_addr],
-                default=func_end,
-            )
+    def _trace_to_end(start_state: int) -> int:
+        """Follows the chain of states to its end and returns the final state."""
+        if start_state in resolved_cache:
+            return resolved_cache[start_state]
 
-            # Check if this block is just a single, unconditional jump
-            heads = list(idautils.Heads(current_addr, next_state_addr))
+        path = [start_state]
+        current_state = start_state
 
-            # Find the first non-NOP instruction
-            first_real_insn_ea = idaapi.BADADDR
-            for head in heads:
-                if idc.print_insn_mnem(head) not in ("nop", ""):
-                    first_real_insn_ea = head
-                    break
+        while current_state in successors:
+            next_state = successors[current_state]
 
-            if first_real_insn_ea == idaapi.BADADDR:
-                # Empty block, something is wrong or it's a dead end. Stop.
-                break
-
-            insn = idaapi.insn_t()
-            if not (
-                idaapi.decode_insn(insn, first_real_insn_ea)
-                and insn.itype == ida_allins.NN_jmp
-            ):
-                # This block has real code (it doesn't start with a jmp). This is our final target.
-                break
-
-            # It's a jump. Is it the *only* instruction?
-            # A simple check: is the next instruction address the end of our block?
-            next_head = idaapi.next_head(first_real_insn_ea, next_state_addr)
-            if next_head != idaapi.BADADDR and next_head < next_state_addr:
-                # There are more instructions after the jump. This is real code.
-                break
-
-            # This is a redirector block. Get the target.
-            target_addr = insn.ops[0].addr  # type: ignore
-
-            if target_addr in visited_addrs:
+            # Check for loops in the chain
+            if next_state in path:
                 print(
-                    f"[!] Detected loop in jump chain at 0x{target_addr:X}. Stopping resolution."
+                    f"[!] Detected loop in state chain: {' -> '.join(map(str, path))} -> {next_state}"
                 )
-                current_addr = (
-                    target_addr  # Break the loop but resolve to the loop start
-                )
-                break
+                # We break the loop by treating the loop's start as the final destination
+                resolved_cache[start_state] = next_state
+                return next_state
 
-            # Continue chasing the jump
-            current_addr = target_addr
-            visited_addrs.add(current_addr)
+            path.append(next_state)
+            current_state = next_state
 
-        if block_ea[state] != current_addr:
+        # The final state is the last one we visited
+        final_state = path[-1]
+
+        # Cache the result for all nodes in the path to speed up future lookups
+        for state in path:
+            resolved_cache[state] = final_state
+
+        return final_state
+
+    resolved_map = {}
+    for original_state in sorted(block_ea.keys()):
+        final_state = _trace_to_end(original_state)
+
+        if final_state not in block_ea:
+            # This can happen if a chain leads to an exit state not in the switch
             print(
-                f"[+]   State {state} (0x{block_ea[state]:X}) resolved to 0x{current_addr:X}"
+                f"[!] State {original_state} resolves to non-mappable state {final_state}. Preserving original target."
+            )
+            resolved_map[original_state] = block_ea[original_state]
+            continue
+
+        final_address = block_ea[final_state]
+        if original_state != final_state:
+            print(
+                f"[+]   State {original_state} (0x{block_ea[original_state]:X}) resolves to final state {final_state} (0x{final_address:X})"
             )
 
-        resolved_ea[state] = current_addr
+        resolved_map[original_state] = final_address
 
-    return resolved_ea
+    print("[+] Jump chain resolution complete.")
+    return resolved_map
 
 
 def get_switch_mapping(si: idaapi.switch_info_t, dispatcher_ea: int) -> dict[int, int]:
@@ -1127,89 +1222,38 @@ def ensure_mapped(tc: TritonContext, ea: int):
         )
 
 
-def run_solver(
-    tc: TritonContext,
-    si: idaapi.switch_info_t,
-    state_kind: str,
-    state_desc: tuple[str, str | int, int | None],
-    edges: set[Edge],
-    visited: set[int],
-):
+def map_all_segments(tc: TritonContext):
     """
-    Execute Triton until we've visited every switch case once or until
-    `max_steps` is reached.  Safe to call from any thread.
+    Maps all executable and read-only segments from the IDA database into the Triton context.
+    This ensures that calls to other functions within the same binary are valid.
     """
+    print("[+] Mapping all executable and read-only segments into Triton memory...")
+    mapped_count = 0
+    for seg_ea in idautils.Segments():
+        seg = idaapi.getseg(seg_ea)
+        # We need executable segments for code and read-only segments for data (like strings, constants)
+        if seg and (seg.perm & idaapi.SEGPERM_EXEC or seg.perm & idaapi.SEGPERM_READ):
+            seg_name = idaapi.get_segm_name(seg)
+            print(
+                f"[+] Mapping segment '{seg_name}' from 0x{seg.start_ea:X} to 0x{seg.end_ea:X}"
+            )
 
-    @CheckContinuePrompt(
-        metadata={"max_steps": MAX_STEPS},
-        cancel_func=lambda: None,
-        enable_prompt=True,
-    )
-    def worker():
-        print(f"[+] worker started")
-        prev_state = read_state(tc, state_kind, state_desc)
-        steps = 0
-        while steps < MAX_STEPS:
-            ip = tc.getConcreteRegisterValue(tc.registers.rip)
-            ensure_mapped(tc, ip)
-            # -- hard stop: left function -----------------------------
-            if not (FUNC_EA <= ip < FUNC_END):
-                print(f"[!] left function at 0x{ip:X}")
-                break
-            size = idc.get_item_size(ip)
-            mnem = idc.print_insn_mnem(ip)
-            # print(f"[+] ip: 0x{ip:X} - {mnem} - (size: {size})")
-            # 1) Detect helper CALLs early
-            if mnem == "call":
-                callee = idc.print_operand(ip, 0)
-                if callee:
-                    # ––– STUB –––
-                    rsp = tc.getConcreteRegisterValue(tc.registers.rsp) - 8
-                    tc.setConcreteRegisterValue(tc.registers.rsp, rsp)
-                    tc.setConcreteMemoryAreaValue(rsp, struct.pack("<Q", ip + size))
-                    tc.setConcreteRegisterValue(tc.registers.rax, 0)
-                    tc.setConcreteRegisterValue(tc.registers.rip, ip + size)
-
-                    continue  # skip tc.processing()
-            elif mnem == "nop" or mnem == "jmp":
-                tc.setConcreteRegisterValue(tc.registers.rip, ip + size)
-                continue
-
-            # -- single-step ------------------------------------------
             try:
-                instr = Instruction()
-                instr.setOpcode(idc.get_bytes(ip, 16))  # max
-                instr.setAddress(ip)
-                tc.processing(instr)
+                # Use a memory-safe way to get bytes
+                seg_bytes = ida_bytes.get_bytes(seg.start_ea, seg.end_ea - seg.start_ea)
+                if seg_bytes:
+                    tc.setConcreteMemoryAreaValue(seg.start_ea, seg_bytes)
+                    mapped_count += 1
+                else:
+                    print(
+                        f"[!] Warning: Segment '{seg_name}' at 0x{seg.start_ea:X} is empty or could not be read."
+                    )
             except Exception as e:
-                print(f"[!] Triton error @0x{ip:X}: {e}")
-                break
+                print(f"[!] Error mapping segment '{seg_name}': {e}")
 
-            steps += 1
-
-            # -- early stop on RET/JMP --------------------------------
-            if is_ret(ip) or is_uncond_jmp_reg(ip):
-                print(f"[!] early stop on RET/JMP @0x{ip:X}")
-                break
-
-            # -- record state change ----------------------------------
-            cur_state = read_state(tc, state_kind, state_desc)
-            if steps % 1000 == 0:
-                print(
-                    f"[+] 0x{ip:X} - cur_state: {cur_state}, prev_state: {prev_state}"
-                )
-            if cur_state != prev_state:
-                edges.add(Edge(prev_state, cur_state, ip))
-                prev_state = cur_state
-            visited.add(cur_state)
-            if len(visited) == si.ncases:
-                if cur_state == 0:
-                    print(f"[!] visited all {si.ncases} cases")
-                    break
-        print(f"[+] visited {len(edges)} edges in {steps} steps")
-
-    # run the worker in a cancel-able background job
-    ida_kernwin.execute_sync(worker, ida_kernwin.MFF_FAST)
+    if mapped_count == 0:
+        raise RuntimeError("Failed to map any segments into Triton. Cannot proceed.")
+    print(f"[+] Segment mapping complete. Mapped {mapped_count} segments.")
 
 
 def is_state_store(
@@ -1274,7 +1318,366 @@ def patch_head(
     print(f"[+] Dispatcher patched to jump to case {entry_state} at 0x{entry_ea:X}")
 
 
-def find_obfuscation_entry_point(func_ea: int) -> tuple[int, idaapi.switch_info_t, int]:
+def simplify_cfg_with_networkx(
+    cfunc: idaapi.cfunc_t,
+    dispatch_ea: int,
+    switch_info: idaapi.switch_info_t,
+    state_desc: tuple[str, Any, Any],
+    original_block_ea: dict[int, int],
+    G: nx.DiGraph,
+    pm: PatchManager,
+    stack_offset: int,
+):
+    """
+    Simplifies the CFG using the state graph from emulation.
+    This version contains the fix for the tail jump patching logic.
+    """
+    print("[+] Starting CFG simplification using NetworkX graph...")
+
+    # --- Step 1: Resolve all jump chains using the graph (Correct) ---
+    resolved_targets = {}
+    for start_node in G.nodes():
+        curr = start_node
+        path = [curr]
+        while G.out_degree(curr) > 0:
+            succ = list(G.successors(curr))[0]
+            if succ in path:
+                break
+            path.append(succ)
+            curr = succ
+        resolved_targets[start_node] = curr
+
+    print("[+] All state chains resolved.")
+
+    # --- Step 2: Patch dispatcher head to jump to the true entry point (Correct) ---
+    try:
+        entry_state = list(G.successors(0))[0]
+        final_entry_state = resolved_targets.get(entry_state, entry_state)
+        entry_ea = original_block_ea[final_entry_state]
+
+        head_start = switch_info.startea
+        head_end = dispatch_ea
+
+        disp = entry_ea - (head_start + 5)
+        patch = (
+            (b"\xe9" + struct.pack("<i", disp))
+            if -0x8000_0000 <= disp <= 0x7FFF_FFFF
+            else (b"\x48\xb8" + struct.pack("<Q", entry_ea) + b"\xff\xe0")
+        )
+
+        pm.add_patch(head_start, patch.ljust(head_end - head_start, b"\x90"))
+        pm.add_patch(dispatch_ea, b"\x90" * idaapi.get_item_size(dispatch_ea))
+        print(
+            f"[+] Dispatcher head patched to jump to final entry state {final_entry_state} (0x{entry_ea:X})"
+        )
+    except (IndexError, KeyError):
+        raise RuntimeError("Could not determine true entry point from graph.")
+
+    # --- Step 3: Patch all state transitions (Correct) ---
+    print("[+] Finding all state transitions using ctree...")
+
+    # Find the lvar_t object that corresponds to our state variable's stack offset.
+    state_lvar = None
+    target_offset = state_desc[1]  # The offset, e.g., 28
+    for lvar in cfunc.get_lvars():
+        if lvar.is_stk_var() and lvar.get_stkoff() - stack_offset == target_offset:
+            state_lvar = lvar
+            break
+
+    if not state_lvar:
+        raise RuntimeError(f"Could not find the lvar for stack offset {target_offset}")
+
+    print(
+        f"[+] Correctly identified state variable as '{state_lvar.name}' at offset {target_offset}."
+    )
+    visitor = StateStoreVisitor(state_lvar)
+    visitor.apply_to(cfunc.body, None)
+    print(f"[+] Found {len(visitor.found_stores)} state-setting instructions to patch.")
+
+    for addr, next_state_val in visitor.found_stores:
+        # print(f"[+] found store to state variable at 0x{addr:X} - {idc.generate_disasm_line(addr, 0)}")
+        # print(f"[+] next_state_val: {next_state_val} in {resolved_targets.keys()}? {next_state_val in resolved_targets}")
+        if next_state_val in resolved_targets:
+            final_target_state = resolved_targets[next_state_val]
+            # print(f"[+] final_target_state: {final_target_state} in {original_block_ea.keys()}? {final_target_state in original_block_ea}")
+            if final_target_state not in original_block_ea:
+                continue
+
+            target_ea = original_block_ea[final_target_state]
+            disp = target_ea - (addr + 5)
+            patch = (
+                (b"\xe9" + struct.pack("<i", disp))
+                if -0x8000_0000 <= disp <= 0x7FFF_FFFF
+                else (b"\x48\xb8" + struct.pack("<Q", target_ea) + b"\xff\xe0")
+            )
+
+            pm.add_patch(addr, patch.ljust(idaapi.get_item_size(addr), b"\x90"))
+            print(
+                f"[+]   0x{addr:X}: Patched `mov state, {next_state_val}` to jmp to final state {final_target_state} (0x{target_ea:X})"
+            )
+    return
+    # --- Step 4: NOP tail jumps to dispatcher (Corrected Logic) ---
+    print("[+] NOP'ing tail jumps back to dispatcher...")
+    nop_count = 0
+    # Used to identify jumps to the dispatcher, we're giving ourselves a 16 byte
+    # lookbehind. The end is the final 'jmp rax'. The start is a reasonable number of bytes
+    # before it to catch all setup instructions (mov, cmp, etc.).
+    # This avoids the unreliability of switch_info.startea.
+    head_start = switch_info.startea - 0x10
+
+    # Iterate through each case block's starting address
+    for state, ea in original_block_ea.items():
+        # Find the end of this block by finding the start of the next one.
+        # This is the robust way to do it.
+        next_block_start = min(
+            [addr for addr in original_block_ea.values() if addr > ea], default=FUNC_END
+        )
+
+        # The last instruction in our block is right before the next block starts.
+        tail_ea = idaapi.prev_head(next_block_start, ea)
+        if not tail_ea:
+            continue
+        # print(
+        #     f"[+] tail_ea: {hex(tail_ea)} is prev_head of {hex(next_block_start)}  {idc.generate_disasm_line(tail_ea, 0)}"
+        # )
+        # Check if this last instruction is a JMP instruction
+        insn = idautils.DecodeInstruction(tail_ea)
+        if insn is None or insn.itype != idaapi.NN_jmp:
+            continue
+        # Find where it jumps to
+        target_ea = idc.get_operand_value(tail_ea, 0)
+        # print(f"[+] target_ea {hex(target_ea)} from {hex(tail_ea)}")
+        # If the target is anywhere within the dispatcher's setup code, it's a tail jump.
+        # print(
+        #     f"[+] head_start: {hex(head_start)} <= target_ea: {hex(target_ea)} <= dispatch_ea: {hex(dispatch_ea)}"
+        # )
+        if head_start <= target_ea <= dispatch_ea:
+            jmp_size = idaapi.get_item_size(tail_ea)
+            pm.add_patch(tail_ea, b"\x90" * jmp_size)
+            nop_count += 1
+
+    print(f"[+] NOP'd {nop_count} tail jumps.")
+
+
+@functools.lru_cache()
+def get_rbp_offset_from_prologue(func_ea: int, prologue_size: int = 20) -> int:
+    """Extract the RBP offset from the function prologue.
+
+    The solver needs to operate with idautils.Heads(FUNC_EA) coordinates because
+    that's what Triton sees during execution. The power of IDA's decompiler as
+    a discovery tool to find semantically interesting variables is much easier to
+    work with, but we then translate them to execution coordinates.
+
+    To do that, we examine the prologue to find an RBP offset, if any. In particular,
+    we're looking for a lea rbp, [rsp+offset] instruction in the function prologue.
+
+    The offset is the value after the + sign.
+
+    For example, in the following code:
+
+    sub     rsp, 0A8h           ; Allocate 168 bytes on stack
+    lea     rbp, [rsp+80h]      ; Set RBP = RSP + 0x80 (128 bytes)
+
+    The offset is 0x80.
+
+    The following diagram illustrates the memory layout:
+
+            Original RSP (function entry)
+            |
+            | [168 bytes allocated by sub rsp, 0A8h]
+            |
+            v
+        Current RSP ──┐
+            |         │
+            |         │ 128 bytes (0x80)
+            |         │
+            v         │
+        RBP ──────────┘  [RBP = RSP + 0x80]
+            |
+            | [40 bytes above RBP]
+            |
+
+    The following diagram illustrates the memory layout on why we cannot use the
+    decompiler's `get_stkoff_delta()` to get the offset:
+
+            IDA's Internal Logic:
+            ┌─────────────────────────────────────┐
+            │ "This function uses RBP+0x80 setup" │ ← IDA's expectation
+            │ "This is normal, delta = 0"         │ ← get_stkoff_delta() = 0
+            └─────────────────────────────────────┘
+
+            Actual Memory Layout:
+            ┌─────────────────┐
+            │ Stack Bottom    │ ← IDA's reference point (offset 0)
+            │                 │
+            │ +128 bytes      │
+            │                 │
+            │ RBP             │ ← Raw instruction reference point
+            │                 │
+            │ [RBP+28] = +156 │ ← Same memory location, different coordinates
+            └─────────────────┘
+    """
+
+    ctx = TritonContext()
+    ctx.setArchitecture(ARCH.X86_64)
+    ctx.setMode(MODE.ALIGNED_MEMORY, True)
+
+    # Make RSP an unconstrained symbolic variable
+    ctx.symbolizeRegister(ctx.registers.rsp)
+
+    seen_mov_rbp = False
+    insn = Instruction()
+
+    for ea in idautils.Heads(func_ea, func_ea + prologue_size):
+        # grab up to 16 bytes at ea
+        raw = idaapi.get_bytes(ea, idaapi.get_item_size(ea))
+        if not raw:
+            continue
+
+        insn.setOpcode(raw)
+        insn.setAddress(ea)
+        ctx.processing(insn)  # execute symbolically
+
+        mnem = insn.getDisassembly().split()[0]
+
+        # --- Pattern A: lea rbp, [rsp+disp] ---
+        if (
+            mnem == "lea"
+            and insn.getOperands()[0].getType() == OPERAND.REG
+            and insn.getOperands()[0].getName() == "rbp"
+            and insn.getOperands()[1].getType() == OPERAND.MEM
+            and insn.getOperands()[1].getBaseRegister() == ctx.registers.rsp
+        ):
+
+            # AST for RBP now is: (bvadd (bvsub sym_rsp, <sub_imm>) <disp>)
+            ast = ctx.getSymbolicRegister(ctx.registers.rbp).getAst()
+            simp = ctx.simplify(ast)
+
+            # look for the small constant child under the ADD
+            for child in simp.getChildren():
+                if child.getType() == AST_NODE.BV and child.getBitvectorSize() <= 64:
+                    val = child.evaluate()
+                    # make sure it’s positive
+                    if val & (1 << 63) == 0:
+                        return val
+
+        # --- Pattern B: mov rbp, rsp → sub rsp, imm ---
+        if (
+            mnem == "mov"
+            and insn.getOperands()[0].getType() == OPERAND.REG
+            and insn.getOperands()[0].getName() == "rbp"
+            and insn.getOperands()[1].getType() == OPERAND.REG
+            and insn.getOperands()[1].getBaseRegister() == ctx.registers.rsp
+        ):
+            seen_mov_rbp = True
+            continue
+
+        if (
+            seen_mov_rbp
+            and mnem == "sub"
+            and insn.getOperands()[0].getType() == OPERAND.REG
+            and insn.getOperands()[0].getName() == "rsp"
+            and insn.getOperands()[1].getType() == OPERAND.IMM
+        ):
+            return insn.getOperands()[1].getValue()
+
+    # nothing found
+    return 0
+
+
+# def simplify_cfg_with_networkx(
+#     cfunc: idaapi.cfunc_t,
+#     dispatch_ea: int,
+#     switch_info: idaapi.switch_info_t,
+#     state_desc: tuple[str, Any, Any],
+#     original_block_ea: dict[int, int],
+#     G: nx.DiGraph,
+#     pm: PatchManager,
+# ):
+#     """
+#     Simplifies the CFG using the state graph from emulation.
+#     """
+#     print("[+] Starting CFG simplification using NetworkX graph...")
+
+#     # --- Step 1: Resolve all jump chains using the graph ---
+#     resolved_targets = {}
+#     for start_node in G.nodes():
+#         # Find the ultimate destination from this node.
+#         # For this obfuscation, paths are typically linear, so we just follow the chain.
+#         curr = start_node
+#         path = [curr]
+#         while G.out_degree(curr) > 0:
+#             # Assumes one successor, which is true for this pattern
+#             succ = list(G.successors(curr))[0]
+#             if succ in path:  # Loop detected
+#                 break
+#             path.append(succ)
+#             curr = succ
+#         resolved_targets[start_node] = curr  # The final node in the chain
+
+#     print("[+] All state chains resolved.")
+
+#     # --- Step 2: Patch dispatcher head to jump to the true entry point ---
+#     try:
+#         entry_state = list(G.successors(0))[0]
+#         final_entry_state = resolved_targets.get(entry_state, entry_state)
+#         entry_ea = original_block_ea[final_entry_state]
+
+#         head_start = switch_info.startea
+#         head_end = dispatch_ea
+
+#         disp = entry_ea - (head_start + 5)
+#         patch = (
+#             (b"\xe9" + struct.pack("<i", disp))
+#             if -0x8000_0000 <= disp <= 0x7FFF_FFFF
+#             else (b"\x48\xb8" + struct.pack("<Q", entry_ea) + b"\xff\xe0")
+#         )
+
+#         pm.add_patch(head_start, patch.ljust(head_end - head_start, b"\x90"))
+#         pm.add_patch(dispatch_ea, b"\x90" * idaapi.get_item_size(dispatch_ea))
+#         print(
+#             f"[+] Dispatcher head patched to jump to final entry state {final_entry_state} (0x{entry_ea:X})"
+#         )
+#     except (IndexError, KeyError):
+#         raise RuntimeError("Could not determine true entry point from graph.")
+
+#     # --- Step 3: Patch all state transitions (`mov state, X`) ---
+#     state_var_lvar = cfunc.get_lvars()[state_desc[1]]
+#     visitor = StateStoreVisitor(state_var_lvar)
+#     visitor.apply_to(cfunc.body, None)
+
+#     for addr, next_state_val in visitor.found_stores:
+#         if next_state_val in resolved_targets:
+#             final_target_state = resolved_targets[next_state_val]
+#             target_ea = original_block_ea[final_target_state]
+
+#             disp = target_ea - (addr + 5)
+#             patch = (
+#                 (b"\xe9" + struct.pack("<i", disp))
+#                 if -0x8000_0000 <= disp <= 0x7FFF_FFFF
+#                 else (b"\x48\xb8" + struct.pack("<Q", target_ea) + b"\xff\xe0")
+#             )
+
+#             pm.add_patch(addr, patch.ljust(idaapi.get_item_size(addr), b"\x90"))
+#             print(
+#                 f"[+]   0x{addr:X}: Patched `mov state, {next_state_val}` to jmp to final state {final_target_state} (0x{target_ea:X})"
+#             )
+
+#     # --- Step 4: NOP tail jumps to dispatcher ---
+#     # This logic can remain simple as it's just cleanup.
+#     head_start = switch_info.startea
+#     for ea in original_block_ea.values():
+#         block_end = idaapi.get_func(ea).get_chunk(ea).end_ea
+#         tail_ea = idaapi.prev_head(block_end, ea)
+#         if tail_ea and idaapi.get_byte(tail_ea) in (0xE9, 0xEB):
+#             target = idaapi.get_first_dref_from(tail_ea)
+#             if head_start <= target <= dispatch_ea:
+#                 pm.add_patch(tail_ea, b"\x90" * idaapi.get_item_size(tail_ea))
+
+
+def find_obfuscation_entry_point(
+    func_ea: int,
+) -> tuple[ida_hexrays.cfuncptr_t, int, idaapi.switch_info_t, int]:
     """
     Analyzes the decompiled C-tree to find the main state machine dispatcher
     and the argument value required to enter it.
@@ -1307,7 +1710,7 @@ def find_obfuscation_entry_point(func_ea: int) -> tuple[int, idaapi.switch_info_
             raise RuntimeError(
                 f"Could not get switch info for dispatcher at 0x{main_dispatcher_insn.ea:X}"
             )
-        return main_dispatcher_insn.ea, main_dispatcher_si, 1
+        return cfunc, main_dispatcher_insn.ea, main_dispatcher_si, 1
 
     pre_dispatcher_insn = None
     main_dispatcher_insn = None
@@ -1340,7 +1743,7 @@ def find_obfuscation_entry_point(func_ea: int) -> tuple[int, idaapi.switch_info_
     main_dispatcher_expr = main_dispatcher_insn.expr  # type: ignore
     if main_dispatcher_expr.op != ida_hexrays.cot_var:  # type: ignore
         print("Main dispatcher does not switch on a simple variable.")
-        return None, None, None  # type: ignore
+        return None, None, None, None  # type: ignore
 
     state_var_idx = main_dispatcher_expr.v.idx
     state_var_name = lvars[state_var_idx].name
@@ -1367,18 +1770,202 @@ def find_obfuscation_entry_point(func_ea: int) -> tuple[int, idaapi.switch_info_
                 )
 
             print(f"[+] Found trigger value: {trigger_value}")
-            return main_dispatcher_insn.expr.ea, main_dispatcher_si, trigger_value  # type: ignore
+            return cfunc, main_dispatcher_insn.expr.ea, main_dispatcher_si, trigger_value  # type: ignore
 
     print("Could not find a path from pre-dispatcher to main dispatcher!")
-    return None, None, None  # type: ignore
+    return None, None, None, None  # type: ignore
+
+
+def run_solver(
+    tc: TritonContext,
+    si: idaapi.switch_info_t,
+    state_kind: str,
+    state_desc: tuple[str, str | int, int | None],
+    G: nx.DiGraph,
+    mapper: IDAToTritonRegisterMapper,  # The mapper is part of the solver's context
+):
+    """
+    Execute Triton until we've visited every switch case once or until
+    `max_steps` is reached.  Safe to call from any thread.
+    """
+
+    def within_function(ip: int) -> bool:
+        return FUNC_EA <= ip < FUNC_END
+
+    @CheckContinuePrompt(
+        metadata={"max_steps": MAX_STEPS},
+        cancel_func=lambda: None,
+        enable_prompt=True,
+    )
+    def worker():
+        print("[+] Worker started with call-aware emulation loop.")
+
+        # We only care about state changes that happen *inside* the target function.
+        # Initialize prev_state when we are inside.
+        prev_state = read_state(tc, state_kind, state_desc)
+        G.add_node(prev_state)
+
+        steps = 0
+        call_depth = 0  # Start at depth 0, in the main function.
+
+        ip = tc.getConcreteRegisterValue(tc.registers.rip)
+
+        while steps < MAX_STEPS:
+            # print(f"[+] ip: 0x{ip:X} - {steps}")
+
+            # Stop condition: if we return from the initial function call.
+            if call_depth < 0:
+                print(
+                    f"[+] Emulation returned from initial function at 0x{ip:X}. Stopping."
+                )
+                break
+
+            # Ensure memory is mapped for the current instruction
+            ensure_mapped(tc, ip)
+
+            try:
+                size = idaapi.get_item_size(ip)
+                if not size:
+                    print(f"[!] Could not get instruction size at 0x{ip:X}. Stopping.")
+                    break
+                opcode = ida_bytes.get_bytes(ip, size)
+                if not opcode:
+                    print(
+                        f"[!] Could not read instruction bytes at 0x{ip:X}. Stopping."
+                    )
+                    break
+            except Exception as e:
+                print(f"[!] Error reading instruction at 0x{ip:X}: {e}")
+                break
+
+            # Create and process the instruction
+            instr = Instruction()
+            instr.setAddress(ip)
+            instr.setOpcode(opcode)
+            mnem = idc.print_insn_mnem(ip)
+
+            # 1. Stub calls
+            # if mnem == "call":
+            #     # Manually simulate the call instruction's effect on the stack
+            #     rsp = tc.getConcreteRegisterValue(tc.registers.rsp) - 8
+            #     tc.setConcreteRegisterValue(tc.registers.rsp, rsp)
+            #     # Push a fake return address (the next instruction)
+            #     tc.setConcreteMemoryValue(rsp, ip + size)
+            #     # Set a default return value (usually 0)
+            #     tc.setConcreteRegisterValue(tc.registers.rax, 0)
+            #     # Manually advance the instruction pointer
+            #     tc.setConcreteRegisterValue(tc.registers.rip, ip + size)
+            #     print(f"[+] Stubbed call at 0x{ip:X}, continuing at 0x{ip + size:X}")
+            #     # Update ip and skip the rest of the loop
+            #     ip = ip + size
+            #     steps += 1
+            #     continue
+
+            # print(f"[+] ip: 0x{ip:X} - {mnem} - (size: {size})")
+            # 1) Detect helper CALLs early
+            if mnem == "call":
+                callee = idc.print_operand(ip, 0)
+                if callee:
+
+                    # ––– STUB –––
+                    rsp = tc.getConcreteRegisterValue(tc.registers.rsp) - 8
+                    tc.setConcreteRegisterValue(tc.registers.rsp, rsp)
+                    tc.setConcreteMemoryAreaValue(rsp, struct.pack("<Q", ip + size))
+                    tc.setConcreteRegisterValue(tc.registers.rax, 0)
+                    print(f"[+] callee:  - stubbed to 0x{ip + size:X} @0x{ip:X}")
+                    ip = ip + size
+                    steps += 1
+                    continue  # skip tc.processing()
+            elif mnem == "nop":
+                # print(f"[+] nop @0x{ip:X}")
+                ip = ip + size
+                steps += 1
+                continue
+
+            # 2. Early exit on RET/JMP to outside the function
+            if is_ret(ip):
+                ret_addr = tc.getConcreteMemoryValue(
+                    tc.getConcreteRegisterValue(tc.registers.rsp)
+                )
+                if not within_function(ret_addr):
+                    print(f"[!] Early stop on RET @0x{ip:X} to 0x{ret_addr:X}")
+                    break
+
+            if is_uncond_jmp_reg(ip):
+                # This is tricky as we don't know the register's value without emulation.
+                # We'll let tc.processing handle it and the loop condition will catch the exit.
+                pass
+
+            # Track call depth
+            if False and instr.isControlFlow():
+                if mnem == "call":
+                    call_depth += 1
+                elif mnem == "ret":
+                    call_depth -= 1
+
+            try:
+                tc.processing(instr)
+                # print(
+                #     f"[!] Triton failed to process instruction at 0x{ip:X}: {instr.getDisassembly()}"
+                # )
+                # break
+            except Exception as e:
+                print(
+                    f"[!] Triton exception at 0x{ip:X}:  {instr.getDisassembly()} - error message: {e}"
+                )
+                traceback.print_exc()
+                break
+
+            steps += 1
+            if steps % 1000 == 0:
+                print(
+                    f"[+] 0x{ip:X} - cur_state: {cur_state}, prev_state: {prev_state}"
+                )
+            # Get the next instruction pointer from the emulator
+            next_ip = tc.getConcreteRegisterValue(tc.registers.rip)
+
+            # --- STATE CHANGE RECORDING ---
+            # We only care about state transitions that are committed *inside* the target function.
+            if within_function(ip):
+                cur_state = read_state(tc, state_kind, state_desc)
+                if cur_state != prev_state:
+                    if not G.has_node(cur_state):
+                        print(f"[+] Discovered new state: {cur_state}")
+
+                    G.add_node(prev_state)
+                    G.add_node(cur_state)
+                    G.add_edge(prev_state, cur_state, ip=ip)
+
+                    print(
+                        f"[+] State transition: {prev_state} -> {cur_state} at 0x{ip:X} ({G.number_of_nodes()} nodes, {G.number_of_edges()} edges)"
+                    )
+                    prev_state = cur_state
+
+                # --- Intelligent Stop Condition ---
+                if G.number_of_nodes() >= si.ncases:
+                    if G.has_node(cur_state) and G.out_degree(cur_state) > 0:
+                        print(
+                            f"[+] All {si.ncases} states discovered and returned to a known path. Stopping."
+                        )
+                        break
+
+            # Update ip for the next iteration
+            ip = next_ip
+
+        print(
+            f"[+] Solver finished. Graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges in {steps} steps."
+        )
+
+    # run the worker in a cancel-able background job
+    ida_kernwin.execute_sync(worker, ida_kernwin.MFF_FAST)
 
 
 def main():
 
     print(f"[+] analysing 0x{FUNC_EA:X}..0x{FUNC_END:X}")
 
-    dispatch_ea, switch_info, seed_value = find_obfuscation_entry_point(FUNC_EA)
-    if not all((dispatch_ea, switch_info, seed_value)):
+    cfunc, dispatch_ea, switch_info, seed_value = find_obfuscation_entry_point(FUNC_EA)
+    if not all((cfunc, dispatch_ea, switch_info, seed_value)):
         raise RuntimeError("Failed to find obfuscation entry point")
 
     print(f"[+] Main dispatcher at 0x{dispatch_ea:X} -> {switch_info.ncases} cases")
@@ -1387,27 +1974,47 @@ def main():
     # Initialize Triton
     tc = TritonContext()
     tc.setArchitecture(ARCH.X86_64)
+    print("[+] Disabling strict memory alignment enforcement.")
     tc.setMode(MODE.ALIGNED_MEMORY, True)
     tc.setMode(MODE.SYMBOLIZE_LOAD, False)
     tc.setMode(MODE.SYMBOLIZE_STORE, False)
     mapper = IDAToTritonRegisterMapper(tc)
 
-    tc.addCallback(CALLBACK.GET_CONCRETE_MEMORY_VALUE, hook_call)
+    # tc.addCallback(CALLBACK.GET_CONCRETE_MEMORY_VALUE, hook_call)
 
-    # Load the function's bytes into Triton memory
-    for ea in idautils.FuncItems(FUNC_EA):
-        tc.setConcreteMemoryAreaValue(ea, idc.get_bytes(ea, idc.get_item_size(ea)))
+    map_all_segments(tc)
 
+    print(f"[+] Mapping fake TEB at 0x{TEB_AREA:X} to handle gs:[offset] accesses.")
+    tc.setConcreteMemoryAreaValue(TEB_AREA, bytearray(TEB_SIZE))
+    tc.setConcreteRegisterValue(tc.registers.gs, TEB_AREA)
+    # Map the dummy region for the pointer argument in RCX
+    print(
+        f"[+] Mapping dummy region for first argument pointer at 0x{DUMMY_ARG_REGION:X}"
+    )
+    tc.setConcreteMemoryAreaValue(DUMMY_ARG_REGION, bytearray(DUMMY_ARG_SIZE))
+    # print(f"[+] Mapping fake stack at 0x{STACK_TOP - STACK_SIZE:X} to 0x{STACK_TOP:X}")
     tc.setConcreteMemoryAreaValue(STACK_TOP - STACK_SIZE, bytearray(STACK_SIZE))
+
+    # Set RIP to the function's entry point
     tc.setConcreteRegisterValue(tc.registers.rip, FUNC_EA)
-    tc.setConcreteRegisterValue(tc.registers.rsp, STACK_TOP)  # dummy stack
+
+    # Per the x64 ABI, RSP must be (16*N + 8) aligned upon function entry
+    # to account for the 8-byte return address pushed by the CALL instruction.
+    initial_rsp = STACK_TOP - 8
+    print(
+        f"[+] Setting initial RSP to 16-byte aligned 0x{initial_rsp:X} for non-standard prologue."
+    )
+    tc.setConcreteRegisterValue(tc.registers.rsp, initial_rsp)
+
+    # RBP is usually set in the prologue, but starting it at the stack top is a safe default.
     tc.setConcreteRegisterValue(tc.registers.rbp, STACK_TOP)
 
     # Seed argument in correct register (Windows x64: RCX, RDX)
-    tc.setConcreteRegisterValue(tc.registers.rcx, 0x600000)  # fake &bytecodeTable
+    tc.setConcreteRegisterValue(tc.registers.rcx, DUMMY_ARG_REGION)
     tc.setConcreteRegisterValue(tc.registers.rdx, seed_value)
 
-    state_kind, *state_desc = guess_state_var(dispatch_ea)
+    stack_offset = get_rbp_offset_from_prologue(FUNC_EA)
+    state_kind, *state_desc = guess_state_var2(cfunc, dispatch_ea, stack_offset)
     print(f"[+] state variable is a {state_kind}: {state_desc}")
 
     # If the state variable lives on the stack, give it an initial value 0.
@@ -1420,89 +2027,32 @@ def main():
 
     edges: set[Edge] = set()
     visited: set[int] = set()
+
+    G = nx.DiGraph()
+    run_solver(tc, switch_info, state_kind, state_desc, G, mapper)  # type: ignore
+    # run_solver(tc, switch_info, state_kind, state_desc, edges, visited)  # type: ignore
+
+    for edge in edges:
+        print("edge", hex(edge.src), hex(edge.dst), hex(edge.ip))
+    for v in visited:
+        print("visited", hex(v))
+    if G.number_of_edges() == 0:
+        print("Emulation did not produce any state transitions. Cannot deobfuscate.")
+        return
+
     original_block_ea: dict[int, int] = get_switch_mapping(switch_info, dispatch_ea)
-    block_ea = simplify_control_flow_graph(original_block_ea, FUNC_END)
-    run_solver(tc, switch_info, state_kind, state_desc, edges, visited)  # type: ignore
-
-    # Find the true entry state from the emulation trace.
-    # It's the destination state from the initial state (which we presume is 0).
-    # TODO: what if the initial state is not 0?
-    try:
-        entry_state = next(edge.dst for edge in edges if edge.src == 0)
-    except StopIteration:
-        raise RuntimeError(
-            "Could not determine the entry state from the emulation trace. "
-            "The state machine may not have been entered correctly."
-        )
-
-    print(f"[+] True entry state determined to be: {entry_state}")
-
     pm = PatchManager(dry_run=not ENABLE_PATCHING)
 
-    print("[+] Preserving pre-dispatcher logic at case 0")
-
-    for state in sorted(original_block_ea.keys()):  # Iterate over original states
-        ea = original_block_ea[state]  # The physical address of the block
-
-        # Determine block end (next physical block or function end)
-        next_state_addr = min(
-            [addr for addr in original_block_ea.values() if addr > ea], default=FUNC_END
-        )
-
-        # Patch all mov [state], imm instructions within this physical block
-        for head in idautils.Heads(ea, next_state_addr):
-            if not is_state_store(head, state_desc):  # type: ignore
-                continue
-
-            imm = idc.get_operand_value(head, 1)
-            if imm not in block_ea:  # Use the resolved map here
-                # This state transition leads to a block we couldn't map.
-                # Could be an exit state.
-                print(
-                    f"[+] 0x{head:X}: Skipping state store (imm {imm} not in block map)"
-                )
-                continue
-
-            # Get the *final* target from our simplified map
-            target_ea = block_ea[imm]
-
-            disp = target_ea - (head + 5)
-            if -0x8000_0000 <= disp <= 0x7FFF_FFFF:
-                patch = b"\xe9" + struct.pack("<i", disp)
-            else:
-                patch = b"\x48\xb8" + struct.pack("<Q", target_ea) + b"\xff\xe0"
-            mov_size = idc.get_item_size(head)
-            pm.add_patch(head, patch.ljust(mov_size, b"\x90"))
-            print(f"[+] 0x{head:X}: Patched mov [state], {imm} to jmp 0x{target_ea:X}")
-
-        # Patch the tail jump to NOPs ONLY if it's a jmp to the main dispatcher
-        tail_ea = idc.prev_head(next_state_addr, ea)
-        insn = idaapi.insn_t()
-        if idaapi.decode_insn(insn, tail_ea) and insn.itype == ida_allins.NN_jmp:
-            # Check if it's an unconditional jmp (not a jcc)
-            # For x86/x64, NN_jmp is unconditional.
-
-            # Get the jump target address
-            op = insn.ops[0]  # type: ignore
-            target_ea = idaapi.BADADDR
-            if op.type == idaapi.o_near:
-                target_ea = op.addr
-
-            # Only patch the jump if it explicitly goes back to the dispatcher head
-            if target_ea == dispatch_ea:
-                jmp_size = idc.get_item_size(tail_ea)
-                pm.add_patch(tail_ea, b"\x90" * jmp_size)
-                print(f"[+] 0x{tail_ea:X}: Tail jump to dispatcher patched to NOPs")
-            else:
-                # This is a jump, but not to our dispatcher. Leave it alone.
-                # This is critical for preserving the logic of nested dispatchers.
-                print(
-                    f"[+] 0x{tail_ea:X}: Skipping tail jump patch (target is 0x{target_ea:X}, not dispatcher)"
-                )
-        else:
-            # The last instruction is not a jmp, so there's nothing to patch.
-            # This is expected for blocks that end in 'retn'.
-            print(f"[+] 0x{tail_ea:X}: Skipping tail patch (not a jmp instruction)")
+    simplify_cfg_with_networkx(
+        cfunc,
+        dispatch_ea,
+        switch_info,
+        state_desc,
+        original_block_ea,
+        G,
+        pm,
+        stack_offset,
+    )
 
     pm.apply_all()
 
