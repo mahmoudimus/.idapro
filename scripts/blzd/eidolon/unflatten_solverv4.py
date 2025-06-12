@@ -43,7 +43,7 @@ logging.basicConfig(level=logging.DEBUG)
 FUNC = idaapi.get_func(idaapi.get_screen_ea())
 FUNC_EA = FUNC.start_ea  # start EA
 FUNC_END = FUNC.end_ea
-ENABLE_PATCHING = False  # True → rewrite code
+ENABLE_PATCHING = True  # True → rewrite code
 MAX_STEPS = 250000  # safety
 GRAPH_DOT = False
 
@@ -657,23 +657,22 @@ class CTreeContainsVisitor(ida_hexrays.ctree_visitor_t):
         ]
 
     def visit_insn(self, insn: ida_hexrays.cinsn_t) -> TraversalEnum:
+        if self.found:
+            return TraversalEnum.STOP  # Stop traversal
+
         print(
             "looking for",
             self.state_var_idx,
             " and im currently at",
+            hex(insn.ea),
             idc.generate_disasm_line(insn.ea, 0),
         )
         print(
-            insn.op,
-            " looking for",
-            ida_hexrays.cot_asg,
-            " -- ",
-            idc.get_operand_value(insn.ea, 0),
-            " ++ ",
-            idc.get_operand_value(insn.ea, 1),
+            "current insn is:",
+            insn.opname,
+            "looking for",
+            f"cot_asg (assignment) ({ida_hexrays.cot_asg})",
         )
-        if self.found:
-            return TraversalEnum.STOP  # Stop traversal
         # We are looking for an assignment instruction, e.g., `v1 = 0;`
         if insn.cexpr is not None and insn.cexpr.op == ida_hexrays.cot_asg:
             print(
@@ -1344,7 +1343,7 @@ def simplify_cfg_with_networkx(
         # The pre-dispatcher is the first switch in the function.
         if not pre_dispatcher_si:
             raise RuntimeError("Could not find pre-dispatcher switch info.")
-        
+
         # We patch the main dispatcher's switch_info start, which is the
         # jump table for the state machine. This is correct.
         pre_dispatcher_start = pre_dispatcher_si.startea
@@ -1585,77 +1584,129 @@ def get_rbp_offset_from_prologue(func_ea: int, prologue_size: int = 20) -> int:
     return 0
 
 
-def find_obfuscation_entry_points(
+def find_obfuscation_entry_point(
     func_ea: int,
-) -> tuple[
-    ida_hexrays.cfuncptr_t, idaapi.switch_info_t, idaapi.switch_info_t, dict[int, bool]
-]:
+) -> tuple[ida_hexrays.cfuncptr_t, int, idaapi.switch_info_t, int]:
     """
-    Analyzes the C-tree to find the main dispatcher and ALL argument values
-    that lead into different logical paths.
+    Analyzes the decompiled C-tree to find the main state machine dispatcher
+    and the argument value required to enter it.
 
     Returns:
-        A tuple of (cfunc, main_dispatcher_ea, main_dispatcher_si, entry_points).
-        entry_points is a dict of {seed_value: is_main_dispatcher_trigger}.
+        A tuple of (main_dispatcher_ea, main_dispatcher_si, trigger_seed_value).
     """
     try:
         cfunc = ida_hexrays.decompile(func_ea)
     except ida_hexrays.DecompilationFailure:
         raise RuntimeError(f"Failed to decompile function at 0x{func_ea:X}")
 
+    if not cfunc:
+        raise RuntimeError(f"Could not decompile function at 0x{func_ea:X}")
+
     finder = CTreeSwitchFinder()
-    finder.apply_to(cfunc.body, None)
+    finder.apply_to(cfunc.body, None)  # type: ignore
     all_switches = finder.switches
 
     if not all_switches:
         raise RuntimeError("Could not find any switch dispatcher in the function.")
 
-    # Find the pre-dispatcher (switches on an argument) and main dispatcher
+    if len(all_switches) == 1:
+        print("[+] Found a single switch dispatcher. Assuming default seed.")
+        main_dispatcher_insn = all_switches[0]
+        # CORRECT: Address is on the expression.
+        main_dispatcher_ea = main_dispatcher_insn.expr.ea  # type: ignore
+        main_dispatcher_si = idaapi.get_switch_info(main_dispatcher_ea)
+        if not main_dispatcher_si:
+            raise RuntimeError(
+                f"Could not get switch info for dispatcher at 0x{main_dispatcher_insn.ea:X}"
+            )
+        return cfunc, main_dispatcher_insn.ea, main_dispatcher_si, 1
+
     pre_dispatcher_insn = None
     main_dispatcher_insn = None
     lvars = cfunc.get_lvars()
+
     for s_insn in all_switches:
-        if s_insn.expr.op == ida_hexrays.cot_var:
-            var_idx = s_insn.expr.v.idx
+        is_on_argument = False
+        # Access the switch data via .cswitch
+        if s_insn.expr.op == ida_hexrays.cot_var:  # type: ignore
+            var_idx = s_insn.expr.v.idx  # type: ignore
             if lvars[var_idx].is_arg_var:
-                pre_dispatcher_insn = s_insn
-            else:
-                main_dispatcher_insn = s_insn
+                is_on_argument = True
+
+        if is_on_argument:
+            pre_dispatcher_insn = s_insn
+        else:
+            main_dispatcher_insn = s_insn
 
     if not pre_dispatcher_insn or not main_dispatcher_insn:
-        print(
-            "[!] Could not reliably identify dispatchers. Assuming first is pre-dispatcher."
-        )
         pre_dispatcher_insn, main_dispatcher_insn = all_switches[0], all_switches[1]
-
-    main_dispatcher_ea = main_dispatcher_insn.expr.ea
-    main_dispatcher_si = idaapi.get_switch_info(main_dispatcher_ea)
-    pre_dispatcher_si = idaapi.get_switch_info(pre_dispatcher_insn.expr.ea)
-    if not main_dispatcher_si:
-        raise RuntimeError(
-            f"Could not get switch info for dispatcher at 0x{main_dispatcher_ea:X}"
+        print(
+            "[!] Could not identify dispatchers by variable type, falling back to order."
         )
-    if not pre_dispatcher_si:
-        raise RuntimeError(
-            f"Could not get switch info for pre-dispatcher at 0x{pre_dispatcher_insn.expr.ea:X}"
-        )
+    # print(dir(pre_dispatcher_insn))
+    # Use .ea to get the address for printing and analysis
+    print(f"[+] Identified pre-dispatcher at 0x{pre_dispatcher_insn.expr.ea:X}")  # type: ignore
+    print(f"[+] Identified main dispatcher at 0x{main_dispatcher_insn.expr.ea:X}")  # type: ignore
 
-    state_var_idx = main_dispatcher_insn.expr.v.idx
-    entry_points = {}  # { seed: is_main_logic }
+    # Identify the state variable from the main dispatcher's expression
+    main_dispatcher_expr = main_dispatcher_insn.expr  # type: ignore
+    if main_dispatcher_expr.op != ida_hexrays.cot_var:  # type: ignore
+        print("Main dispatcher does not switch on a simple variable.")
+        return None, None, None, None  # type: ignore
 
-    # Find all cases in the pre-dispatcher
-    for case in pre_dispatcher_insn.cases:
+    state_var_idx = main_dispatcher_expr.v.idx
+    state_var_name = lvars[state_var_idx].name
+    print(
+        f"[+] Main state variable identified as '{state_var_name}' (index {state_var_idx})"
+    )
+
+    # Now, search each case of the pre-dispatcher for an assignment to this variable
+    for case in pre_dispatcher_insn.cases:  # type: ignore
         checker = CTreeContainsVisitor(state_var_idx)
-        checker.apply_to(case, None)
-        is_main_trigger = checker.found
+        checker.apply_to(case, pre_dispatcher_insn.expr)  # type: ignore
+        if checker.found:
+            print(f"[+] Found state variable initialization in case at 0x{case.ea:X}")
+            if not case.values:
+                raise RuntimeError(
+                    "Main dispatcher is in the default case, cannot determine seed."
+                )
 
-        for val in case.values:
-            entry_points[val] = is_main_trigger
-            print(
-                f"[+] Found entry point: a2 == {val} (triggers main logic: {is_main_trigger})"
-            )
+            trigger_value = case.values[0]
+            main_dispatcher_si = idaapi.get_switch_info(main_dispatcher_insn.expr.ea)  # type: ignore
+            if not main_dispatcher_si:
+                raise RuntimeError(
+                    f"Could not get switch info for dispatcher at 0x{main_dispatcher_insn.ea:X}"
+                )
 
-    return cfunc, pre_dispatcher_si, main_dispatcher_si, entry_points
+            print(f"[+] Found trigger value: {trigger_value}")
+            return cfunc, main_dispatcher_insn.expr.ea, main_dispatcher_si, trigger_value  # type: ignore
+
+    print("Could not find a path from pre-dispatcher to main dispatcher!")
+    return None, None, None, None  # type: ignore
+
+
+def find_main_dispatcher(
+    cfunc: ida_hexrays.cfuncptr_t,
+) -> tuple[int, idaapi.switch_info_t, int]:
+    """
+    Finds the main state machine dispatcher switch in the function.
+    The main dispatcher is the one that does NOT operate on a function argument.
+    """
+    lvars = cfunc.get_lvars()
+    finder = CTreeSwitchFinder()
+    finder.apply_to(cfunc.body, None)
+
+    for s_insn in finder.switches:
+        if s_insn.expr.op == ida_hexrays.cot_var:
+            var_idx = s_insn.expr.v.idx
+            if not lvars[var_idx].is_arg_var:
+                # This is our main dispatcher
+                main_si = idaapi.get_switch_info(s_insn.expr.ea)
+                if main_si:
+                    print(f"[+] Found main dispatcher switch at 0x{s_insn.expr.ea:X}")
+                    return s_insn.expr.ea, main_si, var_idx
+
+    raise RuntimeError("Could not find the main dispatcher switch.")
 
 
 def run_solver(
@@ -1826,121 +1877,180 @@ def run_solver(
 
 
 def main():
-    print(f"[+] analysing 0x{FUNC_EA:X}..0x{FUNC_END:X}")
+    print(f"[+] analyzing 0x{FUNC_EA:X}..0x{FUNC_END:X}")
 
-    cfunc, pre_dispatcher_si, main_dispatcher_si, entry_points = (
-        find_obfuscation_entry_points(FUNC_EA)
-    )
-    if not all((cfunc, pre_dispatcher_si, main_dispatcher_si, entry_points)):
-        raise RuntimeError("Failed to find obfuscation entry points")
+    try:
+        cfunc = ida_hexrays.decompile(FUNC_EA)
+    except ida_hexrays.DecompilationFailure:
+        raise RuntimeError(f"Failed to decompile function at 0x{FUNC_EA:X}")
 
-    dispatch_ea = main_dispatcher_si.jumps  # The address of the jmp instruction
+    # --- Step 1 & 2: Find the main dispatcher and the state variable ---
+    lvars = cfunc.get_lvars()
+    finder = CTreeSwitchFinder()
+    finder.apply_to(cfunc.body, None)
+
+    main_dispatcher_switch = None
+    pre_dispatcher_switch = None
+
+    for s_insn in finder.switches:
+        if s_insn.expr.op == ida_hexrays.cot_var:
+            var_idx = s_insn.expr.v.idx
+            if lvars[var_idx].is_arg_var:
+                pre_dispatcher_switch = s_insn
+            else:
+                main_dispatcher_switch = s_insn
+
+    if not main_dispatcher_switch or not pre_dispatcher_switch:
+        raise RuntimeError("Could not distinguish pre-dispatcher and main dispatcher.")
+
+    main_dispatcher_si = idaapi.get_switch_info(main_dispatcher_switch.expr.ea)
+    state_var_idx = main_dispatcher_switch.expr.v.idx
+    state_lvar = cfunc.get_lvars()[state_var_idx]
+    dispatch_ea = main_dispatcher_switch.expr.ea
+    print(f"[+] Main dispatcher at 0x{dispatch_ea:X} on var '{state_lvar.name}'")
+
+    # --- Step 3: Isolate the 'case 1' block and find the state-set within it ---
+    case_1_block = pre_dispatcher_switch.cases[0]
+    target_seed = case_1_block.values[0]
+
+    entry_visitor = StateStoreVisitor(state_lvar)
+    entry_visitor.apply_to(case_1_block, None)
+    if not entry_visitor.found_stores:
+        raise RuntimeError(
+            f"Could not find the state-setting instruction within 'case {target_seed}:'"
+        )
+
+    true_entry_patch_addr, initial_state_val = entry_visitor.found_stores[0]
     print(
-        f"[+] Main dispatcher at 0x{main_dispatcher_si.startea:X} -> {main_dispatcher_si.ncases} cases"
+        f"[+] Found true entry point: instruction at 0x{true_entry_patch_addr:X} sets state to {initial_state_val}"
     )
 
-    # This graph will hold the combined results of all emulation runs
-    G_combined = nx.DiGraph()
+    # --- Step 4: Emulate to build the graph ---
+    print(f"[+] Emulating with seed value a2 = {target_seed} to trace the main logic.")
+    tc = TritonContext()
+    tc.setArchitecture(ARCH.X86_64)
+    tc.setMode(MODE.ALIGNED_MEMORY, False)  # Keep this for robustness
+    mapper = IDAToTritonRegisterMapper(tc)
+
+    map_all_segments(tc)
+    tc.setConcreteMemoryAreaValue(TEB_AREA, bytearray(TEB_SIZE))
+    tc.setConcreteRegisterValue(tc.registers.gs, TEB_AREA)
+    tc.setConcreteMemoryAreaValue(DUMMY_ARG_REGION, bytearray(DUMMY_ARG_SIZE))
+    tc.setConcreteMemoryAreaValue(STACK_TOP - STACK_SIZE, bytearray(STACK_SIZE))
+
+    tc.setConcreteRegisterValue(tc.registers.rip, FUNC_EA)
+    tc.setConcreteRegisterValue(tc.registers.rsp, STACK_TOP - 8)
+    tc.setConcreteRegisterValue(tc.registers.rbp, STACK_TOP)
+
+    # Set the arguments for this specific run
+    tc.setConcreteRegisterValue(tc.registers.rcx, DUMMY_ARG_REGION)
+    tc.setConcreteRegisterValue(tc.registers.rdx, target_seed)
 
     stack_offset = get_rbp_offset_from_prologue(FUNC_EA)
     state_kind, *state_desc = guess_state_var2(cfunc, dispatch_ea, stack_offset)
     print(f"[+] State variable is a {state_kind}: {state_desc}")
 
-    for seed_value, is_main_trigger in entry_points.items():
-        print("-" * 60)
-        print(f"[+] Emulating path for entry seed: {seed_value}")
+    G = nx.DiGraph()
+    run_solver(tc, main_dispatcher_si, state_kind, state_desc, G, mapper)  # type: ignore
 
-        # Don't bother emulating non-main paths if they don't set the state
-        if not is_main_trigger:
-            print("[+] Path does not trigger main state machine. Skipping emulation.")
-            # In a more complex scenario, you might handle these differently,
-            # but for this problem, they are simple direct returns.
-            continue
-
-        # --- Re-initialize Triton for a clean run ---
-        tc = TritonContext()
-        tc.setArchitecture(ARCH.X86_64)
-        tc.setMode(MODE.ALIGNED_MEMORY, False)  # Keep this for robustness
-        mapper = IDAToTritonRegisterMapper(tc)
-
-        map_all_segments(tc)
-        tc.setConcreteMemoryAreaValue(TEB_AREA, bytearray(TEB_SIZE))
-        tc.setConcreteRegisterValue(tc.registers.gs, TEB_AREA)
-        tc.setConcreteMemoryAreaValue(DUMMY_ARG_REGION, bytearray(DUMMY_ARG_SIZE))
-        tc.setConcreteMemoryAreaValue(STACK_TOP - STACK_SIZE, bytearray(STACK_SIZE))
-
-        tc.setConcreteRegisterValue(tc.registers.rip, FUNC_EA)
-        tc.setConcreteRegisterValue(tc.registers.rsp, STACK_TOP - 8)
-        tc.setConcreteRegisterValue(tc.registers.rbp, STACK_TOP)
-
-        # Set the arguments for this specific run
-        tc.setConcreteRegisterValue(tc.registers.rcx, DUMMY_ARG_REGION)
-        tc.setConcreteRegisterValue(tc.registers.rdx, seed_value)
-
-        # Run the solver for this path
-        G_path = nx.DiGraph()
-        run_solver(tc, switch_info, state_kind, state_desc, G_path, mapper)  # type: ignore
-
-        # Merge the results into the combined graph
-        G_combined = nx.compose(G_combined, G_path)
-        print(
-            f"[+] Merged results. Combined graph has {G_combined.number_of_nodes()} nodes."
-        )
-
-    print("-" * 60)
-    if G_combined.number_of_edges() == 0:
+    if G.number_of_edges() == 0:
         print(
             "[!] Emulation did not produce any state transitions. Cannot deobfuscate."
         )
         return
 
-    # --- Final Patching using the COMBINED graph ---
-    original_block_ea: dict[int, int] = get_switch_mapping(
-        main_dispatcher_si, dispatch_ea
-    )
+    # --- Final, Corrected Patching ---
     pm = PatchManager(dry_run=not ENABLE_PATCHING)
+    original_block_ea = get_switch_mapping(main_dispatcher_si, dispatch_ea)
 
-    # The patching logic now uses the complete, combined graph
-    simplify_cfg_with_networkx(
-        cfunc,
-        pre_dispatcher_si,
-        main_dispatcher_si,
-        state_desc,
-        original_block_ea,
-        G_combined,
-        pm,
-        stack_offset,
+    # 4a: Patch the true entry point (`n2 = 2;`)
+    try:
+        # The target is the block corresponding to the value being set.
+        target_state = initial_state_val  # This is 2
+        target_ea = original_block_ea[target_state]
+
+        success, patch_bytes = idautils.Assemble(
+            true_entry_patch_addr, f"jmp {target_ea}"
+        )
+        if not success:
+            raise RuntimeError(
+                f"Failed to assemble jump at 0x{true_entry_patch_addr:X}"
+            )
+        assert isinstance(patch_bytes, bytes)
+        pm.add_patch(
+            true_entry_patch_addr,
+            patch_bytes.ljust(idaapi.get_item_size(true_entry_patch_addr), b"\x90"),
+        )
+        print(
+            f"[+] Patched true entry at 0x{true_entry_patch_addr:X} to jmp to state {target_state} (0x{target_ea:X})"
+        )
+    except (IndexError, KeyError, RuntimeError) as e:
+        raise RuntimeError(f"Could not patch true entry point: {e}")
+
+    all_main_dispatcher_stores = []
+    for case_block in main_dispatcher_switch.cases:
+        case_visitor = StateStoreVisitor(state_lvar)
+        # Apply the visitor to the c-block of each case
+        case_visitor.apply_to(case_block, None)
+        # Add any found stores to our master list
+        all_main_dispatcher_stores.extend(case_visitor.found_stores)
+
+    print(
+        f"[+] Found {len(all_main_dispatcher_stores)} state-setting instructions within the main dispatcher to patch."
     )
 
-    # For the other cases (a2=2, a2=3), they are simple and don't involve the dispatcher.
-    # The decompiler should now be able to correctly represent them as simple if/else checks
-    # because we are no longer destroying the function structure.
-    # We just need to NOP out the main dispatcher switch jump table.
-    ida_xref.delete_switch_table(pre_dispatcher_si.startea, pre_dispatcher_si)
-    ida_nalt.del_switch_info(pre_dispatcher_si.startea)
-    
-    ida_xref.delete_switch_table(main_dispatcher_si.startea, main_dispatcher_si)
-    ida_nalt.del_switch_info(main_dispatcher_si.startea)
+    for addr, current_state_val in all_main_dispatcher_stores:
+        try:
+            # The target is the block corresponding to the value being set.
+            target_state = current_state_val
+            if target_state not in original_block_ea:
+                print(
+                    f"[!] Warning: State {target_state} has no corresponding case block. NOP'ing at 0x{addr:X}."
+                )
+                pm.add_patch(addr, b"\x90" * idaapi.get_item_size(addr))
+                continue
+
+            target_ea = original_block_ea[target_state]
+
+            success, patch_bytes = idautils.Assemble(addr, f"jmp {target_ea}")
+            if not success:
+                print(
+                    f"[!] Warning: Failed to assemble jump at 0x{addr:X}. Skipping patch."
+                )
+                continue
+            assert isinstance(patch_bytes, bytes)
+            pm.add_patch(addr, patch_bytes.ljust(idaapi.get_item_size(addr), b"\x90"))
+            print(
+                f"[+]   0x{addr:X}: Patched `mov state, {current_state_val}` to jmp to state {target_state} (0x{target_ea:X})"
+            )
+        except Exception as e:
+            print(f"[!] Error patching 0x{addr:X}: {e}. NOP'ing.")
+            pm.add_patch(addr, b"\x90" * idaapi.get_item_size(addr))
+    # 4c: NOP out the main dispatcher's jump table
+    # pm.add_patch(dispatch_ea, b"\x90" * idaapi.get_item_size(dispatch_ea))
+    # This replaces the previous, less complete NOP'ing logic.
+    nop_len = (
+        dispatch_ea - main_dispatcher_si.defjump + idaapi.get_item_size(dispatch_ea)
+    )
+
+    if nop_len > 0:
+        print(
+            f"[+] NOP'ing entire switch mechanism from 0x{main_dispatcher_si.defjump:X} to 0x{main_dispatcher_switch.expr.ea:X} ({nop_len} bytes)"
+        )
+        pm.add_patch(main_dispatcher_si.defjump, b"\x90" * nop_len)
+    else:
+        print(f"[!] Warning: Could not determine size of switch mechanism to NOP.")
 
     pm.apply_all()
 
-    # --- This is the crucial final step ---
-    # Delete the old switch information so IDA doesn't get confused.
-    # We need to do this for BOTH switches.
-    # pre_dispatcher_si = idaapi.get_switch_info(cfunc.body.cinsn.ea)
-    # if pre_dispatcher_si:
-    #     ida_xref.delete_switch_table(pre_dispatcher_si.startea, pre_dispatcher_si)
-    #     ida_nalt.del_switch_info(pre_dispatcher_si.startea)
-
-    # ida_xref.delete_switch_table(main_dispatcher_si.startea, main_dispatcher_si)
-    # ida_nalt.del_switch_info(main_dispatcher_si.startea)
-
-    # Ask IDA to re-analyze everything.
+    # Final cleanup and re-analysis
+    ida_xref.delete_switch_table(main_dispatcher_si.startea, main_dispatcher_si)
+    ida_nalt.del_switch_info(main_dispatcher_si.startea)
     print("[+] Re-analyzing function...")
     ida_auto.auto_mark_range(FUNC_EA, FUNC_END, ida_auto.AU_USED)
     ida_auto.auto_wait()
 
-    print("[+] Patching complete - press <F5> in IDA to re-decompile")
+    print("[+] Patching complete – press <F5> in IDA to re-decompile")
     print("[✓] done")
 
 
