@@ -1,10 +1,39 @@
+import enum
+import logging
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+
 import ida_hexrays
 import ida_idaapi
 import ida_lines
 import ida_loader
 
-MIN_NUM_COMPARISONS = 2
-GOTO_NOT_SINGLE = -1
+
+def configure_logger(logger: logging.Logger) -> logging.Logger:
+    """Configure and return a logger for the pyhrdeob module.
+
+    Returns:
+        logging.Logger: Configured logger instance
+    """
+
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+        logger.addHandler(handler)
+    return logger
+
+
+logger = configure_logger(logging.getLogger("pyhrdeob"))
+
+
+class TraversalEnum(enum.IntEnum):
+    CONTINUE = 0
+    STOP = 1
+    SKIP = 2
 
 
 _mmat_strs = {
@@ -19,235 +48,287 @@ _mmat_strs = {
     ida_hexrays.MMAT_LVARS: "MMAT_LVARS",
 }
 
+MIN_NUM_COMPARISONS = 2
+GOTO_NOT_SINGLE = -1
 
-def mba_maturity_t_to_string(mmt):
-    return _mmat_strs.get(mmt, "???")
+
+@dataclass
+class MicrocodeHelper:
+    """Helper class for working with IDA Hex-Rays microcode operations and maturity levels."""
+
+    # Static class variables
+    MMAT: List[Tuple[int, str]] = field(
+        default_factory=lambda: sorted(
+            [
+                (getattr(ida_hexrays, x), x)
+                for x in filter(lambda y: y.startswith("MMAT_"), dir(ida_hexrays))
+            ]
+        )[1:]
+    )
+    MOPT: List[Tuple[int, str]] = field(
+        default_factory=lambda: [
+            (getattr(ida_hexrays, x), x)
+            for x in filter(lambda y: y.startswith("mop_"), dir(ida_hexrays))
+        ]
+    )
+    MCODE: List[Tuple[int, str]] = field(
+        default_factory=lambda: sorted(
+            [
+                (getattr(ida_hexrays, x), x)
+                for x in filter(lambda y: y.startswith("m_"), dir(ida_hexrays))
+            ]
+        )
+    )
+
+    class MatDelta:
+        """Enum-like class for maturity level changes."""
+
+        INCREASING = 1
+        NEUTRAL = 0
+        DECREASING = -1
+
+    @classmethod
+    def get_mcode_name(cls, mcode: int) -> Optional[str]:
+        """Return the name of the given mcode_t."""
+        for value, name in cls.MCODE:
+            if mcode == value:
+                return name
+        return None
+
+    @classmethod
+    def get_mopt_name(cls, mopt: int) -> Optional[str]:
+        """Return the name of the given mopt_t."""
+        for value, name in cls.MOPT:
+            if mopt == value:
+                return name
+        return None
+
+    @classmethod
+    def get_mmat(cls, mmat_name: str) -> Optional[int]:
+        """Return the mba_maturity_t for the given maturity name."""
+        for value, name in cls.MMAT:
+            if name == mmat_name:
+                return value
+        return None
+
+    @classmethod
+    def get_mmat_name(cls, mmat: int) -> Optional[str]:
+        """Return the maturity name of the given mba_maturity_t."""
+        for value, name in cls.MMAT:
+            if value == mmat:
+                return name
+        return None
+
+    @classmethod
+    def get_mmat_levels(cls) -> List[int]:
+        """Return a list of the microcode maturity levels."""
+        return [x[0] for x in cls.MMAT]
+
+    @classmethod
+    def diff_mmat(cls, mmat_src: int, mmat_dst: int) -> int:
+        """Return an enum indicating maturity growth."""
+        direction = mmat_dst - mmat_src
+        if direction > 0:
+            return cls.MatDelta.INCREASING
+        if direction < 0:
+            return cls.MatDelta.DECREASING
+        return cls.MatDelta.NEUTRAL
 
 
-def mopt_t_to_string(t):
-    if t == ida_hexrays.mop_z:
-        return "mop_z"
-    elif t == ida_hexrays.mop_r:
-        return "mop_r"
-    elif t == ida_hexrays.mop_n:
-        return "mop_n"
-    elif t == ida_hexrays.mop_str:
-        return "mop_str"
-    elif t == ida_hexrays.mop_d:
-        return "mop_d"
-    elif t == ida_hexrays.mop_S:
-        return "mop_S"
-    elif t == ida_hexrays.mop_v:
-        return "mop_v"
-    elif t == ida_hexrays.mop_b:
-        return "mop_b"
-    elif t == ida_hexrays.mop_f:
-        return "mop_f"
-    elif t == ida_hexrays.mop_l:
-        return "mop_l"
-    elif t == ida_hexrays.mop_a:
-        return "mop_a"
-    elif t == ida_hexrays.mop_h:
-        return "mop_h"
-    elif t == ida_hexrays.mop_c:
-        return "mop_c"
-    elif t == ida_hexrays.mop_fn:
-        return "mop_fn"
-    elif t == ida_hexrays.mop_p:
-        return "mop_p"
-    elif t == ida_hexrays.mop_sc:
-        return "mop_sc"
-    else:
+mba_maturity_t_to_string = MicrocodeHelper.get_mmat_name
+
+mopt_t_to_string = MicrocodeHelper.get_mopt_name
+
+
+@dataclass
+class MicrocodeOpcode:
+    name: str
+    nb_operands: int
+    is_commutative: bool
+    symbol: Optional[str] = None
+
+    @property
+    def hexrays_code(self) -> int:
+        return getattr(ida_hexrays, f"m_{self.name}")
+
+
+@dataclass(repr=False)
+class MicrocodeInstruction:
+    minsn: ida_hexrays.minsn_t
+    opcode: MicrocodeOpcode
+
+    @classmethod
+    def from_minsn(cls, minsn: ida_hexrays.minsn_t) -> "MicrocodeInstruction":
+        return cls(minsn, OPCODES_INFO[minsn.opcode])
+
+    def __repr__(self) -> str:
+        if not self.opcode:
+            return "???"
+
+        if self.opcode.nb_operands == 0:
+            return f"m_{self.opcode.name}"
+        elif self.opcode.nb_operands == 1:
+            return f"m_{self.opcode.name}(%s,%s)" % (
+                mopt_t_to_string(self.minsn.l.t),
+                mopt_t_to_string(self.minsn.d.t),
+            )
+        elif self.opcode.nb_operands == 2:
+            return f"m_{self.opcode.name}(%s,%s,%s)" % (
+                mopt_t_to_string(self.minsn.l.t),
+                mopt_t_to_string(self.minsn.r.t),
+                mopt_t_to_string(self.minsn.d.t),
+            )
         return "???"
+
+    __str__ = __repr__
+
+
+@dataclass
+class mov_info_t:
+    op_copy: Optional[ida_hexrays.mop_t] = None
+    ins_mov: Optional[ida_hexrays.minsn_t] = None
+    block: int = -1
+
+
+OPCODES_INFO = {
+    ida_hexrays.m_nop: MicrocodeOpcode("nop", 0, True),
+    ida_hexrays.m_stx: MicrocodeOpcode("stx", 2, False),
+    ida_hexrays.m_ldx: MicrocodeOpcode("ldx", 2, False),
+    ida_hexrays.m_ldc: MicrocodeOpcode("ldc", 1, False),
+    ida_hexrays.m_mov: MicrocodeOpcode("mov", 1, False, ""),
+    ida_hexrays.m_neg: MicrocodeOpcode("neg", 1, False, "-"),
+    ida_hexrays.m_lnot: MicrocodeOpcode("lnot", 1, False, "!"),
+    ida_hexrays.m_bnot: MicrocodeOpcode("bnot", 1, False, "~"),
+    ida_hexrays.m_xds: MicrocodeOpcode("xds", 1, False, "xds"),
+    ida_hexrays.m_xdu: MicrocodeOpcode("xdu", 1, False, "xdu"),
+    ida_hexrays.m_low: MicrocodeOpcode("low", 1, False, "low"),
+    ida_hexrays.m_high: MicrocodeOpcode("high", 1, False, "high"),
+    ida_hexrays.m_add: MicrocodeOpcode("add", 2, True, "+"),
+    ida_hexrays.m_sub: MicrocodeOpcode("sub", 2, False, "-"),
+    ida_hexrays.m_mul: MicrocodeOpcode("mul", 2, True, "*"),
+    ida_hexrays.m_udiv: MicrocodeOpcode("udiv", 2, False, "UDiv"),
+    ida_hexrays.m_sdiv: MicrocodeOpcode("sdiv", 2, False, "/"),
+    ida_hexrays.m_umod: MicrocodeOpcode("umod", 2, False, "URem"),
+    ida_hexrays.m_smod: MicrocodeOpcode("smod", 2, False, "%"),
+    ida_hexrays.m_or: MicrocodeOpcode("or", 2, True, "|"),
+    ida_hexrays.m_and: MicrocodeOpcode("and", 2, True, "&"),
+    ida_hexrays.m_xor: MicrocodeOpcode("xor", 2, True, "^"),
+    ida_hexrays.m_shl: MicrocodeOpcode("shl", 2, False, "<<"),
+    ida_hexrays.m_shr: MicrocodeOpcode("shr", 2, False, "LShR"),
+    ida_hexrays.m_sar: MicrocodeOpcode("sar", 2, False, ">>"),
+    ida_hexrays.m_cfadd: MicrocodeOpcode("cfadd", 2, True),
+    ida_hexrays.m_ofadd: MicrocodeOpcode("ofadd", 2, True),
+    ida_hexrays.m_cfshl: MicrocodeOpcode("cfshl", 2, False),
+    ida_hexrays.m_cfshr: MicrocodeOpcode("cfshr", 2, False),
+    ida_hexrays.m_sets: MicrocodeOpcode("sets", 2, False),
+    ida_hexrays.m_seto: MicrocodeOpcode("seto", 2, False),
+    ida_hexrays.m_setp: MicrocodeOpcode("setp", 2, False),
+    ida_hexrays.m_setnz: MicrocodeOpcode("setnz", 2, True, "!="),
+    ida_hexrays.m_setz: MicrocodeOpcode("setz", 2, True, "=="),
+    ida_hexrays.m_seta: MicrocodeOpcode("seta", 2, False, ">"),
+    ida_hexrays.m_setae: MicrocodeOpcode("setae", 2, False, ">="),
+    ida_hexrays.m_setb: MicrocodeOpcode("setb", 2, False, "<"),
+    ida_hexrays.m_setbe: MicrocodeOpcode("setbe", 2, False, "<="),
+    ida_hexrays.m_setg: MicrocodeOpcode("setg", 2, False, "UGT"),
+    ida_hexrays.m_setge: MicrocodeOpcode("setge", 2, False, "UGE"),
+    ida_hexrays.m_setl: MicrocodeOpcode("setl", 2, False, "ULT"),
+    ida_hexrays.m_setle: MicrocodeOpcode("setle", 2, False, "ULE"),
+    ida_hexrays.m_jcnd: MicrocodeOpcode("jcnd", 1, False),
+    ida_hexrays.m_jnz: MicrocodeOpcode("jnz", 2, True),
+    ida_hexrays.m_jz: MicrocodeOpcode("jz", 2, True),
+    ida_hexrays.m_jae: MicrocodeOpcode("jae", 2, False),
+    ida_hexrays.m_jb: MicrocodeOpcode("jb", 2, False),
+    ida_hexrays.m_ja: MicrocodeOpcode("ja", 2, False),
+    ida_hexrays.m_jbe: MicrocodeOpcode("jbe", 2, False),
+    ida_hexrays.m_jg: MicrocodeOpcode("jg", 2, False),
+    ida_hexrays.m_jge: MicrocodeOpcode("jge", 2, False),
+    ida_hexrays.m_jl: MicrocodeOpcode("jl", 2, False),
+    ida_hexrays.m_jle: MicrocodeOpcode("jle", 2, False),
+    ida_hexrays.m_jtbl: MicrocodeOpcode("jtbl", 2, False),
+    ida_hexrays.m_ijmp: MicrocodeOpcode("ijmp", 2, False),
+    ida_hexrays.m_goto: MicrocodeOpcode("goto", 1, False),
+    ida_hexrays.m_call: MicrocodeOpcode("call", 2, False),
+    ida_hexrays.m_icall: MicrocodeOpcode("icall", 2, False),
+    ida_hexrays.m_ret: MicrocodeOpcode("ret", 0, False),
+    ida_hexrays.m_push: MicrocodeOpcode("push", 0, False),
+    ida_hexrays.m_pop: MicrocodeOpcode("pop", 0, False),
+    ida_hexrays.m_und: MicrocodeOpcode("und", 0, False),
+    ida_hexrays.m_ext: MicrocodeOpcode("ext", 0, False),
+    ida_hexrays.m_f2i: MicrocodeOpcode("f2i", 2, False),
+    ida_hexrays.m_f2u: MicrocodeOpcode("f2u", 2, False),
+    ida_hexrays.m_i2f: MicrocodeOpcode("i2f", 2, False),
+    ida_hexrays.m_u2f: MicrocodeOpcode("u2f", 2, False),
+    ida_hexrays.m_f2f: MicrocodeOpcode("f2f", 2, False),
+    ida_hexrays.m_fneg: MicrocodeOpcode("fneg", 2, False),
+    ida_hexrays.m_fadd: MicrocodeOpcode("fadd", 2, True),
+    ida_hexrays.m_fsub: MicrocodeOpcode("fsub", 2, False),
+    ida_hexrays.m_fmul: MicrocodeOpcode("fmul", 2, True),
+    ida_hexrays.m_fdiv: MicrocodeOpcode("fdiv", 2, False),
+}
 
 
 def mcode_t_to_string(o):
-    if o.opcode == ida_hexrays.m_nop:
-        return "m_nop"
-    elif o.opcode == ida_hexrays.m_stx:
-        return "m_stx(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_ldx:
-        return "m_ldx(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_ldc:
-        return "m_ldc(%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_mov:
-        return "m_mov(%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_neg:
-        return "m_neg(%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_lnot:
-        return "m_lnot(%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_bnot:
-        return "m_bnot(%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_xds:
-        return "m_xds(%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_xdu:
-        return "m_xdu(%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_low:
-        return "m_low(%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_high:
-        return "m_high(%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_add:
-        return "m_add(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_sub:
-        return "m_sub(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_mul:
-        return "m_mul(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_udiv:
-        return "m_udiv(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_sdiv:
-        return "m_sdiv(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_umod:
-        return "m_umod(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_smod:
-        return "m_smod(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_or:
-        return "m_or(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_and:
-        return "m_and(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_xor:
-        return "m_xor(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_shl:
-        return "m_shl(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_shr:
-        return "m_shr(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_sar:
-        return "m_sar(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    elif o.opcode == ida_hexrays.m_cfadd:
-        return "m_cfadd(%s,%s,%s)" % (
-            mopt_t_to_string(o.l.t),
-            mopt_t_to_string(o.r.t),
-            mopt_t_to_string(o.d.t),
-        )
-    else:
-        return "???"
+    return repr(MicrocodeInstruction.from_minsn(o))
 
 
 def report(msg):
-    print("[pyhrdeob] %s" % msg)
+    logger.info("[pyhrdeob] %s", msg)
 
 
 def report_success(msg):
-    print("[+] %s" % msg)
+    logger.info("[+] %s", msg)
 
 
 def report_info(msg):
-    print("[i] %s" % msg)
+    logger.info("[i] %s", msg)
 
 
 def report_info3(msg):
-    print("[i3] %s" % msg)
+    logger.info("[i3] %s", msg)
 
 
 def report_error(msg):
-    print("[!] %s" % msg)
+    logger.error("[!] %s", msg)
 
 
 def report_error3(msg):
-    print("[!3] %s" % msg)
+    logger.error("[!3] %s", msg)
 
 
 def report_debug(msg):
-    # print("[D] %s" % msg)
-    pass
+    logger.debug("[D] %s", msg)
 
 
-# Put an mop_t into an mlist_t. The op must be either a register or a stack
-# variable.
-def insert_op(blk, ml, op):
+def insert_op(
+    blk: ida_hexrays.mblock_t, ml: ida_hexrays.mlist_t, op: ida_hexrays.mop_t
+) -> bool:
+    """
+    Put an mop_t into an mlist_t. The op must be either a register or a stack
+    variable.
+    """
     if op.t not in [ida_hexrays.mop_r, ida_hexrays.mop_S]:
         return False
+
+    # I needed help from Hex-Rays with this line. Some of the example plugins
+    # showed how to insert a register into an mlist_t. None of them showed
+    # how to insert a stack variable. I figured out a way to do it by reverse
+    # engineering Hex-Rays, but it seemed really janky. This is The Official
+    # Method (TM).
     blk.append_use_list(ml, op, ida_hexrays.MUST_ACCESS)
     return True
 
 
-def my_find_def_backwards(blk, ml, start):
+def my_find_def_backwards(
+    blk: ida_hexrays.mblock_t,
+    ml: ida_hexrays.mlist_t,
+    start: ida_hexrays.minsn_t | None,
+) -> ida_hexrays.minsn_t | None:
+    """
+    Ilfak sent me this function in response to a similar support request. It
+    walks backwards through a block, instruction-by-instruction, looking at
+    what each instruction defines. It stops when it finds definitions for
+    everything in the mlist_t, or when it hits the beginning of the block.
+    """
     m_end = blk.head
     p = start if start else blk.tail
     while p:
@@ -257,7 +338,15 @@ def my_find_def_backwards(blk, ml, start):
         p = p.prev
 
 
-def my_find_def_forwards(blk, ml, start):
+def my_find_def_forwards(
+    blk: ida_hexrays.mblock_t,
+    ml: ida_hexrays.mlist_t,
+    start: ida_hexrays.minsn_t | None,
+) -> ida_hexrays.minsn_t | None:
+    """
+    This is a nearly identical version of the function above, except it works
+    in the forward direction rather than backwards.
+    """
     m_end = blk.head
     p = start if start else blk.head
     while p:
@@ -268,8 +357,28 @@ def my_find_def_forwards(blk, ml, start):
 
 
 def find_numeric_def_backwards(
-    blk, op, chain, recursive, allow_multi_succs, block_stop
-):
+    blk: ida_hexrays.mblock_t,
+    op: ida_hexrays.mop_t,
+    chain: list[mov_info_t],
+    recursive: bool,
+    allow_multi_succs: bool,
+    block_stop: int,
+) -> tuple[bool, ida_hexrays.mop_t | None]:
+    """
+    This function has way too many arguments. Basically, it's a wrapper around
+    my_find_def_backwards from above. It is extended in the following ways:
+    * If my_find_def_backwards identifies a definition of the variable "op"
+      which is an assignment from another variable, this function then continues
+      looking for numeric assignments to that variable (and recursively so, if
+      that variable is in turn assigned from another variable).
+    * It keeps a list of all the assignment instructions it finds along the way,
+      storing them in the vector passed as the "chain" argument.
+    * It has support for traversing more than one basic block in a graph, if
+      the bRecursive argument is true. It won't traverse into blocks with more
+      than one successor if bAllowMultiSuccs is false. In any case, it will
+      never traverse past the block numbered iBlockStop, if that parameter is
+      non-negative.
+    """
     report_debug(
         f"blk = {blk.serial}, op = {op.dstr()}, chain = {chain}, block_stop = {block_stop}"
     )
@@ -277,166 +386,341 @@ def find_numeric_def_backwards(
     ml = ida_hexrays.mlist_t()
     if not insert_op(blk, ml, op):
         return False, None
+
+    # Start from the end of the block. This variable gets updated when a copy
+    # is encountered, so that subsequent searches start from the right place.
     start = None
     while True:
+        # Told you this function was just a wrapper around
+        # my_find_def_backwards.
         _def = my_find_def_backwards(blk, ml, start)
         if _def:
+            # Ensure that it's a mov instruction. We don't want, for example,
+            # an "stx" instruction, which is assumed to redefine everything
+            # until its aliasing information is refined.
             if _def.opcode != ida_hexrays.m_mov:
                 report_error("FindNumericDef: found %s" % mcode_t_to_string(_def))
                 return False, None
+
+            # Now that we found a mov, add it to the chain.
             mi = mov_info_t()
             mi.op_copy = _def.l
             mi.block = blk.serial
             mi.ins_mov = _def
             chain.append(mi)
+
+            # Was it a numeric assignment?
             if _def.l.t == ida_hexrays.mop_n:
+                # Great! We're done.
                 return True, _def.l
-            report_info3(f"Now tracking {ida_lines.tag_remove(_def.l._print())}")
+
+            tag = _def.l._print()
+            assert tag
+            # Otherwise, if it was not a numeric assignment, then try to track
+            # whatever was assigned to it. This can only succeed if the thing
+            # that was assigned was a register or stack variable.
+            report_info3(f"Now tracking {ida_lines.tag_remove(tag)}")
+
+            # Try to start tracking the other thing...
             ml.clear()
             if not insert_op(blk, ml, _def.l):
                 return False, None
             start = _def
         else:
+            # Otherwise, we did not find a definition of the currently-tracked
+            # variable on this block. Try to continue if the parameters allow.
+
+            # If recursion was disallowed, or we reached the topmost legal
+            # block, then quit.
             if not recursive or blk.serial == block_stop:
                 return False, None
+
+            # If the block has more than one predecessor, then we can't
+            # continue.
             if blk.npred() != 1:
                 return False, None
+
+            # Recurse into sole predecessor block
             pred = blk.pred(0)
             blk = mba.get_mblock(pred)
+
+            # If the predecessor has more than one successor, check to see
+            # whether the arguments allow that.
             if not allow_multi_succs and blk.nsucc() != 1:
                 return False, None
+
+            # Resume the search at the end of the new block.
             start = None
     return False, None
 
 
-def find_forward_numeric_def(blk, mop):
+def find_forward_numeric_def(
+    blk: ida_hexrays.mblock_t, mop: ida_hexrays.mop_t
+) -> tuple[bool, ida_hexrays.mop_t | None, ida_hexrays.minsn_t | None]:
+    """
+    This function is just a thin wrapper around find_forward_numeric_def, which
+    also inserts the mov into the "chain" argument.
+    """
     ml = ida_hexrays.mlist_t()
     if not insert_op(blk, ml, mop):
         return False, None, None
+
+    # Find a forward definition
     assign_insn = my_find_def_forwards(blk, ml, None)
-    if assign_insn:
-        report_info3(
-            f"Forward search found {ida_lines.tag_remove(assign_insn._print())}"
-        )
-        if (
-            assign_insn.opcode != ida_hexrays.m_mov
-            or assign_insn.l.t != ida_hexrays.mop_n
-        ):
-            return False, None, None
+    if not assign_insn:
+        return False, None, None
+    tag = assign_insn._print()
+    assert tag
+    # We only want MOV instructions with numeric left-hand sides
+    report_info3(f"Forward search found {ida_lines.tag_remove(tag)}")
+    if assign_insn.opcode != ida_hexrays.m_mov or assign_insn.l.t != ida_hexrays.mop_n:
+        return False, None, None
+
+    # Return the numeric operand if we found it
         return True, assign_insn.l, assign_insn
+        return True, assign_insn.l, assign_insn
+    return False, None, None
+    return True, assign_insn.l, assign_insn
     return False, None, None
 
 
-def find_forward_stack_var_def(cluster_head, op_copy, chain):
+def find_forward_stack_var_def(
+    cluster_head: ida_hexrays.mblock_t,
+    op_copy: ida_hexrays.mop_t,
+    chain: list[mov_info_t],
+) -> ida_hexrays.mop_t | None:
+    """
+    This function is just a thin wrapper around find_forward_numeric_def, which
+    also inserts the mov into the "chain" argument.
+    """
     if not op_copy or op_copy.t != ida_hexrays.mop_S:
         return None
+
+    # Find the definition
     ok, num, ins = find_forward_numeric_def(cluster_head, op_copy)
     if not ok:
         return None
-    report_info3(f"Forward method found {ida_lines.tag_remove(num._print())}!")
+
+    assert num
+    tag = num._print()
+    assert tag
+    report_info3(f"Forward method found {ida_lines.tag_remove(tag)}!")
+
+    # If the found definition was suitable, add the assignment to the chain
     mi = mov_info_t()
     mi.op_copy = num
     mi.block = cluster_head.serial
     mi.ins_mov = ins
     chain.append(mi)
+    # Return the number
     return num
 
 
-class mov_info_t:
-    def __init__(self, op_copy=None, ins_mov=None, block=-1):
-        self.op_copy = op_copy
-        self.ins_mov = ins_mov
-        self.block = block
-
-
 def append_goto_onto_non_empty_block(blk, block_dest):
+    """
+    Append a goto onto a non-empty block, which is assumed not to already have
+    a goto at the end of it.
+    """
+    # Allocate a new instruction, using the tail address
     new_goto = ida_hexrays.minsn_t(blk.tail.ea)
+
+    # Create a goto instruction to the specified block
     new_goto.opcode = ida_hexrays.m_goto
     new_mop = ida_hexrays.mop_t()
     new_mop.t = ida_hexrays.mop_b
     new_mop.b = block_dest
     new_mop.size = ida_hexrays.NOSIZE
     new_goto.l = new_mop
+
+    # Add it onto the block
     blk.insert_into_block(new_goto, blk.tail)
 
 
 def change_single_target(blk, old, new):
+    """
+    For a block with a single successor, change its target from some old block
+    to a new block. This is only on the graph level, not in terms of gotos.
+    """
     mba = blk.mba
+
+    # Overwrite the successor with the new target
     blk.succset[0] = new
+
+    # Add this block to the predecessor set of the target
     mba.get_mblock(new).predset.push_back(blk.serial)
+
+    # Remove this block from the predecessor set of the old target
     mba.get_mblock(old).predset._del(blk.serial)
 
 
 def remove_single_gotos(mba):
+    """
+    This function eliminates transfers to blocks with a single goto on them.
+    Either if a given block has a goto at the end of it, where the destination
+    is a block with a single goto on it, or if the block doesn't end in a goto,
+    but simply falls through to a block with a single goto on it. Also, this
+    process happens recursively; i.e., if A goes to B, and B goes to C, and C
+    goes to D, then after we've done our tranformations, A will go to D.
+    """
+    # This information determines, ultimately, to which block a goto will go.
+    # As mentioned in the function comment, this accounts for gotos-to-gotos.
     forwarder_info = [0] * mba.qty
+
+    # For each block
     for i in range(mba.qty):
+        # Begin by initializing its information to say that it does not
+        # consist of a single goto. Update later if it does.
         forwarder_info[i] = GOTO_NOT_SINGLE
         b = mba.get_mblock(i)
+
+        # Get the block and skip any "assert" instructions.
         m2 = ida_hexrays.getf_reginsn(b.head)
+
+        # Is the first non-assert instruction a goto?
         if not m2 or m2.opcode != ida_hexrays.m_goto or m2.l.t != ida_hexrays.mop_b:
             continue
+
         print(f"[+] Single goto found for block num = {b.serial}")
+        # If it was a goto, record the destination block number
         forwarder_info[i] = m2.l.b
+
     rc = 0
+
+    # Now, actually replace transfer-to-goto blocks with their destinations.
     for i in range(mba.qty):
         blk = mba.get_mblock(i)
+
+        # FYI, don't screw with blocks that have calls at the end of them.
+        # You'll get an INTERR. Also, if this block has more than one
+        # successor, then it couldn't possibly be a transfer to a goto.
+        # (blk->is_call_block() || blk->nsucc() != 1)
         if blk.is_call_block() or blk.nsucc() != 1:
             continue
+
+        # Get the last instruction on the block
         mgoto = blk.tail
         if not mgoto:
             continue
+
+        # Now, look up the block number of the destination.
         was_goto = mgoto.opcode == ida_hexrays.m_goto
+
+        # If the last instruction was a goto, get the information from there.
+        # Otherwise, take the number of the only successor block.
         original_goto_target = mgoto.l.b if was_goto else blk.succ(0)
         goto_target = original_goto_target
         should_replace = False
         visited = []
+
+        # Keep looping while we still find goto-to-gotos.
         while True:
+            # Keep track of the blocks we've seen so far, so we don't end up
+            # in an infinite loop if the goto blocks form a cycle in the
+            # graph.
             if goto_target in visited:
                 should_replace = False
                 break
             else:
                 visited.append(goto_target)
+
+            # Once we find the first non-single-goto block, stop.
             if forwarder_info[goto_target] == GOTO_NOT_SINGLE:
                 break
+
+            # If we find at least one single goto at the destination, then
+            # indicate that we should replace. Keep looping, though, to find
+            # the ultimate destination.
             should_replace = True
             print("[+] Replacing single goto target")
+
+            # Now check: did the single-goto block also target a single-goto
+            # block?
             goto_target = forwarder_info[goto_target]
+
+        # If the target wasn't a single-goto block, or there was an infinite
+        # loop in the graph, don't touch this block.
         if not should_replace:
             continue
+
+        # Otherwise, update the destination with the final target.
+
         if was_goto:
+            # If the block had a goto, overwrite its block destination.
             mgoto.l.b = goto_target
         else:
+            # Otherwise, add a goto onto the block. You might think you could skip
+            # this step and just change the successor information, but you'll get
+            # an INTERR if you do.
             append_goto_onto_non_empty_block(blk, goto_target)
+
+        # Change the successor/predecessor information for this block and its
+        # old and new target.
         change_single_target(blk, original_goto_target, goto_target)
+
+        # Counter of the number of blocks changed.
         rc += 1
     return rc
 
 
-def extract_jcc_parts(pred1):
+def extract_jcc_parts(
+    pred1: ida_hexrays.mblock_t,
+) -> tuple[bool, ida_hexrays.mblock_t | None, int, int]:
+    """
+    For a block that ends in a conditional jump, extract the integer block
+    numbers for the "taken" and "not taken" cases.
+    """
+    # Check if the block ends with a conditional jump
     if ida_hexrays.is_mcode_jcond(pred1.tail.opcode):
         if pred1.tail.d.t != ida_hexrays.mop_b:
             report_info(
                 "extract_jcc_parts: block was jcc, but destination was %s, not mop_b"
                 % (mopt_t_to_string(pred1.tail.d.t))
             )
-            return False, None, None, None
+            return False, None, -1, -1
         ends_with_jcc = pred1
-        jcc_dest = pred1.tail.d.b
+        _tail: ida_hexrays.minsn_t = pred1.tail
+        _dest_operand: ida_hexrays.mop_t = _tail.d
+        jcc_dest: int = _dest_operand.b  # byte value
+
+        # The fallthrough location is the block that's not directly targeted
+        # by the jcc instruction. Determine that by looking at the successors.
+        # I guess technically Hex-Rays enforces that it must be the
+        # sequentially-next-numbered block, but oh well.
         jcc_fall_through = pred1.succ(1) if pred1.succ(0) == jcc_dest else pred1.succ(0)
+
         return True, ends_with_jcc, jcc_dest, jcc_fall_through
-    return False, None, None, None
+    return False, None, -1, -1
 
 
-def split_mblocks_by_jcc_ending(pred1, pred2):
+def split_mblocks_by_jcc_ending(
+    pred1: ida_hexrays.mblock_t, pred2: ida_hexrays.mblock_t
+) -> tuple[
+    bool,
+    ida_hexrays.mblock_t | None,
+    ida_hexrays.mblock_t | None,
+    int,
+    int,
+]:
+    """
+    For a block with two predecessors, figure out if one of them ends in a jcc
+    instruction. Return pointers to the block that ends in a jcc and the one
+    that doesn't. Also return the integer numbers of those blocks.
+    """
     ends_with_jcc, non_jcc, jcc_dest, jcc_fall_through = None, None, -1, -1
     if not pred1.tail or not pred2.tail:
-        return False, None, None, None, None
+        return False, None, None, -1, -1
+
+    # Check if the first block ends with jcc. Make sure the second one
+    # doesn't also.
     ok, ends_with_jcc, jcc_dest, jcc_fall_through = extract_jcc_parts(pred1)
     if ok:
+        # If the second block also ends with jcc, then we can't split them.
         if ida_hexrays.is_mcode_jcond(pred2.tail.opcode):
             return False, ends_with_jcc, non_jcc, jcc_dest, jcc_fall_through
         non_jcc = pred2
     else:
+        # Otherwise, check if the second block ends with jcc. Make sure the first
+        # one doesn't also.
         ok, ends_with_jcc, jcc_dest, jcc_fall_through = extract_jcc_parts(pred2)
         if not ok:
             return False, ends_with_jcc, non_jcc, jcc_dest, jcc_fall_through
@@ -445,6 +729,12 @@ def split_mblocks_by_jcc_ending(pred1, pred2):
 
 
 class deferred_graph_modifier_t:
+    """
+    The "deferred graph modifier" records changes that the client wishes to make
+    to a given graph, but does not apply them immediately. Weird things could
+    happen if we were to modify a graph while we were iterating over it, so save
+    the modifications until we're done iterating over the graph.
+    """
 
     class edgeinfo_t:
         def __init__(self, src=-1, dst1=-1, dst2=-1):
@@ -458,14 +748,17 @@ class deferred_graph_modifier_t:
     def clear(self):
         self.edges = []
 
-    # Plan to add an edge
     def add(self, src, dest):
+        """
+        Plan to add an edge
+        """
         self.edges.append(deferred_graph_modifier_t.edgeinfo_t(src=src, dst2=dest))
 
-    # Plan to replace an edge from src->old_dest to src->new_dest
     def replace(self, src, old_dest, new_dest):
-
-        # if the edge was already planned to be replaced, replace the
+        """
+        Plan to replace an edge from src->old_dest to src->new_dest
+        """
+        # If the edge was already planned to be replaced, replace the
         # old destination with the new one
         for e in self.edges:
             if e.src == src and e.dst1 == old_dest:
@@ -474,8 +767,10 @@ class deferred_graph_modifier_t:
             deferred_graph_modifier_t.edgeinfo_t(src=src, dst1=old_dest, dst2=new_dest)
         )
 
-    # Apply the planned changes to the graph
     def apply(self, mba, cfi=None):
+        """
+        Apply the planned changes to the graph
+        """
 
         # Iterate through the edges slated for removal or addition
         for e in self.edges:
@@ -503,10 +798,13 @@ class deferred_graph_modifier_t:
                     )
         return len(self.edges)
 
-    # Either change the destination of an existing goto, or add a new goto onto
-    # the end of the block to the destination. Also, plan to modify the graph
-    # structure later to reflect these changes.
     def change_goto(self, blk, old, new):
+        """
+        Either change the destination of an existing goto, or add a new goto onto
+        the end of the block to the destination. Also, plan to modify the graph
+        structure later to reflect these changes.
+        """
+
         changed = True
         disp_pred = blk.serial
 
@@ -526,8 +824,52 @@ class deferred_graph_modifier_t:
         # If we did change the destination, plan to update the graph later
         if changed:
             self.replace(blk.serial, old, new)
-
         return changed
+
+
+class jz_info_t:
+    """
+    Helper class, used to determine whether a function is likely obfuscated or not.
+    Also used to collect the number of times a var. was used in a comparison,
+    and a list of the values it was compared against
+    """
+
+    def __init__(self, op=None, nseen=0):
+        self.op = op
+        self.nseen = nseen
+        self.nums = []
+
+    def should_blacklist(self):
+        """
+        Determines whether a function is likely obfuscated via
+        a) Minimum number o fcomparisons made against comp. variable
+        b) constant values in comparisons are suff. entropic
+        :return: True if not obfuscated
+        """
+
+        # This check is pretty weak. I thought I could set the minimum number to
+        # 6, but the pattern deobfuscators might eliminate some of them before
+        # this function gets called.
+        if self.nseen < MIN_NUM_COMPARISONS:
+            return True
+
+        # Count the number of 1-bits in the constant values used for comparison
+        num_bits = 0
+        num_ones = 0
+        for num in self.nums:
+            num_bits += num.size * 8
+            v = num.nnn.value
+            for i in range(num.size * 8):
+                if v & (1 << i):
+                    num_ones += 1
+
+        # Compute the percentage of 1-bits. Given that these constants seem to be
+        # created pseudorandomly, the percentage should be roughly 1/2.
+        entropy = 0.0 if num_bits == 0 else num_ones / float(num_bits)
+        report_info(
+            f"{self.nseen} comparisons, {len(self.nums)} numbers, {num_bits} bits, {num_ones} ones, {float(entropy)} entropy"
+        )
+        return entropy < 0.3 or entropy > 0.6
 
 
 class jz_collector_t(ida_hexrays.minsn_visitor_t):
@@ -580,19 +922,21 @@ class jz_collector_t(ida_hexrays.minsn_visitor_t):
         return 0
 
 
-# This function finds the "first" block immediately before the control flow
-# flattening dispatcher begins. The logic is simple; start at the beginning
-# of the function, keep moving forward until the next block has more than one
-# predecessor. As it happens, this is where the assignment to the switch
-# dispatch variable takes place, and that's mostly why we want it.
-# The information is recorded in the arguments iFirst and iDispatch.
-def get_first_block(mba):
+def get_first_block(
+    mba: ida_hexrays.mba_t,
+) -> tuple[bool, ida_hexrays.mblock_t | None, int, int]:
     """
+    This function finds the "first" block immediately before the control flow
+    flattening dispatcher begins. The logic is simple; start at the beginning
+    of the function, keep moving forward until the next block has more than one
+    predecessor. As it happens, this is where the assignment to the switch
+    dispatch variable takes place, and that's mostly why we want it.
+    The information is recorded in the arguments iFirst and iDispatch.
+
     Finds the first block before control flow dispatcher begins.
     :param mba: mba_t
     :return: True if found, mblock_t first block, serial first block, dispatcher serial
     """
-
     report_info("Determining first block before cfg disp begins")
     # Initialise first and dispatch to erroneous values
     first, dispatch = -1, -1
@@ -605,7 +949,7 @@ def get_first_block(mba):
         mb = mba.get_mblock(curr)
         if mb.nsucc() != 1:
             report_error(f"Block {curr} had {mb.nsucc()} (!= 1) successors\n")
-            return False, None, None, None
+            return False, None, -1, -1
 
         # Get the successor block
         succ = mb.succ(0)
@@ -624,17 +968,19 @@ def get_first_block(mba):
     return True, mb, first, dispatch
 
 
-# This class is used to find all variables that have 32-bit numeric values
-# assigned to them in the first block (as well as the values that are
-# assigned to them).
 class block_insn_assign_number_extractor_t(ida_hexrays.minsn_visitor_t):
+    """
+    This class is used to find all variables that have 32-bit numeric values
+    assigned to them in the first block (as well as the values that are
+    assigned to them).
+    """
+
     def __init__(self):
         ida_hexrays.minsn_visitor_t.__init__(self)
         self.seen_assignments = []
 
     def visit_minsn(self):
         ins = self.curins
-
         if (
             ins.opcode != ida_hexrays.m_mov
             or ins.l.t != ida_hexrays.mop_n
@@ -647,13 +993,15 @@ class block_insn_assign_number_extractor_t(ida_hexrays.minsn_visitor_t):
         return 0
 
 
-# Protected functions might use either one, or two, variables for the switch
-# dispatch number. If it uses two, one of them is the "update" variable, whose
-# contents will be copied into the "comparison" variable in the first dispatch
-# block. This class is used to locate the "update" variable, by simply looking
-# for a variable whose contents are copied into the "comparison" variable,
-# which must have had a number assigned to it in the first block.
 class handoff_var_finder_t(ida_hexrays.minsn_visitor_t):
+    """
+    Protected functions might use either one, or two, variables for the switch
+    dispatch number. If it uses two, one of them is the "update" variable, whose
+    contents will be copied into the "comparison" variable in the first dispatch
+    block. This class is used to locate the "update" variable, by simply looking
+    for a variable whose contents are copied into the "comparison" variable,
+    which must have had a number assigned to it in the first block.
+    """
 
     class seen_copy_t:
         def __init__(self, op, count=1):
@@ -662,11 +1010,9 @@ class handoff_var_finder_t(ida_hexrays.minsn_visitor_t):
 
     def __init__(self, op_max, num_extractor):
         ida_hexrays.minsn_visitor_t.__init__(self)
-
         # We're looking for assignments to this variable
         self.comparison_var = op_max
         self.num_extractor = num_extractor
-
         # This information is generated by this class. Namely, it's a list of
         # variables that are seen copied into the comparison variable, as well
         # as a count of the number of times it is copied.
@@ -703,10 +1049,13 @@ class handoff_var_finder_t(ida_hexrays.minsn_visitor_t):
         return 0
 
 
-# Once we know which variable is the one used for comparisons, look for all
-# jz instructions that compare a number against this variable. This then tells
-# us which number corresponds to which basic block.
 class jz_mapper_t(ida_hexrays.minsn_visitor_t):
+    """
+    Once we know which variable is the one used for comparisons, look for all
+    jz instructions that compare a number against this variable. This then tells
+    us which number corresponds to which basic block.
+    """
+
     def __init__(self, cfi, assign_var):
         ida_hexrays.minsn_visitor_t.__init__(self)
         self.cfi = cfi
@@ -758,13 +1107,17 @@ class jz_mapper_t(ida_hexrays.minsn_visitor_t):
         return 0
 
 
-# Compute dominator information for the function.
-def compute_dominators(mba):
+def compute_dominators(mba: ida_hexrays.mba_t) -> list[ida_hexrays.bitset_t]:
+    """
+    Compute dominator information for the function.
+    :param mba: mba_t
+    :return: list of bitset_t, each representing a block and its dominators
+    """
     num_blocks = mba.qty
     assert num_blocks > 0
 
     # Use Hex-Rays' handy bitsets_t to represent dominators
-    dom_info = []
+    dom_info: list[ida_hexrays.bitset_t] = []
     for i in range(num_blocks):
         dom_info.append(ida_hexrays.bitset_t())
 
@@ -789,7 +1142,7 @@ def compute_dominators(mba):
             bs_before = ida_hexrays.bitset_t(bs_curr)
 
             # Get that block from the graph
-            block_i = mba.get_mblock(i)
+            block_i: ida_hexrays.mblock_t = mba.get_mblock(i)
 
             # Iterate over its predecessors, intersecting their dataflow
             # values against this one's values
@@ -816,7 +1169,7 @@ def compute_dominators(mba):
     # for d to indicate that it dominates b.
 
     # Create a new array_of_bitsets
-    dom_info_output = []
+    dom_info_output: list[ida_hexrays.bitset_t] = []
     for i in range(num_blocks):
         dom_info_output.append(ida_hexrays.bitset_t())
 
@@ -840,6 +1193,20 @@ class cf_flatten_info_t:
         self.maturity = None
         self.mb_first = None
         self.detected_dispatchers = []
+        self.op_assigned: ida_hexrays.mop_t | None = None
+        self.op_compared = None
+        self.op_sub_compared = None
+        self.first = -1
+        self.dispatch = -1
+        self.ufirst = 0
+        self.which_func = ida_idaapi.BADADDR
+        self.dom_info: list[ida_hexrays.bitset_t] = []
+        self.dominated_clusters: list[int] = []
+        self.tracking_first_blocks = False
+        self.op_and_assign = False
+        self.op_and_imm = 0
+        self.key_to_block = {}
+        self.block_to_key = {}
         self.clear()
 
     def report_info(self, msg):
@@ -859,8 +1226,8 @@ class cf_flatten_info_t:
         self.dispatch = -1
         self.ufirst = 0
         self.which_func = ida_idaapi.BADADDR
-        self.dom_info = None
-        self.dominated_clusters = None
+        self.dom_info.clear()
+        self.dominated_clusters.clear()
         self.tracking_first_blocks = False
         self.op_and_assign = False
         self.op_and_imm = 0
@@ -872,8 +1239,8 @@ class cf_flatten_info_t:
         self.op_compared = None
         self.op_sub_compared = None
         self.which_func = ida_idaapi.BADADDR
-        self.dom_info = None
-        self.dominated_clusters = None
+        self.dom_info.clear()
+        self.dominated_clusters.clear()
         self.tracking_first_blocks = False
         self.op_and_assign = False
         self.op_and_imm = 0
@@ -891,10 +1258,10 @@ class cf_flatten_info_t:
         """
         mba = blk.mba
         report_info(f"Detecting additional dispatchers ..")
-        block = mba.get_mblock(0)
+        block: ida_hexrays.mblock_t = mba.get_mblock(0)
         i = 0
         while block.nextb != None:
-            block = mba.get_mblock(i)
+            block: ida_hexrays.mblock_t = mba.get_mblock(i)
             if (
                 block.npred() >= 3
                 and block.get_reginsn_qty() >= 1
@@ -964,13 +1331,15 @@ class cf_flatten_info_t:
         # Find the "first" block in the function, the one immediately before the
         # control flow switch.
         ok, self.mb_first, self.first, self.dispatch = get_first_block(mba)
-        first = self.mb_first
-        self.detected_dispatchers.append(self.dispatch)
-        self.detect_additional_dispatchers(blk)
-
         if not ok:
             report_error(f"Failed determining the first block")
             return False
+
+        first = self.mb_first
+        assert first
+        assert self.dispatch
+        self.detected_dispatchers.append(self.dispatch)
+        self.detect_additional_dispatchers(blk)
 
         report_info(
             f"Determined dispatcher block = {self.dispatch}, first_block = {first.serial}"
@@ -991,7 +1360,7 @@ class cf_flatten_info_t:
                 break
 
         # This is the "assignment" variable, whose value is updated by the switch
-        # case code
+        # case code2
         local_op_assigned = None
         if found:
             # If the "comparison" variable was assigned a number in the first block,
@@ -1142,7 +1511,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
     def __init__(self, plugin):
         ida_hexrays.optblock_t.__init__(self)
-        self.cfi = cf_flatten_info_t(plugin)
+        self.cfi: cf_flatten_info_t = cf_flatten_info_t(plugin)
         self.plugin = plugin
         self.last_maturity = ida_hexrays.MMAT_ZERO
         self.clear()
@@ -1169,7 +1538,9 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         self.deferred_erasures_local = []
         self.performed_erasures_global = []
 
-    def get_dominated_cluster_head(self, mba, disp_pred):
+    def get_dominated_cluster_head(
+        self, mba: ida_hexrays.mba_t, disp_pred: int
+    ) -> tuple[bool, ida_hexrays.mblock_t | None, int | None]:
         """
         Find block dominating the dispatcher predecessor and is one of the targets
         of the CFG switch.
@@ -1177,7 +1548,6 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         :param disp_pred: dispatcher predecessor serial
         :return: Flag if succeeded, mblock_t, mblock_t serial
         """
-        mb_cluster_head, cluster_head = None, -1
         # Find the block that is targeted by the dispatcher, and that
         # dominates the block we're currently looking at. This logic won't
         # work for the first block (since it wasn't targeted by the control
@@ -1185,21 +1555,23 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         # cluster information), so we special-case it.
         if disp_pred == self.cfi.first:
             cluster_head = self.cfi.first
-            mb_cluster_head = mba.get_mblock(self.cfi.first)
+            mb_cluster_head: ida_hexrays.mblock_t = mba.get_mblock(self.cfi.first)
         else:
             # If it wasn't the first block, look up its cluster head block
             cluster_head = self.cfi.dominated_clusters[disp_pred]
             if cluster_head < 0:
                 self.report_info(f"Cluster_head returned zero!")
                 return False, None, None
-            mb_cluster_head = mba.get_mblock(cluster_head)
+            mb_cluster_head: ida_hexrays.mblock_t = mba.get_mblock(cluster_head)
             self.report_info(
                 f"Block {disp_pred} was part of dominated cluster {cluster_head}"
             )
 
         return True, mb_cluster_head, cluster_head
 
-    def get_dominated_cluster_head_by_pattern_dirty(self, mba, mb):
+    def get_dominated_cluster_head_by_pattern_dirty(
+        self, mba: ida_hexrays.mba_t, mb: ida_hexrays.mblock_t
+    ) -> tuple[bool, ida_hexrays.mblock_t | None, int | None]:
         """
         Return the dominated cluster head by pattern.
         This looks at dom_info, searching for the start of the cluster.
@@ -1209,7 +1581,8 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         """
 
         ok = False
-        mb_cluster_head, cluster_head = None, -1
+        mb_cluster_head: ida_hexrays.mblock_t | None = None
+        cluster_head: int | None = None
 
         # get the predset into a separate list
         visited_preds = [mb_serial for mb_serial in mb.predset]
@@ -1272,22 +1645,28 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
         return ok, mb_cluster_head, cluster_head
 
-    # This function attempts to locate the numeric assignment to a given variable
-    # "what" starting from the end of the block "mb". It follows definitions
-    # backwards, even across blocks, until it either reaches the block
-    # "mbClusterHead", or, if the boolean "bAllowMultiSuccs" is false, it will
-    # stop the first time it reaches a block with more than one successor.
-    # If it finds an assignment whose source is a stack variable, then it will not
-    # be able to continue in the backwards direction, because intervening memory
-    # writes will make the definition information useless. In that case, it
-    # switches to a strategy of searching in the forward direction from
-    # mbClusterHead, looking for assignments to that stack variable.
-    # Information about the chain of assignment instructions along the way are
-    # stored in the vector called m_DeferredErasuresLocal, a member variable of
-    # the CFUnflattener class.
     def find_block_target_or_last_copy(
-        self, mb, mb_cluster_head, what, allow_multi_succs
-    ):
+        self,
+        mb: ida_hexrays.mblock_t,
+        mb_cluster_head: ida_hexrays.mblock_t,
+        what: ida_hexrays.mop_t,
+        allow_multi_succs: bool,
+    ) -> int:
+        """
+        This function attempts to locate the numeric assignment to a given variable
+        "what" starting from the end of the block "mb". It follows definitions
+        backwards, even across blocks, until it either reaches the block
+        "mbClusterHead", or, if the boolean "bAllowMultiSuccs" is false, it will
+        stop the first time it reaches a block with more than one successor.
+        If it finds an assignment whose source is a stack variable, then it will not
+        be able to continue in the backwards direction, because intervening memory
+        writes will make the definition information useless. In that case, it
+        switches to a strategy of searching in the forward direction from
+        mbClusterHead, looking for assignments to that stack variable.
+        Information about the chain of assignment instructions along the way are
+        stored in the vector called m_DeferredErasuresLocal, a member variable of
+        the CFUnflattener class.
+        """
 
         report_info(f"Current what = {what.dstr()}")
 
@@ -1333,7 +1712,9 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         report_info(f"OpCopy = {op_copy.dstr()}")
         if not found and op_copy and op_copy.t == ida_hexrays.mop_S:
             report_info("Running forward analysis")
-            num = find_forward_stack_var_def(mb_cluster_head, op_copy, local)
+            num: ida_hexrays.mop_t | None = find_forward_stack_var_def(
+                mb_cluster_head, op_copy, local
+            )
             if num:
                 op_num = num
                 found = True
@@ -1343,7 +1724,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         dest_no = -1
 
         # If we found a numeric assignment...
-        if found:
+        if found and op_num:
 
             # Look up the integer number of the block corresponding to that value.
             dest_no = self.cfi.find_block_by_key(op_num.nnn.value)
@@ -1371,7 +1752,14 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
         return dest_no
 
-    def handle_two_preds(self, mb, mb_cluster_head, op_copy):
+    def handle_two_preds(
+        self,
+        mb: ida_hexrays.mblock_t,
+        mb_cluster_head: ida_hexrays.mblock_t,
+        op_copy: ida_hexrays.mop_t,
+    ) -> tuple[
+        bool, ida_hexrays.mblock_t | None, ida_hexrays.mblock_t | None, int, int
+    ]:
         """
         Handle constructs with two successors, f.e. if statements
         If block assigns to assignment variable with 2 predecessors, analyse each
@@ -1389,7 +1777,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         )
         mba = mb.mba
         disp_pred = mb.serial
-        cluster_head = mb_cluster_head.serial
+        cluster_head: int = mb_cluster_head.serial
 
         if mb.npred() == 2:
             pred1 = mba.get_mblock(mb.pred(0))
@@ -1397,7 +1785,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         else:
             # No really, don't call this function on a block that doesn't have two
             # predecessors.
-            return False, None, None, None, None
+            return False, None, None, -1, -1
 
         # Given the two predecessors, find the block with the conditional jump at
         # the end of it (store the block in "ends_with_jcc") and the one without
@@ -1413,7 +1801,10 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                 % (disp_pred, pred1.serial, pred2.serial)
             )
             return False, ends_with_jcc, non_jcc, jcc_dest, jcc_fall_through
-
+        assert ends_with_jcc is not None
+        assert mb_cluster_head is not None
+        assert op_copy is not None
+        assert non_jcc is not None
         # Sanity checking the structure of the graph. The nonJcc block should only
         # have one incoming edge...
         if non_jcc.npred() != 1:
@@ -1421,7 +1812,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                 "Block %d w/preds %d, %d did not have one predecessor ending in jcc, one without"
                 % (disp_pred, pred1.serial, pred2.serial)
             )
-            return False, None, None, None, None
+            return False, None, None, -1, -1
 
         # ... namely, from the block ending with the jcc.
         if non_jcc.pred(0) != ends_with_jcc.serial:
@@ -1429,12 +1820,13 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                 "Block %d w/preds %d, %d, non-jcc pred %d did not have the other as its predecessor"
                 % (disp_pred, pred1.serial, pred2.serial, non_jcc.serial)
             )
-            return False, None, None, None, None
+            return False, None, None, -1, -1
 
         # Call the previous function to locate the numeric definition of the
         # variable that is used to update the assignment variable if the jcc is
         # not taken.
-        actual_goto_target = self.find_block_target_or_last_copy(
+
+        actual_goto_target: int = self.find_block_target_or_last_copy(
             ends_with_jcc, mb_cluster_head, op_copy, allow_multi_succs=False
         )
 
@@ -1442,7 +1834,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         if actual_goto_target >= 0:
 
             # ... then do the same thing when the jcc is not taken.
-            actual_jcc_target = self.find_block_target_or_last_copy(
+            actual_jcc_target: int = self.find_block_target_or_last_copy(
                 non_jcc, mb_cluster_head, op_copy, allow_multi_succs=True
             )
 
@@ -1456,9 +1848,9 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                     actual_jcc_target,
                 )
 
-        return False, None, None, None, None
+        return False, None, None, -1, -1
 
-    def process_erasures(self, mba):
+    def process_erasures(self, mba: ida_hexrays.mba_t):
         """
         Erase superfluos chain of instructions, used to copy numeric value
         into assignment variable.
@@ -1604,7 +1996,8 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                     f"disp_pred = {disp_pred}, cluster_head = {cluster_head}"
                 )
                 self.deferred_erasures_local = []
-
+                assert mb_cluster_head is not None
+                assert self.cfi.op_assigned is not None
                 # Try to find a numeric assignment to the assignment variable, but
                 # pass false for the last parameter so that the search stops if it
                 # reaches a block with more than one successor. This ought to succeed
@@ -1709,21 +2102,22 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                     # onto the end of the jcc taken block.
                     mb_head = mb.head
                     mb_curr = mb_head
-                    while True:
-                        copy = ida_hexrays.minsn_t(mb_curr)
-                        non_jcc.insert_into_block(copy, non_jcc.tail)
-                        mb_curr = mb_curr.next
-                        if not mb_curr:
-                            break
+                    if non_jcc:
+                        while True:
+                            copy = ida_hexrays.minsn_t(mb_curr)
+                            non_jcc.insert_into_block(copy, non_jcc.tail)
+                            mb_curr = mb_curr.next
+                            if not mb_curr:
+                                break
 
-                    # Make a note to ourselves to modify the graph structure later,
-                    # for the taken side of the conditional. Change the goto target.
-                    dgm.replace(non_jcc.serial, mb.serial, actual_jcc_target)
-                    non_jcc.tail.l.b = actual_jcc_target
+                        # Make a note to ourselves to modify the graph structure later,
+                        # for the taken side of the conditional. Change the goto target.
+                        dgm.replace(non_jcc.serial, mb.serial, actual_jcc_target)
+                        non_jcc.tail.l.b = actual_jcc_target
 
-                    # We added instructions to the nonJcc block, so its def-use lists
-                    # are now spoiled. Mark it dirty.
-                    non_jcc.mark_lists_dirty()
+                        # We added instructions to the nonJcc block, so its def-use lists
+                        # are now spoiled. Mark it dirty.
+                        non_jcc.mark_lists_dirty()
 
         changed += dgm.apply(mba, self.cfi)
         # After we've processed every block, apply the deferred modifications to
@@ -1752,7 +2146,7 @@ class pyhexraysdeob_t(ida_idaapi.plugin_t):
     def __init__(self):
         self.black_list = []
         self.white_list = []
-        self.wanted_name = "Emotet unflattener"
+        self.wanted_name = "Eidolon unflattener"
         self.activated = False
         self.SAFE_MODE = True
         self.flags = 0
