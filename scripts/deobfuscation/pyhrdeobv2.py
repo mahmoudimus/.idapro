@@ -16,6 +16,7 @@ def configure_logger(logger: logging.Logger) -> logging.Logger:
         logging.Logger: Configured logger instance
     """
 
+    logger.propagate = False
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
     if not logger.handlers:
@@ -476,7 +477,7 @@ def find_forward_numeric_def(
     if assign_insn.opcode != ida_hexrays.m_mov or assign_insn.l.t != ida_hexrays.mop_n:
         return False, None, None
 
-    # Return the numeric operand if we found it
+        # Return the numeric operand if we found it
         return True, assign_insn.l, assign_insn
         return True, assign_insn.l, assign_insn
     return False, None, None
@@ -1273,10 +1274,11 @@ class cf_flatten_info_t:
                 self.detected_dispatchers.append(i)
             i += 1
 
-    # This function computes all of the preliminary information needed for
-    # unflattening.
-    def get_assigned_and_comparison_variables(self, blk):
-
+    def get_assigned_and_comparison_variables(self, blk: ida_hexrays.mblock_t):
+        """
+        This function computes all of the preliminary information needed for
+        unflattening.
+        """
         mba = blk.mba
         self.clear()
         ea = mba.entry_ea
@@ -1298,7 +1300,7 @@ class cf_flatten_info_t:
         mba.for_all_topinsns(jzc)
         if jzc.n_max_jz < 0:
             report_info(
-                f"No comparisons seen for function Ea = {hex(ea)}, adding function to blacklist"
+                f"No comparisons seen for function @ {hex(ea)} - adding function to blacklist"
             )
             # If there were no comparisons and we haven't seen this function
             # before, blacklist it.
