@@ -1,5 +1,6 @@
 import enum
 import logging
+import typing
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -7,6 +8,8 @@ import ida_hexrays
 import ida_idaapi
 import ida_lines
 import ida_loader
+import ida_pro
+import ida_xref
 
 
 def configure_logger(logger: logging.Logger) -> logging.Logger:
@@ -53,32 +56,25 @@ MIN_NUM_COMPARISONS = 2
 GOTO_NOT_SINGLE = -1
 
 
-@dataclass
 class MicrocodeHelper:
     """Helper class for working with IDA Hex-Rays microcode operations and maturity levels."""
 
     # Static class variables
-    MMAT: List[Tuple[int, str]] = field(
-        default_factory=lambda: sorted(
-            [
-                (getattr(ida_hexrays, x), x)
-                for x in filter(lambda y: y.startswith("MMAT_"), dir(ida_hexrays))
-            ]
-        )[1:]
-    )
-    MOPT: List[Tuple[int, str]] = field(
-        default_factory=lambda: [
+    MMAT: List[Tuple[int, str]] = sorted(
+        [
             (getattr(ida_hexrays, x), x)
-            for x in filter(lambda y: y.startswith("mop_"), dir(ida_hexrays))
+            for x in filter(lambda y: y.startswith("MMAT_"), dir(ida_hexrays))
         ]
-    )
-    MCODE: List[Tuple[int, str]] = field(
-        default_factory=lambda: sorted(
-            [
-                (getattr(ida_hexrays, x), x)
-                for x in filter(lambda y: y.startswith("m_"), dir(ida_hexrays))
-            ]
-        )
+    )[1:]
+    MOPT: List[Tuple[int, str]] = [
+        (getattr(ida_hexrays, x), x)
+        for x in filter(lambda y: y.startswith("mop_"), dir(ida_hexrays))
+    ]
+    MCODE: List[Tuple[int, str]] = sorted(
+        [
+            (getattr(ida_hexrays, x), x)
+            for x in filter(lambda y: y.startswith("m_"), dir(ida_hexrays))
+        ]
     )
 
     class MatDelta:
@@ -581,7 +577,7 @@ def remove_single_gotos(mba):
         if not m2 or m2.opcode != ida_hexrays.m_goto or m2.l.t != ida_hexrays.mop_b:
             continue
 
-        print(f"[+] Single goto found for block num = {b.serial}")
+        report_debug(f"[+] Single goto found for block num = {b.serial}")
         # If it was a goto, record the destination block number
         forwarder_info[i] = m2.l.b
 
@@ -632,7 +628,7 @@ def remove_single_gotos(mba):
             # indicate that we should replace. Keep looping, though, to find
             # the ultimate destination.
             should_replace = True
-            print("[+] Replacing single goto target")
+            report_debug("[+] Replacing single goto target")
 
             # Now check: did the single-goto block also target a single-goto
             # block?
@@ -871,6 +867,95 @@ class jz_info_t:
             f"{self.nseen} comparisons, {len(self.nums)} numbers, {num_bits} bits, {num_ones} ones, {float(entropy)} entropy"
         )
         return entropy < 0.3 or entropy > 0.6
+
+
+class jtbl_collector_t(ida_hexrays.minsn_visitor_t):
+    """
+    Looks for switch statements (jump tables) in the Hex-Rays microcode.
+    Each m_jtbl represents a decompiled 'switch' with its table of targets.
+    """
+
+    def __init__(self):
+        ida_hexrays.minsn_visitor_t.__init__(self)
+        # list of all m_jtbl instructions we encountered
+        self.switch_insns = []
+
+    def visit_minsn(self):
+        ins = self.curins
+
+        # If this is a jump-table instruction, stash it
+        if ins.opcode == ida_hexrays.m_jtbl:
+            # ins.l is the index expression feeding the table
+            # ins.r is the table descriptor (pointer + size)
+            self.switch_insns.append(
+                {
+                    "insn": ins,
+                    "index_mop": ins.l,
+                    "table_mop": ins.r,
+                    # you can also inspect ins.jumps or ins.cases for the targets
+                    "cases": getattr(ins, "jumps", None),
+                }
+            )
+
+        return 0
+
+
+@dataclass
+class SwitchInfo:
+    jtbl_insn: ida_hexrays.minsn_t
+    index_reg: ida_hexrays.mop_t
+    table: ida_hexrays.mop_t
+    state_var: ida_hexrays.mop_t
+    cases: ida_hexrays.mcases_t
+
+
+class switch_state_collector_t(ida_hexrays.minsn_visitor_t):
+    """
+    1) Records all m_xdu instructions (var → reg)
+    2) On m_jtbl, finds which reg is the index, then looks up any prior xdu to map
+       that reg back to the original var.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.xdu_map: list[MicrocodeInstruction] = []
+        self.switches: list[SwitchInfo] = []
+
+    def visit_minsn(self):
+        ins = self.curins
+
+        if ins.opcode == ida_hexrays.m_xdu:
+            # record dest_reg ← src_var
+            self.xdu_map.append(MicrocodeInstruction.from_minsn(ins))
+
+        elif ins.opcode == ida_hexrays.m_jtbl:
+            idx_mop = ins.l
+            tbl_mop = ins.r
+            state_var = None
+            report_debug(f"jump table at: {hex(ins.ea)}")
+            for msin in reversed(self.xdu_map):
+                dest = msin.minsn.d
+                src = msin.minsn.l
+                report_debug(
+                    f"{msin}, {hex(msin.minsn.ea)}, {dest.dstr()}, {src.dstr()}"
+                )
+                if dest.equal_mops(idx_mop, ida_hexrays.EQ_IGNSIZE):
+                    state_var = src
+                    break
+            assert (
+                state_var is not None
+            ), f"state_var is None for jump table at {hex(ins.ea)}"
+            # report_debug(dir(ins))
+            info = SwitchInfo(
+                jtbl_insn=ins,
+                index_reg=idx_mop,
+                table=tbl_mop,
+                state_var=state_var,
+                cases=tbl_mop.c,
+            )
+            self.switches.append(info)
+
+        return 0
 
 
 class jz_collector_t(ida_hexrays.minsn_visitor_t):
@@ -1293,14 +1378,14 @@ class cf_flatten_info_t:
         # seen to be obfuscated.
         was_white_listed = ea in self.plugin.white_list
 
-        report_info(f"Running jz_collector")
-        # Look for the variable that was used in the largest number of jz/jg
-        # comparisons against a constant. This is our "comparison" variable.
-        jzc = jz_collector_t()
-        mba.for_all_topinsns(jzc)
-        if jzc.n_max_jz < 0:
+        report_info(f"Running switch collector")
+        # Look for the variable that was used for the switch statement
+        # statements. This is our "comparison" variable.
+        switch_tbl_collector = switch_state_collector_t()
+        mba.for_all_topinsns(switch_tbl_collector)
+        if len(switch_tbl_collector.switches) == 0:
             report_info(
-                f"No comparisons seen for function @ {hex(ea)} - adding function to blacklist"
+                f"No switch statements seen for function @ {hex(ea)} - adding function to blacklist"
             )
             # If there were no comparisons and we haven't seen this function
             # before, blacklist it.
@@ -1308,26 +1393,27 @@ class cf_flatten_info_t:
                 self.plugin.black_list.append(ea)
             return False
 
-        report_info(f"Max comparisons seen = {jzc.n_max_jz}")
+        report_info(
+            f"Max switch statements seen = {len(switch_tbl_collector.switches)}"
+        )
 
         # Otherwise, we were able to find jz comparison information. Use that to
         # determine if the constants look entropic enough. If not, blacklist this
         # function. If so, whitelist it.
         if not was_white_listed:
             # this kicks out cfgNetwork handling .. lowering entropy..
-            if jzc.seen_comparisons[jzc.n_max_jz].should_blacklist():
-                report_info(f"Classified function as not obfuscated")
-                self.plugin.black_list.append(ea)
-                return False
+            # if jtblc.switch_insns[0].should_blacklist():
+            #     report_info(f"Classified function as not obfuscated")
+            #     self.plugin.black_list.append(ea)
+            #     return False
             self.plugin.white_list.append(ea)
 
-        op_max = jzc.seen_comparisons[jzc.n_max_jz].op
-
+        op_max = switch_tbl_collector.switches[0].state_var
         report_info(f"Comparison variable = {op_max.dstr()}")
         # op_max is our "comparison" variable used in the control flow switch.
-        if op_max.size < 4:
-            self.report_error(f"Comparison variable {op_max.dstr()} is too narrow\n")
-            return False
+        # if op_max.size < 4:
+        #     self.report_error(f"Comparison variable {op_max.dstr()} is too narrow\n")
+        #     return False
 
         ok = False
         # Find the "first" block in the function, the one immediately before the
@@ -1337,14 +1423,14 @@ class cf_flatten_info_t:
             report_error(f"Failed determining the first block")
             return False
 
+        assert self.mb_first
         first = self.mb_first
-        assert first
         assert self.dispatch
         self.detected_dispatchers.append(self.dispatch)
         self.detect_additional_dispatchers(blk)
 
         report_info(
-            f"Determined dispatcher block = {self.dispatch}, first_block = {first.serial}"
+            f"Determined dispatcher block = {self.dispatch}, first_block = {first.serial}, first.start = {hex(first.start)}"
         )
 
         # Get all variables assigned to numbers in the first block. If we find the
@@ -1357,6 +1443,7 @@ class cf_flatten_info_t:
         # Was the comparison variable assigned a number in the first block?
         found = False
         for sas in fbe.seen_assignments:
+            report_info(f"sas[0] = {sas[0].dstr()}")
             if sas[0].equal_mops(op_max, ida_hexrays.EQ_IGNSIZE):
                 found = True
                 break
@@ -1405,8 +1492,54 @@ class cf_flatten_info_t:
 
         # Extract the key-to-block mapping for each JZ against the comparison
         # variable
-        jzm = jz_mapper_t(self, local_op_assigned)
-        mba.for_all_topinsns(jzm)
+        # jzm = jz_mapper_t(self, local_op_assigned)
+        # mba.for_all_topinsns(jzm)
+
+        # Once we’ve found the “comparison” variable (op_max), also pull in
+        # the jump-table’s own mapping of keys → blocks.
+        # for swi in switch_tbl_collector.switches:
+        #     # only use the jump-table whose state_var matches our op_max
+        #     if swi.state_var and swi.state_var.equal_mops(
+        #         op_max, ida_hexrays.EQ_IGNSIZE
+        #     ):
+        #         assert swi.cases is not None
+        #         # swi.cases is typically a dict of {key_value: target_block}
+        #         for case_idx in range(swi.cases.size()):
+        #             case_item: ida_hexrays.ccase_t = swi.cases.at(case_idx)
+        #             for val_idx in range(case_item.values.size()):
+        #                 case_val = case_item.values.at(val_idx)
+        #                 self.key_to_block[case_val] = case_item.ea
+        #                 self.block_to_key[case_item.ea] = case_val
+        #         report_info(f"[+] Imported {len(swi.cases)} jump-table entries")
+        #         report_debug(f"Jump-table cases: {swi.cases.values}")
+        #         break
+        for swi in switch_tbl_collector.switches:
+            if not swi.state_var or not swi.state_var.equal_mops(
+                op_max, ida_hexrays.EQ_IGNSIZE
+            ):
+                continue
+            assert swi.cases is not None
+            report_info(f"[+] Found jump-table for {op_max.dstr()}, importing cases")
+            num_imported = 0
+
+            vals: ida_xref.casevec_t = swi.cases.values  # casevec_t of the keys
+            targs: ida_pro.intvec_t = swi.cases.targets  # intvec_t of the block numbers
+            # they should be the same length
+            for vals, blk_ in zip(vals, targs):
+                py_blk = int(blk_)  # ensure a Python int
+                # vals is an intvec_t, so iterating yields int-like
+                for val in vals:
+                    py_key = int(val)  # coerce to Python int
+                    if py_key not in self.key_to_block:
+                        self.key_to_block[py_key] = py_blk
+                        num_imported += 1
+
+                # map each block back to *one* representative key
+                if py_blk not in self.block_to_key and len(vals) > 0:
+                    self.block_to_key[py_blk] = int(vals[0])
+
+            report_info(f"[+] Imported {num_imported} jump-table entries")
+            break
 
         # Save off the current function's starting EA
         self.which_func = ea
@@ -1869,11 +2002,13 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
             mba.get_mblock(erase.block).make_nop(erase.ins_mov)
         self.deferred_erasures_local = []
 
-    def func(self, blk):
+    @typing.override
+    def func(self, blk: ida_hexrays.mblock_t) -> int:
         """
         Top level unflattening function for entire graph.
+
         :param blk: mblock_t
-        :return: number of changes applied
+        :return: number of changes applied. See also mark_lists_dirty.
         """
 
         if self.plugin.activated == False:
@@ -2165,6 +2300,7 @@ class pyhexraysdeob_t(ida_idaapi.plugin_t):
             self.cfu = None
         self.activated = not self.activated
         print("%s, activated=%s" % (self.wanted_name, self.activated))
+        return self.activated
 
     def init(self):
         if not ida_hexrays.init_hexrays_plugin():
@@ -2204,5 +2340,14 @@ def PLUGIN_ENTRY():
 
 
 if __name__ == "__main__":
-    _pyhx = pyhexraysdeob_t()
+    try:
+        activated = _pyhx.toggle_activated()
+    except Exception as e:
+        _pyhx = pyhexraysdeob_t()
+    else:
+        if activated:
+            assert _pyhx.toggle_activated() is False
+        del _pyhx
+        _pyhx = pyhexraysdeob_t()
     _pyhx.init()
+    assert _pyhx.toggle_activated() is True
