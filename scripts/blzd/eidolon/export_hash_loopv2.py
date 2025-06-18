@@ -1,10 +1,4 @@
-## IDA Python Script to resolve APIs in BlackByteNT samples
-## Created by Cluster25
-## Tested on sample SHA256: 02a0a39dbe0dcb5600f4179aeab457bb86965699e45d1d154082b02139dc701d
-## Prerequisites:
-##  - Offset of the function used to resolve the APIs (in the analyzed sample it is sub_140001DF0)
-##  - Must run on Windows to have access to the list of DLLs in the System32 directory
-
+import functools
 import pathlib
 
 import pefile
@@ -57,6 +51,9 @@ def fnv1a_64(byte_sequence: bytes, lower=True) -> int:
         h = h ^ final_byte
         h = (h * fnv_prime) & 0xFFFFFFFFFFFFFFFF  # Keep it 64 bits
     return h
+
+
+HASHES = {""}
 
 
 def decode_name(byte_sequence: bytes, is_function=False) -> str:
@@ -139,19 +136,21 @@ def print_hash_table(debug=True):
                 print(f"    64-bit: 0x{hash64:016X}")
 
 
-def generate_enum_output():
+def generate_enum_output(enum_name, dll_name_algo, func_name_algo):
     out = pathlib.Path(idaapi.get_input_file_path()).parent / "api_hashes.h"
     with open(out, "w+", encoding="utf-8") as f:
-        f.write("enum EidolonApiHashesFnv1a64\n")
+        f.write(f"enum {enum_name}\n")
         f.write("{\n")
         # Print DLL entries with comments
         for dll_path in map(pathlib.Path, modules):
             if not dll_path.exists():
                 continue
             dll_name_utf8 = dll_path.name.encode("utf-8")
-            hash64 = fnv1a_64(dll_name_utf8)
+            hash64 = dll_name_algo(dll_name_utf8)
             dll_name = dll_path.name.replace(".", "_")
-            f.write(f"    FNV64A_{dll_name} = 0x{hash64:016X}, // {dll_path.name}\n")
+            f.write(
+                f"    {dll_name_algo.__name__}_{dll_name} = 0x{hash64:016X}, // {dll_path.name}\n"
+            )
             f.write("\n")  # Blank line separator
 
             pe = pefile.PE(dll_path)
@@ -159,14 +158,18 @@ def generate_enum_output():
                 if not exp.name:
                     continue
                 func_name = exp.name
-                hash64 = fnv1a_64(func_name)
+                hash64 = func_name_algo(func_name)
                 func_name_str = func_name.decode("ascii", errors="ignore").replace(
                     ".", "_"
                 )
                 f.write(
-                    f"    FNV64A_{dll_name}_{func_name_str} = 0x{hash64:016X}, // {func_name_str}\n"
+                    f"    {dll_name_algo.__name__}_{dll_name}_{func_name_str} = 0x{hash64:016X}, // {func_name_str}\n"
                 )
         f.write("};\n")
 
 
-generate_enum_output()
+generate_enum_output(
+    "EidolonApiHashesFnv1a64 : unsigned __int64",
+    fnv1a_64,
+    functools.partial(fnv1a_64, lower=False),
+)
