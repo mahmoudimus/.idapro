@@ -1,13 +1,12 @@
 import enum
 import logging
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import ida_hexrays
 import ida_idaapi
 import ida_lines
-import ida_loader
 import ida_pro
 import ida_xref
 
@@ -31,15 +30,6 @@ def configure_logger(logger: logging.Logger) -> logging.Logger:
     return logger
 
 
-logger = configure_logger(logging.getLogger("pyhrdeob"))
-
-
-class TraversalEnum(enum.IntEnum):
-    CONTINUE = 0
-    STOP = 1
-    SKIP = 2
-
-
 _mmat_strs = {
     ida_hexrays.MMAT_ZERO: "MMAT_ZERO",
     ida_hexrays.MMAT_GENERATED: "MMAT_GENERATED",
@@ -51,9 +41,6 @@ _mmat_strs = {
     ida_hexrays.MMAT_GLBOPT3: "MMAT_GLBOPT3",
     ida_hexrays.MMAT_LVARS: "MMAT_LVARS",
 }
-
-MIN_NUM_COMPARISONS = 2
-GOTO_NOT_SINGLE = -1
 
 
 class MicrocodeHelper:
@@ -132,11 +119,6 @@ class MicrocodeHelper:
         return cls.MatDelta.NEUTRAL
 
 
-mba_maturity_t_to_string = MicrocodeHelper.get_mmat_name
-
-mopt_t_to_string = MicrocodeHelper.get_mopt_name
-
-
 @dataclass
 class MicrocodeOpcode:
     name: str
@@ -159,32 +141,30 @@ class MicrocodeInstruction:
         return cls(minsn, OPCODES_INFO[minsn.opcode])
 
     def __repr__(self) -> str:
-        if not self.opcode:
-            return "???"
-
-        if self.opcode.nb_operands == 0:
-            return f"m_{self.opcode.name}"
-        elif self.opcode.nb_operands == 1:
-            return f"m_{self.opcode.name}(%s,%s)" % (
-                mopt_t_to_string(self.minsn.l.t),
-                mopt_t_to_string(self.minsn.d.t),
-            )
-        elif self.opcode.nb_operands == 2:
-            return f"m_{self.opcode.name}(%s,%s,%s)" % (
-                mopt_t_to_string(self.minsn.l.t),
-                mopt_t_to_string(self.minsn.r.t),
-                mopt_t_to_string(self.minsn.d.t),
-            )
-        return "???"
+        return self.repr(self.minsn)
 
     __str__ = __repr__
 
+    @classmethod
+    def repr(cls, minsn: ida_hexrays.minsn_t) -> str:
+        opcode = OPCODES_INFO[minsn.opcode]
+        if not opcode:
+            return "???"
 
-@dataclass
-class mov_info_t:
-    op_copy: Optional[ida_hexrays.mop_t] = None
-    ins_mov: Optional[ida_hexrays.minsn_t] = None
-    block: int = -1
+        if opcode.nb_operands == 0:
+            return f"m_{opcode.name}"
+        elif opcode.nb_operands == 1:
+            return f"m_{opcode.name}(%s,%s)" % (
+                MicrocodeHelper.get_mopt_name(minsn.l.t),
+                MicrocodeHelper.get_mopt_name(minsn.d.t),
+            )
+        elif opcode.nb_operands == 2:
+            return f"m_{opcode.name}(%s,%s,%s)" % (
+                MicrocodeHelper.get_mopt_name(minsn.l.t),
+                MicrocodeHelper.get_mopt_name(minsn.r.t),
+                MicrocodeHelper.get_mopt_name(minsn.d.t),
+            )
+        return "???"
 
 
 OPCODES_INFO = {
@@ -264,36 +244,22 @@ OPCODES_INFO = {
 }
 
 
-def mcode_t_to_string(o):
-    return repr(MicrocodeInstruction.from_minsn(o))
+logger = configure_logger(logging.getLogger("pyhrdeob"))
+MIN_NUM_COMPARISONS = 2
+GOTO_NOT_SINGLE = -1
 
 
-def report(msg):
-    logger.info("[pyhrdeob] %s", msg)
+class TraversalEnum(enum.IntEnum):
+    CONTINUE = 0
+    STOP = 1
+    SKIP = 2
 
 
-def report_success(msg):
-    logger.info("[+] %s", msg)
-
-
-def report_info(msg):
-    logger.info("[i] %s", msg)
-
-
-def report_info3(msg):
-    logger.info("[i3] %s", msg)
-
-
-def report_error(msg):
-    logger.error("[!] %s", msg)
-
-
-def report_error3(msg):
-    logger.error("[!3] %s", msg)
-
-
-def report_debug(msg):
-    logger.debug("[D] %s", msg)
+@dataclass
+class mov_info_t:
+    op_copy: Optional[ida_hexrays.mop_t] = None
+    ins_mov: Optional[ida_hexrays.minsn_t] = None
+    block: int = -1
 
 
 def insert_op(
@@ -376,7 +342,7 @@ def find_numeric_def_backwards(
       never traverse past the block numbered iBlockStop, if that parameter is
       non-negative.
     """
-    report_debug(
+    logger.debug(
         f"blk = {blk.serial}, op = {op.dstr()}, chain = {chain}, block_stop = {block_stop}"
     )
     mba = blk.mba
@@ -396,7 +362,9 @@ def find_numeric_def_backwards(
             # an "stx" instruction, which is assumed to redefine everything
             # until its aliasing information is refined.
             if _def.opcode != ida_hexrays.m_mov:
-                report_error("FindNumericDef: found %s" % mcode_t_to_string(_def))
+                logger.error(
+                    "FindNumericDef: found %s" % MicrocodeInstruction.repr(_def)
+                )
                 return False, None
 
             # Now that we found a mov, add it to the chain.
@@ -416,7 +384,7 @@ def find_numeric_def_backwards(
             # Otherwise, if it was not a numeric assignment, then try to track
             # whatever was assigned to it. This can only succeed if the thing
             # that was assigned was a register or stack variable.
-            report_info3(f"Now tracking {ida_lines.tag_remove(tag)}")
+            logger.info(f"Now tracking {ida_lines.tag_remove(tag)}")
 
             # Try to start tracking the other thing...
             ml.clear()
@@ -469,7 +437,7 @@ def find_forward_numeric_def(
     tag = assign_insn._print()
     assert tag
     # We only want MOV instructions with numeric left-hand sides
-    report_info3(f"Forward search found {ida_lines.tag_remove(tag)}")
+    logger.info(f"Forward search found {ida_lines.tag_remove(tag)}")
     if assign_insn.opcode != ida_hexrays.m_mov or assign_insn.l.t != ida_hexrays.mop_n:
         return False, None, None
 
@@ -501,7 +469,7 @@ def find_forward_stack_var_def(
     assert num
     tag = num._print()
     assert tag
-    report_info3(f"Forward method found {ida_lines.tag_remove(tag)}!")
+    logger.info(f"Forward method found {ida_lines.tag_remove(tag)}!")
 
     # If the found definition was suitable, add the assignment to the chain
     mi = mov_info_t()
@@ -577,7 +545,7 @@ def remove_single_gotos(mba):
         if not m2 or m2.opcode != ida_hexrays.m_goto or m2.l.t != ida_hexrays.mop_b:
             continue
 
-        report_debug(f"[+] Single goto found for block num = {b.serial}")
+        logger.debug(f"[+] Single goto found for block num = {b.serial}")
         # If it was a goto, record the destination block number
         forwarder_info[i] = m2.l.b
 
@@ -628,7 +596,7 @@ def remove_single_gotos(mba):
             # indicate that we should replace. Keep looping, though, to find
             # the ultimate destination.
             should_replace = True
-            report_debug("[+] Replacing single goto target")
+            logger.debug("[+] Replacing single goto target")
 
             # Now check: did the single-goto block also target a single-goto
             # block?
@@ -669,9 +637,9 @@ def extract_jcc_parts(
     # Check if the block ends with a conditional jump
     if ida_hexrays.is_mcode_jcond(pred1.tail.opcode):
         if pred1.tail.d.t != ida_hexrays.mop_b:
-            report_info(
+            logger.info(
                 "extract_jcc_parts: block was jcc, but destination was %s, not mop_b"
-                % (mopt_t_to_string(pred1.tail.d.t))
+                % (MicrocodeHelper.get_mopt_name(pred1.tail.d.t))
             )
             return False, None, -1, -1
         ends_with_jcc = pred1
@@ -780,17 +748,17 @@ class deferred_graph_modifier_t:
             mb_src.succset.push_back(mb_dst2.serial)
             mb_dst2.predset.push_back(mb_src.serial)
             if cfi == None:
-                report_info(
+                logger.info(
                     "Replaced edge (%d->%d) by (%d->%d)\n"
                     % (e.src, e.dst1, e.src, e.dst2)
                 )
             else:
                 if e.src in cfi.block_to_key.keys():
-                    report_info(
+                    logger.info(
                         f"Replaced edge ({e.src}->{e.dst1}) by ({e.src}->{e.dst2}) BlockKey = {hex(cfi.block_to_key[e.src])}"
                     )
                 else:
-                    report_info(
+                    logger.info(
                         f"Replaced edge ({e.src}->{e.dst1}) by ({e.src}->{e.dst2}) BlockKey = {cfi.block_to_key}"
                     )
         return len(self.edges)
@@ -863,7 +831,7 @@ class jz_info_t:
         # Compute the percentage of 1-bits. Given that these constants seem to be
         # created pseudorandomly, the percentage should be roughly 1/2.
         entropy = 0.0 if num_bits == 0 else num_ones / float(num_bits)
-        report_info(
+        logger.info(
             f"{self.nseen} comparisons, {len(self.nums)} numbers, {num_bits} bits, {num_ones} ones, {float(entropy)} entropy"
         )
         return entropy < 0.3 or entropy > 0.6
@@ -932,11 +900,11 @@ class switch_state_collector_t(ida_hexrays.minsn_visitor_t):
             idx_mop = ins.l
             tbl_mop = ins.r
             state_var = None
-            report_debug(f"jump table at: {hex(ins.ea)}")
+            logger.debug(f"jump table at: {hex(ins.ea)}")
             for msin in reversed(self.xdu_map):
                 dest = msin.minsn.d
                 src = msin.minsn.l
-                report_debug(
+                logger.debug(
                     f"{msin}, {hex(msin.minsn.ea)}, {dest.dstr()}, {src.dstr()}"
                 )
                 if dest.equal_mops(idx_mop, ida_hexrays.EQ_IGNSIZE):
@@ -1023,18 +991,18 @@ def get_first_block(
     :param mba: mba_t
     :return: True if found, mblock_t first block, serial first block, dispatcher serial
     """
-    report_info("Determining first block before cfg disp begins")
+    logger.info("Determining first block before cfg disp begins")
     # Initialise first and dispatch to erroneous values
     first, dispatch = -1, -1
     curr = 0
 
     while True:
 
-        report_info(f"Investigating if dispatcher. Current block = {curr}")
+        logger.info(f"Investigating if dispatcher. Current block = {curr}")
         # If we find a block with more than one successor, we failed.
         mb = mba.get_mblock(curr)
         if mb.nsucc() != 1:
-            report_error(f"Block {curr} had {mb.nsucc()} (!= 1) successors\n")
+            logger.error(f"Block {curr} had {mb.nsucc()} (!= 1) successors\n")
             return False, None, -1, -1
 
         # Get the successor block
@@ -1185,7 +1153,7 @@ class jz_mapper_t(ida_hexrays.minsn_visitor_t):
             block_no = blk.nextb.serial
         else:
             block_no = ins.d.b
-        self.cfi.report_info(
+        self.cfi.report(
             f"Mapping found, key_val = {hex(key_val)} -> block = {block_no}"
         )
         self.cfi.key_to_block[key_val] = block_no
@@ -1295,14 +1263,14 @@ class cf_flatten_info_t:
         self.block_to_key = {}
         self.clear()
 
-    def report_info(self, msg):
-        report_info(msg)
+    def report(self, msg):
+        logger.info(msg)
 
     def report_error(self, msg):
-        report_error(msg)
+        logger.error(msg)
 
     def report_debug(self, msg):
-        report_debug(msg)
+        logger.debug(msg)
 
     def clear(self):
         self.op_assigned = None
@@ -1343,7 +1311,7 @@ class cf_flatten_info_t:
         Detect additional dispatchers.
         """
         mba = blk.mba
-        report_info(f"Detecting additional dispatchers ..")
+        logger.info(f"Detecting additional dispatchers ..")
         block: ida_hexrays.mblock_t = mba.get_mblock(0)
         i = 0
         while block.nextb != None:
@@ -1353,7 +1321,7 @@ class cf_flatten_info_t:
                 and block.get_reginsn_qty() >= 1
                 and i not in self.detected_dispatchers
             ):
-                report_info(
+                logger.info(
                     f"Block serial = {block.serial} with greater equal 3 predecessors found, verifying whether potential dispatcher .."
                 )
                 self.detected_dispatchers.append(i)
@@ -1371,20 +1339,20 @@ class cf_flatten_info_t:
         # Ensure that this function hasn't been blacklisted (e.g. because entropy
         # calculation indicates that it isn't obfuscated).
         if ea in self.plugin.black_list:
-            report_error(f"[+] Function Ea = {hex(ea)} blacklisted!")
+            logger.error(f"[+] Function Ea = {hex(ea)} blacklisted!")
             return False
 
         # There's also a separate whitelist for functions that were previously
         # seen to be obfuscated.
         was_white_listed = ea in self.plugin.white_list
 
-        report_info(f"Running switch collector")
+        logger.info(f"Running switch collector")
         # Look for the variable that was used for the switch statement
         # statements. This is our "comparison" variable.
         switch_tbl_collector = switch_state_collector_t()
         mba.for_all_topinsns(switch_tbl_collector)
         if len(switch_tbl_collector.switches) == 0:
-            report_info(
+            logger.info(
                 f"No switch statements seen for function @ {hex(ea)} - adding function to blacklist"
             )
             # If there were no comparisons and we haven't seen this function
@@ -1393,7 +1361,7 @@ class cf_flatten_info_t:
                 self.plugin.black_list.append(ea)
             return False
 
-        report_info(
+        logger.info(
             f"Max switch statements seen = {len(switch_tbl_collector.switches)}"
         )
 
@@ -1403,13 +1371,13 @@ class cf_flatten_info_t:
         if not was_white_listed:
             # this kicks out cfgNetwork handling .. lowering entropy..
             # if jtblc.switch_insns[0].should_blacklist():
-            #     report_info(f"Classified function as not obfuscated")
+            #     report(f"Classified function as not obfuscated")
             #     self.plugin.black_list.append(ea)
             #     return False
             self.plugin.white_list.append(ea)
 
         op_max = switch_tbl_collector.switches[0].state_var
-        report_info(f"Comparison variable = {op_max.dstr()}")
+        logger.info(f"Comparison variable = {op_max.dstr()}")
         # op_max is our "comparison" variable used in the control flow switch.
         # if op_max.size < 4:
         #     self.report_error(f"Comparison variable {op_max.dstr()} is too narrow\n")
@@ -1420,7 +1388,7 @@ class cf_flatten_info_t:
         # control flow switch.
         ok, self.mb_first, self.first, self.dispatch = get_first_block(mba)
         if not ok:
-            report_error(f"Failed determining the first block")
+            logger.error(f"Failed determining the first block")
             return False
 
         assert self.mb_first
@@ -1429,7 +1397,7 @@ class cf_flatten_info_t:
         self.detected_dispatchers.append(self.dispatch)
         self.detect_additional_dispatchers(blk)
 
-        report_info(
+        logger.info(
             f"Determined dispatcher block = {self.dispatch}, first_block = {first.serial}, first.start = {hex(first.start)}"
         )
 
@@ -1443,7 +1411,7 @@ class cf_flatten_info_t:
         # Was the comparison variable assigned a number in the first block?
         found = False
         for sas in fbe.seen_assignments:
-            report_info(f"sas[0] = {sas[0].dstr()}")
+            logger.info(f"sas[0] = {sas[0].dstr()}")
             if sas[0].equal_mops(op_max, ida_hexrays.EQ_IGNSIZE):
                 found = True
                 break
@@ -1466,7 +1434,7 @@ class cf_flatten_info_t:
 
             # There should have only been one of them; is that true?
             if len(hvf.seen_copies) != 1:
-                report_error(f"Multiple copies found by handoff finder!")
+                logger.error(f"Multiple copies found by handoff finder!")
                 return False
 
             # If only one variable (X) assigned a number in the first block was
@@ -1510,7 +1478,7 @@ class cf_flatten_info_t:
         #                 case_val = case_item.values.at(val_idx)
         #                 self.key_to_block[case_val] = case_item.ea
         #                 self.block_to_key[case_item.ea] = case_val
-        #         report_info(f"[+] Imported {len(swi.cases)} jump-table entries")
+        #         report(f"[+] Imported {len(swi.cases)} jump-table entries")
         #         report_debug(f"Jump-table cases: {swi.cases.values}")
         #         break
         for swi in switch_tbl_collector.switches:
@@ -1519,7 +1487,7 @@ class cf_flatten_info_t:
             ):
                 continue
             assert swi.cases is not None
-            report_info(f"[+] Found jump-table for {op_max.dstr()}, importing cases")
+            logger.info(f"[+] Found jump-table for {op_max.dstr()}, importing cases")
             num_imported = 0
 
             vals: ida_xref.casevec_t = swi.cases.values  # casevec_t of the keys
@@ -1538,7 +1506,7 @@ class cf_flatten_info_t:
                 if py_blk not in self.block_to_key and len(vals) > 0:
                     self.block_to_key[py_blk] = int(vals[0])
 
-            report_info(f"[+] Imported {num_imported} jump-table entries")
+            logger.info(f"[+] Imported {num_imported} jump-table entries")
             break
 
         # Save off the current function's starting EA
@@ -1584,7 +1552,7 @@ class cf_flatten_info_t:
 
         # Save that information off.
         self.dominated_clusters = dominated_clusters
-        self.report_info(
+        self.report(
             f"m_DominatedClusters: {', '.join(map(str, self.dominated_clusters))}"
         )
 
@@ -1601,7 +1569,7 @@ class assign_searcher_t(ida_hexrays.minsn_visitor_t):
         ida_hexrays.minsn_visitor_t.__init__(self)
         self.op = op
         self.dispatcher_reg = dispatcher_reg
-        report_info(
+        logger.info(
             f"Initiated assign_searcher_t, op = {self.op.dstr()}, dispatcher_reg = {self.dispatcher_reg.dstr()}"
         )
         self.jz_target_block = -1
@@ -1634,7 +1602,7 @@ class assign_searcher_t(ida_hexrays.minsn_visitor_t):
                 and ins.r.dstr() == self.dispatcher_reg.dstr()
             ):
                 block_no = ins.d.b
-                report_info(f"Current instruction = {ins.dstr()}, block = {block_no}")
+                logger.info(f"Current instruction = {ins.dstr()}, block = {block_no}")
                 self.jz_target_block = block_no
             return 0
 
@@ -1653,20 +1621,14 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         self.verbose = True
         self.debug = True
 
-    def report_success(self, blk, changed):
-        report_success(f"UNFLATTENER: blk.start={hex(blk.start)} (changed={changed})")
-
-    def report_info(self, msg):
-        report_info(msg)
+    def report(self, msg):
+        logger.info(msg)
 
     def report_error(self, msg):
-        report_error(msg)
-
-    def report_error3(self, msg):
-        report_error3(msg)
+        logger.error(msg)
 
     def report_debug(self, msg):
-        report_debug(msg)
+        logger.debug(msg)
 
     def clear(self):
         self.cfi.clear()
@@ -1695,10 +1657,10 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
             # If it wasn't the first block, look up its cluster head block
             cluster_head = self.cfi.dominated_clusters[disp_pred]
             if cluster_head < 0:
-                self.report_info(f"Cluster_head returned zero!")
+                self.report(f"Cluster_head returned zero!")
                 return False, None, None
             mb_cluster_head: ida_hexrays.mblock_t = mba.get_mblock(cluster_head)
-            self.report_info(
+            self.report(
                 f"Block {disp_pred} was part of dominated cluster {cluster_head}"
             )
 
@@ -1722,7 +1684,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         # get the predset into a separate list
         visited_preds = [mb_serial for mb_serial in mb.predset]
         visited_preds.append(mb.serial)
-        self.report_info(
+        self.report(
             f"Searching for cluster_head the dirty way, serial = {mb.serial}, predset = {visited_preds}"
         )
 
@@ -1738,7 +1700,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                 # then take that one separately
                 if mb_pred_serial not in visited_preds:
                     dom_info = self.cfi.dom_info[mb_pred_serial]
-                    self.report_info(
+                    self.report(
                         f"Potential cluster_head found, potential_target = {mb_pred_serial}, dom_info = {','.join(str(x) for x in dom_info)}"
                     )
                 else:
@@ -1766,14 +1728,14 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
                 # is the target block our dispatcher block? great we found it!
                 dest_no = last_instr.d.b
-                self.report_info(
+                self.report(
                     f"cluster_head_dirty, last_instruction = {last_instr.dstr()}, target_block = {dest_no}"
                 )
                 if dest_no == target_mb.serial:
-                    self.report_info(f"Cluster head found! Cluster serial = {dest_no}")
+                    self.report(f"Cluster head found! Cluster serial = {dest_no}")
                     return True, mba.get_mblock(dest_no), dest_no
                 else:
-                    self.report_info(
+                    self.report(
                         f"Failed finding cluster head via dirty_method for block = {mb.serial}"
                     )
                     return ok, mb_cluster_head, cluster_head
@@ -1803,7 +1765,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         the CFUnflattener class.
         """
 
-        report_info(f"Current what = {what.dstr()}")
+        logger.info(f"Current what = {what.dstr()}")
 
         mba = mb.mba
         cluster_head = mb_cluster_head.serial
@@ -1818,16 +1780,16 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
         # If we found no intervening assignments to "what", that's bad.
         if len(local) == 0:
-            report_info(
+            logger.info(
                 f"Local array is zero, failed backward search! Dirty search now for block = {mb.serial}"
             )
             if mb.get_reginsn_qty() == 2:
-                report_info(f"2 instructions check suceeded!")
+                logger.info(f"2 instructions check suceeded!")
                 head_insn = mb.head
-                report_info(f"Head instruction = {head_insn.dstr()}")
+                logger.info(f"Head instruction = {head_insn.dstr()}")
             return -1
 
-        report_info(f"Local array not zero!")
+        logger.info(f"Local array not zero!")
 
         # opCopy now contains the last non-numeric assignment that we saw before
         # FindNumericDefBackwards terminated (either due to not being able to
@@ -1844,9 +1806,9 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         # of the cluster. If we don't find it, this is not necessarily an
         # indication that the analysis failed; for blocks with two successors,
         # we do further analysis.
-        report_info(f"OpCopy = {op_copy.dstr()}")
+        logger.info(f"OpCopy = {op_copy.dstr()}")
         if not found and op_copy and op_copy.t == ida_hexrays.mop_S:
-            report_info("Running forward analysis")
+            logger.info("Running forward analysis")
             num: ida_hexrays.mop_t | None = find_forward_stack_var_def(
                 mb_cluster_head, op_copy, local
             )
@@ -1854,7 +1816,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                 op_num = num
                 found = True
             else:
-                self.report_error3("Forward method also failed")
+                self.report_error("Forward method also failed")
 
         dest_no = -1
 
@@ -1871,18 +1833,18 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
             # search all instructions, if the register is assigned only ONCE and that is with a
             # high entropy variable, we can extract the high entropy value, and grab the block by key via that
-            report_info(
+            logger.info(
                 f"Attempting to search for block by key via iterating all instructions, op_copy = {op_copy}"
             )
             searcher = assign_searcher_t(op_copy, self.cfi.op_compared)
             mba.for_all_topinsns(searcher)
             if len(searcher.hits) == 1:
-                report_info(f"Only one assignment, {searcher.hits[0].dstr()}")
+                logger.info(f"Only one assignment, {searcher.hits[0].dstr()}")
                 key = searcher.hits[0].l.nnn.value
                 dest_no = self.cfi.find_block_by_key(key)
                 if dest_no == -1:
                     dest_no = searcher.jz_target_block
-                    report_info(f"Target block via assign_searcher = {dest_no}")
+                    logger.info(f"Target block via assign_searcher = {dest_no}")
                 return dest_no
 
         return dest_no
@@ -1931,7 +1893,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
             split_mblocks_by_jcc_ending(pred1, pred2)
         )
         if not ok:
-            self.report_info(
+            self.report(
                 "Block %s w/preds %s, %s did not have one predecessor ending in jcc, one without"
                 % (disp_pred, pred1.serial, pred2.serial)
             )
@@ -1943,7 +1905,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         # Sanity checking the structure of the graph. The nonJcc block should only
         # have one incoming edge...
         if non_jcc.npred() != 1:
-            self.report_info(
+            self.report(
                 "Block %d w/preds %d, %d did not have one predecessor ending in jcc, one without"
                 % (disp_pred, pred1.serial, pred2.serial)
             )
@@ -1951,7 +1913,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
         # ... namely, from the block ending with the jcc.
         if non_jcc.pred(0) != ends_with_jcc.serial:
-            self.report_info(
+            self.report(
                 "Block %d w/preds %d, %d, non-jcc pred %d did not have the other as its predecessor"
                 % (disp_pred, pred1.serial, pred2.serial, non_jcc.serial)
             )
@@ -1994,7 +1956,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         self.performed_erasures_global.extend(self.deferred_erasures_local)
         for erase in self.deferred_erasures_local:
 
-            self.report_info(
+            self.report(
                 "Erasing %08X: %s"
                 % (erase.ins_mov.ea, ida_lines.tag_remove(erase.ins_mov._print()))
             )
@@ -2032,7 +1994,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
         # remove single gotos
         changed = remove_single_gotos(mba)
-        report_info(f"Number of single GOTOS changed = {changed}")
+        logger.info(f"Number of single GOTOS changed = {changed}")
         if changed != 0:
             mba.verify(True)
 
@@ -2050,12 +2012,10 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         # then adjust the array to contain the dispatch block detected by
         # get_first_block only
         if self.plugin.RUN_MLTPL_DISPATCHERS is False:
-            self.report_info(
-                f"RUN_MLTPL_DISPATCHERS = {self.plugin.RUN_MLTPL_DISPATCHERS}"
-            )
+            self.report(f"RUN_MLTPL_DISPATCHERS = {self.plugin.RUN_MLTPL_DISPATCHERS}")
             self.cfi.detected_dispatchers = [self.cfi.dispatch]
 
-        self.report_info(
+        self.report(
             f"Number of dispatchers to unflatten = {len(self.cfi.detected_dispatchers)}"
         )
         for detected_dispatcher in self.cfi.detected_dispatchers:
@@ -2070,7 +2030,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                 continue
 
             dispatch_predset = dispatch_predset_block.predset
-            self.report_info(
+            self.report(
                 f"DispatcherBlock = {self.cfi.dispatch}, predset = {dispatch_predset}"
             )
 
@@ -2079,7 +2039,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
                 only_erase = False
                 mb = mba.get_mblock(disp_pred)
-                self.report_info(
+                self.report(
                     f"dispatcher = {self.cfi.dispatch}, deobfuscating predecessor = {disp_pred}, pred_successors = {mb.nsucc()}"
                 )
 
@@ -2093,12 +2053,12 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                 if mb.nsucc() != 1:
                     tail = mb.tail
                     if tail.opcode == ida_hexrays.m_jnz:
-                        self.report_info(
+                        self.report(
                             f"Tail instruction is jnz, checking if follow block tail is goto to dispatcher .."
                         )
                         flw_block = mba.get_mblock(disp_pred + 1)
                         if flw_block.tail.opcode == ida_hexrays.m_goto:
-                            self.report_info(
+                            self.report(
                                 f"Tail is goto! patching this block = {disp_pred + 1}, only erasing the assignment"
                             )
                             disp_pred = disp_pred + 1
@@ -2117,21 +2077,19 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                 )
                 if not mb_cluster_head:
                     # added additional method to search for the cluster head
-                    self.report_info(
+                    self.report(
                         f"Could not find dominated cluster head for pred = {disp_pred} via get_dominated_cluster_head."
                     )
                     ok, mb_cluster_head, cluster_head = (
                         self.get_dominated_cluster_head_by_pattern_dirty(mba, mb)
                     )
                     if not ok:
-                        self.report_info(
+                        self.report(
                             f"Could not find dominated cluster head for pred = {disp_pred} via dirty way"
                         )
                         continue
 
-                self.report_info(
-                    f"disp_pred = {disp_pred}, cluster_head = {cluster_head}"
-                )
+                self.report(f"disp_pred = {disp_pred}, cluster_head = {cluster_head}")
                 self.deferred_erasures_local = []
                 assert mb_cluster_head is not None
                 assert self.cfi.op_assigned is not None
@@ -2146,17 +2104,17 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
                 #!TODO what do we do here...?
                 if dest_no == disp_pred:
-                    self.report_info(
+                    self.report(
                         f"Found branch where destination == block, setting dest_no as value in "
                     )
                     continue
                     # dest_no2 = self.cfi.block_to_key[disp_pred]
-                    # self.report_info(f"Key = {hex(dest_no2)}")
+                    # self.report(f"Key = {hex(dest_no2)}")
                 # if we couldn't find a proper destination, for the block so far
                 # we will try to search for the proper destination by applying pattern matching
                 elif dest_no == -1:
 
-                    self.report_info(
+                    self.report(
                         f"Could not find destination for block = {disp_pred}, attempting pattern search now"
                     )
                     disp_block = mba.get_mblock(self.cfi.dispatch)
@@ -2172,19 +2130,17 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                         # if the successor branch final instruction is a jcnd,
                         # this is a potential dest block
                         if tail_reg.opcode == ida_hexrays.m_jg:
-                            self.report_info(f"Dispatcher block tail is jg instruction")
+                            self.report(f"Dispatcher block tail is jg instruction")
 
                             succ_block = mba.get_mblock(self.cfi.dispatch + 1)
                             if succ_block.tail.opcode == ida_hexrays.m_jcnd:
                                 dest_no = succ_block.tail.d.b
-                                self.report_info(
-                                    f"Destination via jcnd pattern = {dest_no}"
-                                )
+                                self.report(f"Destination via jcnd pattern = {dest_no}")
 
                 # Couldn't find any assignments at all to the assignment variable?
                 # That's bad, don't continue.
                 if not self.deferred_erasures_local:
-                    self.report_info(f"No assignments found for block = {disp_pred}!")
+                    self.report(f"No assignments found for block = {disp_pred}!")
                     continue
 
                 # Did we find a block target? Great; just update the CFG to point the
@@ -2201,7 +2157,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
                     # Erase the intermediary assignments to the assignment variable
                     self.process_erasures(mba)
-                    self.report_info(msg)
+                    self.report(msg)
 
                     changed += 1
                     continue
@@ -2211,8 +2167,8 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
                 # (the latter only for debug-printing purposes).
                 op_copy = self.deferred_erasures_local[-1].op_copy
                 m = self.deferred_erasures_local[-1].ins_mov
-                self.report_info(
-                    f"Block {disp_pred} did not define assign a number to assigned var; assigned {mopt_t_to_string(m.l.t)} instead"
+                self.report(
+                    f"Block {disp_pred} did not define assign a number to assigned var; assigned {MicrocodeHelper.get_mopt_name(m.l.t)} instead"
                 )
 
                 # Call the function that handles the case of a conditional assignment
@@ -2269,7 +2225,9 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
         # If we changed the graph, verify that we did so legally.
         if changed:
-            self.report_success(blk, changed)
+            logger.info(
+                f"UNFLATTENER: blk.start={hex(blk.start)} (changed={changed})"
+            )
             mba.verify(True)
 
         # if safe mode, deactivate the plugin after usage to prevent the annoying crashes
@@ -2341,13 +2299,13 @@ def PLUGIN_ENTRY():
 
 if __name__ == "__main__":
     try:
-        activated = _pyhx.toggle_activated()
+        activated = _pyhx.toggle_activated()  # type: ignore
     except Exception as e:
         _pyhx = pyhexraysdeob_t()
     else:
         if activated:
-            assert _pyhx.toggle_activated() is False
-        del _pyhx
+            assert _pyhx.toggle_activated() is False  # type: ignore
+        del _pyhx  # type: ignore
         _pyhx = pyhexraysdeob_t()
     _pyhx.init()
     assert _pyhx.toggle_activated() is True

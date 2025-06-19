@@ -9,6 +9,7 @@ import ida_kernwin
 import ida_problems
 import idaapi
 import idc
+
 import mutilz.actions as actions
 import mutilz.helpers.ida as ida_helpers
 
@@ -118,9 +119,11 @@ class ForceAnalyzeActionHandler(ida_helpers.BaseActionHandler):
             current_address = current_address + 1
 
     @classmethod
-    def reanalyze_function(cls, func_start: int, func_end: int = None):
-        if not func_end:
+    def reanalyze_function(cls, func_start: int, func_end: int = idc.BADADDR):
+        if func_end == idc.BADADDR:
             func_end = idc.find_func_end(func_start)
+            if func_end == idc.BADADDR:
+                raise ValueError(f"Failed to find function end for {hex(func_start)}")
 
         size = func_end - func_start
         ida_bytes.del_items(func_start, 0, size)
