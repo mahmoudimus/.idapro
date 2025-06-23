@@ -1216,6 +1216,22 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         Ignores mem_bytes_at_ea, uses IDA's database.
         Conforms to DecoderProtocol.
         """
+        # TODO:
+        # .text:00000001409451F3 000 18 F6                                               sbb     dh, dh
+        # .text:00000001409451F5 000 77 5A                                               ja      short loc_140945251
+
+        # TODO:
+        # .text:0000000180002350 90                                                  nop
+        # .text:0000000180002351 70 00                                               jo      short $+2
+
+        # TODO:
+        # .text:0000000180002308 81 EF 3D 00 62 5E                                   sub     edi, 5E62003Dh
+        # .text:000000018000230E 81                                                  db 81h
+        # .text:000000018000230F C3                                                  retn
+        # .text:0000000180002310                                     ; ---------------------------------------------------------------------------
+        # .text:0000000180002310                                     loc_180002310:                          ; CODE XREF: sub_180001000+12E4↑j
+        # .text:0000000180002310 86 FF                                               xchg    bh, bh
+        #
         self.load_buffer(mem_bytes_at_ea, ea)
         # Decode using Capstone
         insn = self.get_next_insn()

@@ -1,6 +1,7 @@
 import enum
 import logging
 import typing
+import weakref
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -1964,6 +1965,13 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
             mba.get_mblock(erase.block).make_nop(erase.ins_mov)
         self.deferred_erasures_local = []
 
+    @staticmethod
+    def check_maturity(maturity: int) -> bool:
+        """
+        Check if the maturity level is correct for the current function.
+        """
+        return maturity == ida_hexrays.MMAT_LOCOPT
+
     @typing.override
     def func(self, blk: ida_hexrays.mblock_t) -> int:
         """
@@ -1989,7 +1997,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
         if self.last_maturity == mba.maturity:
             return 0
         self.last_maturity = mba.maturity
-        if mba.maturity != ida_hexrays.MMAT_LOCOPT:
+        if not self.check_maturity(mba.maturity):
             return 0
 
         # remove single gotos
@@ -2225,9 +2233,7 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
 
         # If we changed the graph, verify that we did so legally.
         if changed:
-            logger.info(
-                f"UNFLATTENER: blk.start={hex(blk.start)} (changed={changed})"
-            )
+            logger.info(f"UNFLATTENER: blk.start={hex(blk.start)} (changed={changed})")
             mba.verify(True)
 
         # if safe mode, deactivate the plugin after usage to prevent the annoying crashes
@@ -2235,6 +2241,20 @@ class cf_unflattener_t(ida_hexrays.optblock_t):
             self.plugin.activated = False
 
         return changed
+
+
+class EidolonHooks(ida_hexrays.Hexrays_Hooks):
+
+    def __init__(self, weakref_plugin: weakref.ref["pyhexraysdeob_t"]):
+        super().__init__()
+        self.plugin = weakref_plugin
+
+    def open_pseudocode(self, vu):
+        # called once when you first open/reopen a function view
+        phx = self.plugin()
+        if phx and phx.cfu:
+            phx.cfu.last_maturity = ida_hexrays.MMAT_ZERO
+        return 0
 
 
 class pyhexraysdeob_t(ida_idaapi.plugin_t):
@@ -2247,6 +2267,7 @@ class pyhexraysdeob_t(ida_idaapi.plugin_t):
         self.flags = 0
         self.RUN_MLTPL_DISPATCHERS = True
         self.cfu = None
+        self.hooks: EidolonHooks | None = None
 
     def toggle_activated(self):
         if not self.activated:
@@ -2268,6 +2289,8 @@ class pyhexraysdeob_t(ida_idaapi.plugin_t):
             "Hex-rays version %s has been detected, %s ready to use"
             % (ida_hexrays.get_hexrays_version(), self.wanted_name)
         )
+        self.hr_hook = EidolonHooks(weakref.ref(self))
+        self.hr_hook.hook()
         return ida_idaapi.PLUGIN_OK
 
     def run(self, arg):
@@ -2288,7 +2311,14 @@ class pyhexraysdeob_t(ida_idaapi.plugin_t):
             if vaddr not in self.white_list:
                 self.white_list.append(vaddr)
 
+    def reset_maturity(self):
+        if self.cfu:
+            self.cfu.last_maturity = ida_hexrays.MMAT_ZERO
+
     def term(self):
+        if self.hr_hook:
+            self.hr_hook.unhook()
+            self.hr_hook = None
         if self.activated:
             self.toggle_activated()
 

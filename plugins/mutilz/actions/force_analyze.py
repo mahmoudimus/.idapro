@@ -102,7 +102,12 @@ class ForceAnalyzeActionHandler(ida_helpers.BaseActionHandler):
                 ea = idc.next_head(ea, end_ea)
 
     @staticmethod
-    def decompile_function(func_start: int):
+    def decompile_function(func_start: int, close_view: bool = False):
+        idaapi.auto_wait()
+        # 1) Invalidate Hex-Rays’ cache for this function – it will
+        #    regenerate everything (including microcode) next time.
+        #    Pass True if you want the UI to refresh immediately.
+        ida_hexrays.mark_cfunc_dirty(func_start, close_view)
         hf = ida_hexrays.hexrays_failure_t()
         ida_hexrays.decompile_func(ida_funcs.get_func(func_start), hf)
 
@@ -118,19 +123,27 @@ class ForceAnalyzeActionHandler(ida_helpers.BaseActionHandler):
             ida_problems.forget_problem(ida_problems.PR_DISASM, current_address)
             current_address = current_address + 1
 
+    @staticmethod
+    def reset_analysis_in_range(func_start: int, func_end: int):
+        ida_auto.revert_ida_decisions(func_start, func_end)
+        ida_auto.plan_and_wait(func_start, func_end)
+
+    @staticmethod
+    def delete_and_recreate_function(func_start: int, func_end: int):
+        size = func_end - func_start
+        ida_bytes.del_items(func_start, 0, size)
+        for i in range(size):
+            idaapi.create_insn(func_start + i)
+        ida_funcs.add_func(func_start, func_end)
+        ida_auto.auto_wait()
+
     @classmethod
     def reanalyze_function(cls, func_start: int, func_end: int = idc.BADADDR):
         if func_end == idc.BADADDR:
             func_end = idc.find_func_end(func_start)
             if func_end == idc.BADADDR:
                 raise ValueError(f"Failed to find function end for {hex(func_start)}")
-
-        size = func_end - func_start
-        ida_bytes.del_items(func_start, 0, size)
-        for i in range(size):
-            idaapi.create_insn(func_start + i)
-        ida_funcs.add_func(func_start, func_end)
-        idaapi.auto_wait()
+        cls.delete_and_recreate_function(func_start, func_end)
         cls.decompile_function(func_start)
         print(f"Fixed function {hex(func_start)}")
         cls.reset_problems_in_function(func_start, func_end)

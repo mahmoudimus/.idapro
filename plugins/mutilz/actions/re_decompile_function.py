@@ -5,6 +5,7 @@ import functools
 import ida_funcs
 import idaapi
 import idc
+
 import mutilz.actions as actions
 import mutilz.helpers.ida as ida_helpers
 from mutilz.actions.force_analyze import ForceAnalyzeActionHandler
@@ -22,9 +23,12 @@ class RedecompilefunctionActionHandler(ida_helpers.BaseActionHandler):
         ea = idaapi.get_screen_ea()
         func = ida_funcs.get_func(ea)
         start_ea = func.start_ea if func else ea
+        end_ea = func.end_ea if func else idc.find_func_end(start_ea)
 
         try:
             ForceAnalyzeActionHandler.decompile_function(start_ea)
+            ForceAnalyzeActionHandler.reset_analysis_in_range(start_ea, end_ea)
+            ForceAnalyzeActionHandler.reset_problems_in_function(start_ea, end_ea)
         finally:
             idc.jumpto(ea)
         return 1
