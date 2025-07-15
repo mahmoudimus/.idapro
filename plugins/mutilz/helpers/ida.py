@@ -340,6 +340,10 @@ def is_disassembly_widget(widget, popup, ctx):
     return idaapi.get_widget_type(widget) == idaapi.BWN_DISASM
 
 
+def is_functions_widget(widget, popup, ctx):
+    return idaapi.get_widget_type(widget) == idaapi.BWN_FUNCS
+
+
 def find_signature(ida_signature: str) -> list:
     binary_pattern = idaapi.compiled_binpat_vec_t()
     idaapi.parse_binpat_str(binary_pattern, ida_ida.inf_get_min_ea(), ida_signature, 16)

@@ -3,6 +3,7 @@ import pathlib
 
 import pefile
 
+import idaapi
 import idautils
 
 # List of DLLs dynamically loaded by BlackByteNT
@@ -136,7 +137,13 @@ def print_hash_table(debug=True):
                 print(f"    64-bit: 0x{hash64:016X}")
 
 
-def generate_enum_output(enum_name, dll_name_algo, func_name_algo):
+def generate_enum_output(
+    enum_name,
+    dll_name_algo,
+    func_name_algo,
+    dll_name_encoding="utf-8",
+    func_name_encoding="ascii",
+):
     out = pathlib.Path(idaapi.get_input_file_path()).parent / "api_hashes.h"
     with open(out, "w+", encoding="utf-8") as f:
         f.write(f"enum {enum_name}\n")
@@ -145,11 +152,11 @@ def generate_enum_output(enum_name, dll_name_algo, func_name_algo):
         for dll_path in map(pathlib.Path, modules):
             if not dll_path.exists():
                 continue
-            dll_name_utf8 = dll_path.name.encode("utf-8")
-            hash64 = dll_name_algo(dll_name_utf8)
+            dll_name_utf8 = dll_path.name.encode(dll_name_encoding)
+            hash_value = dll_name_algo(dll_name_utf8)
             dll_name = dll_path.name.replace(".", "_")
             f.write(
-                f"    {dll_name_algo.__name__}_{dll_name} = 0x{hash64:016X}, // {dll_path.name}\n"
+                f"    {dll_name_algo.__name__}_{dll_name} = 0x{hash_value:016X}, // {dll_path.name}\n"
             )
             f.write("\n")  # Blank line separator
 
@@ -158,18 +165,26 @@ def generate_enum_output(enum_name, dll_name_algo, func_name_algo):
                 if not exp.name:
                     continue
                 func_name = exp.name
-                hash64 = func_name_algo(func_name)
-                func_name_str = func_name.decode("ascii", errors="ignore").replace(
-                    ".", "_"
-                )
+                hash_value = func_name_algo(func_name)
+                func_name_str = func_name.decode(
+                    func_name_encoding, errors="ignore"
+                ).replace(".", "_")
                 f.write(
-                    f"    {dll_name_algo.__name__}_{dll_name}_{func_name_str} = 0x{hash64:016X}, // {func_name_str}\n"
+                    f"    {dll_name_algo.__name__}_{dll_name}_{func_name_str} = 0x{hash_value:016X}, // {func_name_str}\n"
                 )
         f.write("};\n")
 
 
+# generate_enum_output(
+#     "EidolonApiHashesFnv1a64 : unsigned __int64",
+#     fnv1a_64,
+#     functools.partial(fnv1a_64, lower=False),
+# )
+
 generate_enum_output(
-    "EidolonApiHashesFnv1a64 : unsigned __int64",
-    fnv1a_64,
-    functools.partial(fnv1a_64, lower=False),
+    "AegisApiHashesFnv1a32 : unsigned __int32",
+    fnv1a_32,
+    fnv1a_32,
+    "utf-16le",
+    "ascii",
 )
