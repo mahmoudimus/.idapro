@@ -15,3 +15,8 @@ tmp/*.db
 tmp/*.bin
 tmp/*.i64
 tmp/**/*
+
+
+plugins/D810.py
+plugins/d810
+scripts/poisonplug-scatterbrain
