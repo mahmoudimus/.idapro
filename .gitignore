@@ -12,3 +12,6 @@ tmp/boombox.exe.i64
 sig
 til
 tmp/*.db
+tmp/*.bin
+tmp/*.i64
+tmp/**/*

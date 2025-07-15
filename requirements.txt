@@ -9,9 +9,16 @@ setuptools==78.1.0
 flare-capa
 debugpy==1.8.13
 openai==1.70.0
-groq==0.22.0
-together==1.5.4
 ollama==0.4.7
 clang==20.1.0
 pywin32==310; sys_platform == 'Windows'
 ipython
+libcst>=1.8.2,<2.0.0
+monkeytype>=23.0.0,<24.0.0
+sark>=9.0.0,<10.0.0
+parse>=1.20.0,<2.0.0
+tqdm>=4.0.0,<5.0.0
+wrapt>=1.0.0,<2.0.0
+networkx>=3.0.0,<4.0.0
+ida-netnode>=3.0.0,<4.0.0
+colorama>=0.4.0,<1.0.0
