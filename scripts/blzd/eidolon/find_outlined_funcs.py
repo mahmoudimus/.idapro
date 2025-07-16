@@ -1,10 +1,25 @@
 import abc
+import dataclasses
 import logging
+
+from PyQt5.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QHBoxLayout,
+    QHeaderView,
+    QMessageBox,
+    QPushButton,
+    QTableView,
+    QVBoxLayout,
+    QWidget,
+)
 
 import ida_allins
 import ida_bytes
 import ida_funcs
 import ida_idp
+import ida_kernwin
 import ida_segment
 import ida_typeinf
 import ida_ua
@@ -15,6 +30,17 @@ import idc
 # Configure logging to display in the IDA output window
 logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
 log = logging.getLogger("OutlinedFuncDetector")
+
+
+@dataclasses.dataclass
+class CandidateFunction:
+    """Holds the state for a function that might be outlined."""
+
+    address: int
+    name: str
+    score: int
+    confirmed: bool = False
+    visited: bool = False
 
 
 class Heuristic(abc.ABC):
@@ -309,9 +335,7 @@ class IsNotLibOrThunkHeuristic(Heuristic):
 
 
 class OutlinedFunctionDetector:
-    """
-    Detects outlined functions by scoring them against a set of weighted heuristics.
-    """
+    """Detects outlined functions by scoring them and returning a list of candidates."""
 
     def __init__(self, heuristics: list[Heuristic], score_threshold: int):
         """
@@ -328,69 +352,211 @@ class OutlinedFunctionDetector:
             score_threshold,
         )
 
-    def calculate_score(self, func_ea: int) -> int:
+    def find_all(self) -> list[CandidateFunction]:
         """
-        Calculates a score for a function based on the configured heuristics.
-
-        :param func_ea: The starting address of the function.
-        :return: The total score.
-        """
-        return sum(h(func_ea) for h in self.heuristics)
-
-    def is_likely_outlined(self, func_ea: int) -> bool:
-        """
-        Checks if a function is likely an outlined function by comparing its score
-        to the threshold.
-
-        :param func_ea: The starting address of the function.
-        :return: True if the function's score meets the threshold, False otherwise.
-        """
-        try:
-            score = self.calculate_score(func_ea)
-        except Exception as e:
-            log.error(
-                "Error in this function: %s - skipping!", hex(func_ea), exc_info=True
-            )
-            return False
-        return score >= self.score_threshold
-
-    def find_and_mark_all(self, set_ida_flag=True, rename_func=True):
-        """
-        Iterates through all functions, identifies outlined functions,
-        and optionally marks and renames them.
+        Finds all likely outlined functions and returns them as a list.
+        :return: A list of CandidateFunction objects.
         """
         log.info("Starting scan for outlined functions...")
-        count = 0
+        candidates = []
         for func_ea in idautils.Functions():
-            # Don't re-evaluate functions already marked as outlined.
             if idc.get_func_flags(func_ea) & idc.FUNC_OUTLINE:
                 continue
 
-            if self.is_likely_outlined(func_ea):
-                count += 1
-                func_name = idc.get_func_name(func_ea)
-                log.info(
-                    "Found likely outlined function: %s at 0x%x", func_name, func_ea
+            try:
+                score = sum(h(func_ea) for h in self.heuristics)
+            except Exception as e:
+                log.error(
+                    "Error %s in this function: %s - skipping!",
+                    e,
+                    hex(func_ea),
+                    exc_info=True,
                 )
+                continue
 
-                if set_ida_flag:
-                    flags = idc.get_func_flags(func_ea)
-                    idc.set_func_flags(func_ea, flags | idc.FUNC_OUTLINE)
+            if score >= self.score_threshold:
+                candidates.append(
+                    CandidateFunction(
+                        address=func_ea, name=idc.get_func_name(func_ea), score=score
+                    )
+                )
+        log.info(
+            "Scan complete. Found %d potential outlined functions.", len(candidates)
+        )
+        return candidates
 
-                if rename_func and func_name.startswith("sub_"):
-                    new_name = f"outline_{func_name}"
-                    if not idc.set_name(func_ea, new_name, idc.SN_NOWARN):
-                        log.warning("Failed to rename %s to %s", func_name, new_name)
 
-        log.info("Scan complete. Found %d new outlined functions.", count)
+# =============================================================================
+# PyQt GUI Components
+# =============================================================================
+class OutlinedFunctionTableModel(QAbstractTableModel):
+    """A Qt Table Model to manage the list of candidate functions."""
+
+    _HEADERS = ["Confirmed", "Address", "Name", "Score"]
+    _VISITED_COLOR = QColor(0xE0, 0xE0, 0xF8)  # A light lavender color
+
+    def __init__(self, data: list[CandidateFunction]):
+        super().__init__()
+        self._data = data
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._data)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self._HEADERS)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return self._HEADERS[section]
+        return None
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+
+        row, col = index.row(), index.column()
+        item = self._data[row]
+
+        if role == Qt.DisplayRole:
+            if col == 1:
+                return f"0x{item.address:X}"
+            if col == 2:
+                return item.name
+            if col == 3:
+                return str(item.score)
+        elif role == Qt.CheckStateRole and col == 0:
+            return Qt.Checked if item.confirmed else Qt.Unchecked
+        elif role == Qt.BackgroundRole and item.visited:
+            return self._VISITED_COLOR
+        return None
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if not index.isValid():
+            return False
+
+        row, col = index.row(), index.column()
+        item = self._data[row]
+
+        if role == Qt.CheckStateRole and col == 0:
+            item.confirmed = value == Qt.Checked
+            self.dataChanged.emit(index, index, [role])
+            return True
+        return False
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.NoItemFlags
+        base_flags = super().flags(index)
+        if index.column() == 0:
+            return base_flags | Qt.ItemIsUserCheckable
+        return base_flags
+
+    def mark_as_visited(self, row: int):
+        """Marks a row as visited and triggers a redraw."""
+        if 0 <= row < len(self._data):
+            self._data[row].visited = True
+            # Emit dataChanged for the entire row to update its background
+            start_index = self.index(row, 0)
+            end_index = self.index(row, self.columnCount() - 1)
+            self.dataChanged.emit(start_index, end_index, [Qt.BackgroundRole])
+
+    def get_confirmed_functions(self) -> list[CandidateFunction]:
+        """Returns a list of all functions the user has confirmed."""
+        return [item for item in self._data if item.confirmed]
 
 
+class OutlinedFunctionViewer(ida_kernwin.PluginForm):
+    """A PyQt Widget to display and manage the list of candidate functions."""
+
+    def __init__(self, candidates: list[CandidateFunction]):
+        super().__init__()
+        self.candidates = candidates
+        self.model = OutlinedFunctionTableModel(self.candidates)
+
+    def OnCreate(self, form):
+        self.parent: QWidget = self.FormToPyQtWidget(form)
+        self.parent.setWindowTitle("Outlined Function Candidates")
+        self._setup_ui()
+
+    def _setup_ui(self):
+        # --- Table View ---
+        self.table_view = QTableView()
+        self.table_view.setModel(self.model)
+        self.table_view.setSelectionBehavior(QTableView.SelectRows)
+        self.table_view.setSortingEnabled(True)
+        self.table_view.doubleClicked.connect(self.on_double_click)
+
+        # Adjust column widths
+        header = self.table_view.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+
+        # --- Controls ---
+        self.rename_checkbox = QCheckBox("Rename confirmed functions to 'outline_...'")
+        self.rename_checkbox.setChecked(True)
+        self.apply_button = QPushButton("Apply Changes to Confirmed Functions")
+        self.apply_button.clicked.connect(self.on_apply_changes)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(self.rename_checkbox)
+        controls_layout.addStretch()
+        controls_layout.addWidget(self.apply_button)
+
+        # --- Main Layout ---
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(self.table_view)
+        main_layout.addLayout(controls_layout)
+        self.parent.setLayout(main_layout)
+
+    def on_double_click(self, index: QModelIndex):
+        """Jump to the function in IDA when a row is double-clicked."""
+        row = index.row()
+        candidate = self.candidates[row]
+        ida_kernwin.jumpto(candidate.address)
+        self.model.mark_as_visited(row)
+
+    def on_apply_changes(self):
+        """Apply the FUNC_OUTLINE flag and rename functions for confirmed items."""
+        confirmed_items = self.model.get_confirmed_functions()
+        if not confirmed_items:
+            QMessageBox.information(
+                self.parent,
+                "No Changes",
+                "No functions were confirmed. Nothing to apply.",
+            )
+            return
+
+        should_rename = self.rename_checkbox.isChecked()
+        changed_count = 0
+
+        for item in confirmed_items:
+            flags = idc.get_func_flags(item.address)
+            if not (flags & idc.FUNC_OUTLINE):
+                idc.set_func_flags(item.address, flags | idc.FUNC_OUTLINE)
+                changed_count += 1
+
+            if should_rename and item.name.startswith("sub_"):
+                new_name = f"outline_{item.name}"
+                idc.set_name(item.address, new_name, idc.SN_NOWARN)
+
+        QMessageBox.information(
+            self.parent,
+            "Success",
+            f"Applied changes to {len(confirmed_items)} function(s).",
+        )
+        self.Close(0)
+
+    def OnClose(self, form):
+        pass
+
+
+# =============================================================================
+# Main Execution Logic
+# =============================================================================
 def main():
-    """
-    Main entry point for the script. Configures and runs the detector.
-    """
-    # Define the set of heuristics and their weights.
-    # These can be tuned for different obfuscation patterns.
+
     heuristics = [
         # Disqualifying heuristics (large negative weight)
         IsNotLibOrThunkHeuristic(weight=-1000),
@@ -410,7 +576,18 @@ def main():
     score_threshold = 90
 
     detector = OutlinedFunctionDetector(heuristics, score_threshold)
-    detector.find_and_mark_all(set_ida_flag=False, rename_func=False)
+    candidates = detector.find_all()
+
+    if not candidates:
+        ida_kernwin.info(
+            "Scan complete. No new outlined function candidates were found."
+        )
+        return
+
+    # Launch the GUI
+    global outlined_function_viewer  # Keep a global reference to prevent garbage collection
+    outlined_function_viewer = OutlinedFunctionViewer(candidates)
+    outlined_function_viewer.Show("Outlined Function Candidates")
 
 
 if __name__ == "__main__":

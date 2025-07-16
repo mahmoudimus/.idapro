@@ -825,7 +825,10 @@ def simple_pattern_generator():
 
 def more_specific_pattern_generator():
     """Generates IDA string patterns based on Untitled-3 logic."""
-
+#
+# .text:0000000180233829 70 47                                               jo      short near ptr loc_18023386E+4
+# .text:000000018023382B C0 F6 00                                            sal     dh, 0
+# .text:000000018023382E 71 42                                               jno     short near ptr loc_18023386E+4
     pads_ll_str = [[0xC0, -1, 0x00], [0x86, -1], [0x8A, -1]]
 
     multipart_defs_tuple_list_str: List[Tuple[List[int], List[int]]] = [
@@ -905,7 +908,9 @@ PREFIX_PATTERNS = [
     rb"\xF9",  # STC
     rb"[\x80\x81\x83]\xFC\x00...",  # CMP ESP,0x1C00
 ]
-
+# .text:00000001800F5939 81 FC 00 09 00 00                                   cmp     esp, 900h
+# .text:00000001800F593F 77 03                                               ja      short loc_1800F5944
+#
 _COMPILED_PREFIX_REGEX = re.compile(b"|".join(PREFIX_PATTERNS), re.DOTALL)
 
 
