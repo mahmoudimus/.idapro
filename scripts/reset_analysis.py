@@ -22,7 +22,6 @@ def reset_analysis(
 def decompile_function(func_start: int):
     hf = ida_hexrays.hexrays_failure_t()
     ida_hexrays.decompile_func(ida_funcs.get_func(func_start), hf)
-
     ida_auto.auto_wait()
 
 
@@ -38,8 +37,10 @@ def reset_problems_in_function(func_start: int, func_end: int):
         current_address = current_address + 1
 
 
-def reanalyze_function(func_start: int, func_end: int = None, decompile: bool = False):
-    if not func_end:
+def reanalyze_function(
+    func_start: int, func_end: int = idaapi.BADADDR, decompile: bool = False
+):
+    if func_end == idaapi.BADADDR:
         func_end = idc.find_func_end(func_start)
 
     size = func_end - func_start
@@ -54,6 +55,8 @@ def reanalyze_function(func_start: int, func_end: int = None, decompile: bool = 
     reset_problems_in_function(func_start, func_end)
 
 
+text_segment = idaapi.get_segm_by_name(".text")
+reset_analysis(text_segment.start_ea, text_segment.end_ea)
 for func_ea in idautils.Functions():
     # func_ea is already the start_ea of each function
     reanalyze_function(func_ea)

@@ -1,10 +1,16 @@
 import functools
+import logging
 import pathlib
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple
 
 import pefile
 
 import idaapi
 import idautils
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # List of DLLs dynamically loaded by BlackByteNT
 modules = [
@@ -25,6 +31,14 @@ modules = [
     "C:\\Windows\\System32\\IPHLPAPI.dll",
     "C:\\Windows\\System32\\Ws2_32.dll",
     "C:\\Windows\\System32\\Dbghelp.dll",
+    "F:\\Blizzard\\Wow\\_retail_\\wow_loader.dll",
+    "F:\\Blizzard\\Wow\\_retail_\\Wow_loader.dll",
+    "F:\\Blizzard\\Wow\\_beta_\\WowB_loader.dll",
+    "F:\\Blizzard\\Wow\\_ptr_\\WowT_loader.dll",
+    "F:\\Blizzard\\Wow\\_xptr_\\WowT_loader.dll",
+    # "F:\\Blizzard\\Wow\\_classic_\\WowClassic_loader.dll",
+    # "F:\\Blizzard\\Wow\\_retail_\\WowClassicT_loader.dll",
+    # "F:\\Blizzard\\Wow\\_retail_\\WowClassicB_loader.dll",
 ]
 
 # Returns the hash of the input string
@@ -55,6 +69,89 @@ def fnv1a_64(byte_sequence: bytes, lower=True) -> int:
 
 
 HASHES = {""}
+
+
+@dataclass
+class Dll:
+    """
+    Represents a DLL with its name, optional path, and exports.
+    Can be created from a file path or from a configuration dictionary.
+    """
+
+    name: str
+    path: Optional[pathlib.Path] = None
+    exports: Optional[List[str]] = None
+
+    @classmethod
+    def from_path(cls, dll_path: pathlib.Path) -> "Dll":
+        """
+        Create a Dll instance from a file path.
+        Extracts exports from the PE file.
+        """
+        if not dll_path.exists():
+            logger.warning("DLL path does not exist: %s", dll_path)
+            return cls(name=dll_path.name, path=dll_path, exports=[])
+
+        exports = []
+        try:
+            pe = pefile.PE(dll_path)
+            if hasattr(pe, "DIRECTORY_ENTRY_EXPORT") and pe.DIRECTORY_ENTRY_EXPORT:
+                for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    if exp.name:
+                        exports.append(exp.name.decode("ascii", errors="ignore"))
+        except Exception as e:
+            logger.error("Failed to parse PE file %s: %s", dll_path, e)
+
+        return cls(name=dll_path.name, path=dll_path, exports=exports)
+
+    @classmethod
+    def from_config(cls, config: dict) -> "Dll":
+        """
+        Create a Dll instance from a configuration dictionary.
+        Expected format: {"name": "dll_name.dll", "exports": ["export1", "export2"]}
+        """
+        name = config.get("name", "")
+        exports = config.get("exports", [])
+        return cls(name=name, path=None, exports=exports)
+
+    def get_dll_hash(
+        self, algo: Callable[[bytes], int], encoding: str = "utf-8"
+    ) -> int:
+        """
+        Get the hash of the DLL name using the specified algorithm and encoding.
+        """
+        name_bytes = self.name.encode(encoding)
+        return algo(name_bytes)
+
+    def get_export_hashes(
+        self, algo: Callable[[bytes], int], encoding: str = "ascii"
+    ) -> List[Tuple[str, int]]:
+        """
+        Get a list of (export_name, hash) tuples for all exports.
+        """
+        if not self.exports:
+            return []
+
+        result = []
+        for export_name in self.exports:
+            export_bytes = export_name.encode(encoding)
+            hash_value = algo(export_bytes)
+            result.append((export_name, hash_value))
+        return result
+
+    def get_all_hashes(
+        self,
+        algo: Callable[[bytes], int],
+        dll_name_encoding: str = "utf-8",
+        export_encoding: str = "utf-8",
+    ) -> Tuple[int, List[Tuple[str, int]]]:
+        """
+        Get both DLL name hash and all export hashes using the same algorithm.
+        Returns a tuple of (dll_name_hash, list of (export_name, hash) tuples).
+        """
+        dll_hash = self.get_dll_hash(algo, dll_name_encoding)
+        export_hashes = self.get_export_hashes(algo, export_encoding)
+        return (dll_hash, export_hashes)
 
 
 def decode_name(byte_sequence: bytes, is_function=False) -> str:
@@ -137,54 +234,167 @@ def print_hash_table(debug=True):
                 print(f"    64-bit: 0x{hash64:016X}")
 
 
-def generate_enum_output(
-    enum_name,
-    dll_name_algo,
-    func_name_algo,
-    dll_name_encoding="utf-8",
-    func_name_encoding="ascii",
+def get_algo_name(algo: Callable[[bytes], int]) -> str:
+    """
+    Get the name of an algorithm function, handling both regular functions and functools.partial.
+    """
+    if isinstance(algo, functools.partial):
+        return algo.func.__name__
+    return algo.__name__
+
+
+def generate_dll_name_hashes(
+    dlls: List[Dll],
+    enum_name: str,
+    output_filename: str,
+    dll_name_algo: Callable[[bytes], int],
+    dll_name_encoding: str = "utf-8",
 ):
-    out = pathlib.Path(idaapi.get_input_file_path()).parent / "api_hashes.h"
+    """
+    Generate an enum file containing DLL name hashes only.
+    """
+    out = pathlib.Path(idaapi.get_input_file_path()).parent / output_filename
     with open(out, "w+", encoding="utf-8") as f:
         f.write(f"enum {enum_name}\n")
         f.write("{\n")
-        # Print DLL entries with comments
-        for dll_path in map(pathlib.Path, modules):
-            if not dll_path.exists():
-                continue
-            dll_name_utf8 = dll_path.name.encode(dll_name_encoding)
-            hash_value = dll_name_algo(dll_name_utf8)
-            dll_name = dll_path.name.replace(".", "_")
+        for dll in dlls:
+            hash_value = dll.get_dll_hash(dll_name_algo, dll_name_encoding)
+            dll_name_safe = dll.name.replace(".", "_")
+            algo_name = get_algo_name(dll_name_algo)
             f.write(
-                f"    {dll_name_algo.__name__}_{dll_name} = 0x{hash_value:016X}, // {dll_path.name}\n"
+                f"    {algo_name}_{dll_name_safe} = 0x{hash_value:016X}, // {dll.name}\n"
             )
-            f.write("\n")  # Blank line separator
+        f.write("};\n")
+    logger.info("Generated DLL name hashes to %s", out)
 
-            pe = pefile.PE(dll_path)
-            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-                if not exp.name:
-                    continue
-                func_name = exp.name
-                hash_value = func_name_algo(func_name)
-                func_name_str = func_name.decode(
-                    func_name_encoding, errors="ignore"
-                ).replace(".", "_")
+
+def generate_export_hashes(
+    dlls: List[Dll],
+    enum_name: str,
+    output_filename: str,
+    dll_name_algo: Callable[[bytes], int],
+    func_name_algo: Callable[[bytes], int],
+    dll_name_encoding: str = "utf-8",
+    func_name_encoding: str = "ascii",
+):
+    """
+    Generate an enum file containing export function hashes only.
+    DLL names are hashed using dll_name_algo and dll_name_encoding for enum naming.
+    """
+    out = pathlib.Path(idaapi.get_input_file_path()).parent / output_filename
+    with open(out, "w+", encoding="utf-8") as f:
+        f.write(f"enum {enum_name}\n")
+        f.write("{\n")
+        for dll in dlls:
+            if not dll.exports:
+                continue
+            dll_name_safe = dll.name.replace(".", "_")
+            dll_algo_name = get_algo_name(dll_name_algo)
+            export_hashes = dll.get_export_hashes(func_name_algo, func_name_encoding)
+            for export_name, hash_value in export_hashes:
+                export_name_safe = export_name.replace(".", "_")
                 f.write(
-                    f"    {dll_name_algo.__name__}_{dll_name}_{func_name_str} = 0x{hash_value:016X}, // {func_name_str}\n"
+                    f"    {dll_algo_name}_{dll_name_safe}_{export_name_safe} = 0x{hash_value:016X}, // {export_name}\n"
                 )
         f.write("};\n")
+    logger.info("Generated export hashes to %s", out)
 
 
-# generate_enum_output(
-#     "EidolonApiHashesFnv1a64 : unsigned __int64",
-#     fnv1a_64,
-#     functools.partial(fnv1a_64, lower=False),
+def generate_all_hashes(
+    dlls: List[Dll],
+    enum_name: str,
+    output_filename: str,
+    algo: Callable[[bytes], int],
+    dll_name_encoding: str = "utf-8",
+    export_encoding: str = "utf-8",
+):
+    """
+    Generate an enum file containing both DLL name hashes and export hashes
+    using the same algorithm. DLL name entries come first, followed by export entries.
+    """
+    out = pathlib.Path(idaapi.get_input_file_path()).parent / output_filename
+    algo_name = get_algo_name(algo)
+    with open(out, "w+", encoding="utf-8") as f:
+        f.write(f"enum {enum_name}\n")
+        f.write("{\n")
+        for dll in dlls:
+            dll_hash, export_hashes = dll.get_all_hashes(
+                algo, dll_name_encoding, export_encoding
+            )
+            dll_name_safe = dll.name.replace(".", "_")
+            # Write DLL name hash
+            f.write(
+                f"    {algo_name}_{dll_name_safe} = 0x{dll_hash:016X}, // {dll.name}\n"
+            )
+            # Write export hashes
+            for export_name, hash_value in export_hashes:
+                export_name_safe = export_name.replace(".", "_")
+                f.write(
+                    f"    {algo_name}_{dll_name_safe}_{export_name_safe} = 0x{hash_value:016X}, // {export_name}\n"
+                )
+        f.write("};\n")
+    logger.info("Generated all hashes to %s", out)
+
+
+# Example: Generate DLL name hashes
+# dlls_from_paths = [Dll.from_path(pathlib.Path(p)) for p in modules]
+# generate_dll_name_hashes(
+#     dlls=dlls_from_paths,
+#     enum_name="EidolonApiHashesFnv1a64 : unsigned __int64",
+#     output_filename="dll_name_hashes.h",
+#     dll_name_algo=fnv1a_64,
+#     dll_name_encoding="utf-8",
 # )
 
-generate_enum_output(
-    "AegisApiHashesFnv1a32 : unsigned __int32",
-    fnv1a_32,
-    fnv1a_32,
-    "utf-16le",
-    "ascii",
+# Example: Generate export hashes from config
+# custom_dlls_config = {
+#     "wow_loader": {
+#         "name": "wow_loader.dll",
+#         "exports": ["eidolon_run", "g_warden_aegis_crash_callback_export"],
+#     },
+#     "Wow_loader": {
+#         "name": "Wow_loader.dll",
+#         "exports": ["eidolon_run", "g_warden_aegis_crash_callback_export"],
+#     },
+# }
+# dlls_from_config = [Dll.from_config(config) for config in custom_dlls_config.values()]
+# generate_export_hashes(
+#     dlls=dlls_from_config,
+#     enum_name="AegisApiHashesFnv1a32 : unsigned __int32",
+#     output_filename="export_hashes.h",
+#     dll_name_algo=fnv1a_32,
+#     func_name_algo=fnv1a_32,
+#     dll_name_encoding="utf-16le",
+#     func_name_encoding="ascii",
+# )
+
+# Current usage: Generate DLL name hashes (Eidolon)
+dlls_from_paths = [Dll.from_path(pathlib.Path(p)) for p in modules]
+# generate_dll_name_hashes(
+#     dlls=dlls_from_paths,
+#     enum_name="EidolonApiHashesFnv1a64 : unsigned __int64",
+#     output_filename="dll_name_hashes.h",
+#     dll_name_algo=functools.partial(fnv1a_64, lower=False),
+#     dll_name_encoding="utf-8",
+# )
+
+# Generate export hashes (Aegis)
+# generate_export_hashes(
+#     dlls=dlls_from_paths,
+#     enum_name="AegisApiHashesFnv1a32 : unsigned __int32",
+#     output_filename="export_hashes.h",
+#     dll_name_algo=fnv1a_32,
+#     func_name_algo=fnv1a_32,
+#     dll_name_encoding="utf-16le",
+#     func_name_encoding="ascii",
+# )
+
+# Example: Generate both DLL name and export hashes using the same algorithm
+generate_all_hashes(
+    dlls=dlls_from_paths,
+    enum_name="EidolonApiHashesFnv1a64 : unsigned __int64",
+    output_filename="all_hashes.h",
+    algo=functools.partial(fnv1a_64, lower=False),
+    dll_name_encoding="utf-8",
+    export_encoding="utf-8",
 )

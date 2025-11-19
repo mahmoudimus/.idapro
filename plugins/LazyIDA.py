@@ -1,11 +1,27 @@
-from __future__ import division
-from __future__ import print_function
-from struct import unpack
-import idaapi
-import idautils
-import idc
+from __future__ import division, print_function
 
-from PyQt5.Qt import QApplication
+from struct import unpack
+
+# this plugin requires IDA 7.4 or newer
+try:
+    import ida_pro
+    import idaapi
+    import idautils
+    import idc
+
+    SUPPORTED_IDA = ida_pro.IDA_SDK_VERSION >= 740
+
+    if ida_pro.IDA_SDK_VERSION >= 920:
+        from PySide6.QtWidgets import QApplication
+    else:
+        from PyQt5.Qt import QApplication
+except Exception as e:
+    print(e)
+    SUPPORTED_IDA = False
+
+# is this deemed to be a compatible environment for the plugin to load?
+if not SUPPORTED_IDA:
+    print("LazyIDA plugin is not compatible with this IDA version")
 
 ACTION_CONVERT = ["lazyida:convert%d" % i for i in range(10)]
 ACTION_SCANVUL = "lazyida:scanvul"
@@ -22,6 +38,7 @@ ACTION_HX_COPYFO = "lazyida:hx_copyfo"
 ACTION_HX_COPYNAME = "lazyida:hx_copyname"
 ACTION_HX_GOTOCLIPEA = "lazyida:hx_gotoclipea"
 ACTION_HX_GOTOCLIPFO = "lazyida:hx_gotoclipfo"
+ACTION_HX_MARK_FUNCTION_OUTLINED = "lazyida:hx_markfunctionoutlined"
 
 u16 = lambda x: unpack("<H", x)[0]
 u32 = lambda x: unpack("<I", x)[0]
@@ -30,11 +47,14 @@ u64 = lambda x: unpack("<Q", x)[0]
 ARCH = 0
 BITS = 0
 
+
 def copy_to_clip(data):
     QApplication.clipboard().setText(data)
 
+
 def clip_text():
     return QApplication.clipboard().text()
+
 
 def parse_location(loc, is_fo=False):
     is_named = False
@@ -45,19 +65,30 @@ def parse_location(loc, is_fo=False):
             loc = idaapi.get_fileregion_ea(loc)
     except ValueError:
         try:
-            ascii_text = loc.encode(encoding="ascii",errors="replace").decode(encoding="ascii").strip()
+            ascii_text = (
+                loc.encode(encoding="ascii", errors="replace")
+                .decode(encoding="ascii")
+                .strip()
+            )
             loc = idc.get_name_ea_simple(ascii_text)
             is_named = True
         except:
             return idaapi.BADADDR
     return loc, is_named, ascii_text
 
+
 class VulnChoose(idaapi.Choose):
     """
     Chooser class to display result of format string vuln scan
     """
+
     def __init__(self, title, items, icon, embedded=False):
-        idaapi.Choose.__init__(self, title, [["Address", 20], ["Function", 30], ["Format", 30]], embedded=embedded)
+        idaapi.Choose.__init__(
+            self,
+            title,
+            [["Address", 20], ["Function", 30], ["Format", 30]],
+            embedded=embedded,
+        )
         self.items = items
         self.icon = 45
 
@@ -79,10 +110,12 @@ class VulnChoose(idaapi.Choose):
     def OnSelectLine(self, n):
         idc.jumpto(int(self.items[n][0], 16))
 
+
 class hotkey_action_handler_t(idaapi.action_handler_t):
     """
     Action handler for hotkey actions
     """
+
     def __init__(self, action):
         idaapi.action_handler_t.__init__(self)
         self.action = action
@@ -137,10 +170,12 @@ class hotkey_action_handler_t(idaapi.action_handler_t):
         else:
             return idaapi.AST_DISABLE_FOR_WIDGET
 
+
 class menu_action_handler_t(idaapi.action_handler_t):
     """
     Action handler for menu actions
     """
+
     def __init__(self, action):
         idaapi.action_handler_t.__init__(self)
         self.action = action
@@ -148,7 +183,11 @@ class menu_action_handler_t(idaapi.action_handler_t):
     def activate(self, ctx):
         if self.action in ACTION_CONVERT:
             # convert (dump as)
-            t0, t1, view = idaapi.twinpos_t(), idaapi.twinpos_t(), idaapi.get_current_viewer()
+            t0, t1, view = (
+                idaapi.twinpos_t(),
+                idaapi.twinpos_t(),
+                idaapi.get_current_viewer(),
+            )
             if idaapi.read_selection(view, t0, t1):
                 start, end = t0.place(view).toea(), t1.place(view).toea()
                 size = end - start + 1
@@ -189,7 +228,7 @@ class menu_action_handler_t(idaapi.action_handler_t):
                     for i in range(0, size, 2):
                         if i % 16 == 0:
                             output += "\n    "
-                        output += "0x%04X, " % u16(data[i:i+2])
+                        output += "0x%04X, " % u16(data[i : i + 2])
                     output = output[:-2] + "\n};"
                 elif self.action == ACTION_CONVERT[4]:
                     # C array dword
@@ -199,7 +238,7 @@ class menu_action_handler_t(idaapi.action_handler_t):
                     for i in range(0, size, 4):
                         if i % 32 == 0:
                             output += "\n    "
-                        output += "0x%08X, " % u32(data[i:i+4])
+                        output += "0x%08X, " % u32(data[i : i + 4])
                     output = output[:-2] + "\n};"
                 elif self.action == ACTION_CONVERT[5]:
                     # C array qword
@@ -209,7 +248,7 @@ class menu_action_handler_t(idaapi.action_handler_t):
                     for i in range(0, size, 8):
                         if i % 32 == 0:
                             output += "\n    "
-                        output += "0x%016X, " % u64(data[i:i+8])
+                        output += "0x%016X, " % u64(data[i : i + 8])
                     output = output[:-2] + "\n};"
                 elif self.action == ACTION_CONVERT[6]:
                     # python list
@@ -217,19 +256,29 @@ class menu_action_handler_t(idaapi.action_handler_t):
                 elif self.action == ACTION_CONVERT[7]:
                     # python list word
                     data += b"\x00"
-                    output = "[%s]" % ", ".join("0x%04X" % u16(data[i:i+2]) for i in range(0, size, 2))
+                    output = "[%s]" % ", ".join(
+                        "0x%04X" % u16(data[i : i + 2]) for i in range(0, size, 2)
+                    )
                 elif self.action == ACTION_CONVERT[8]:
                     # python list dword
                     data += b"\x00" * 3
-                    output = "[%s]" % ", ".join("0x%08X" % u32(data[i:i+4]) for i in range(0, size, 4))
+                    output = "[%s]" % ", ".join(
+                        "0x%08X" % u32(data[i : i + 4]) for i in range(0, size, 4)
+                    )
                 elif self.action == ACTION_CONVERT[9]:
                     # python list qword
                     data += b"\x00" * 7
-                    output = "[%s]" %  ", ".join("%#018X" % u64(data[i:i+8]) for i in range(0, size, 8)).replace("0X", "0x")
+                    output = "[%s]" % ", ".join(
+                        "%#018X" % u64(data[i : i + 8]) for i in range(0, size, 8)
+                    ).replace("0X", "0x")
                 copy_to_clip(output)
                 print(output)
         elif self.action == ACTION_XORDATA:
-            t0, t1, view = idaapi.twinpos_t(), idaapi.twinpos_t(), idaapi.get_current_viewer()
+            t0, t1, view = (
+                idaapi.twinpos_t(),
+                idaapi.twinpos_t(),
+                idaapi.get_current_viewer(),
+            )
             if idaapi.read_selection(view, t0, t1):
                 start, end = t0.place(view).toea(), t1.place(view).toea()
             else:
@@ -245,20 +294,35 @@ class menu_action_handler_t(idaapi.action_handler_t):
             x = idaapi.ask_long(0, "Xor with...")
             if x:
                 x &= 0xFF
-                print("\n[+] Xor 0x%X - 0x%X (%u bytes) with 0x%02X:" % (start, end, end - start, x))
+                print(
+                    "\n[+] Xor 0x%X - 0x%X (%u bytes) with 0x%02X:"
+                    % (start, end, end - start, x)
+                )
                 print(repr("".join(chr(b ^ x) for b in data)))
         elif self.action == ACTION_FILLNOP:
-            t0, t1, view = idaapi.twinpos_t(), idaapi.twinpos_t(), idaapi.get_current_viewer()
+            t0, t1, view = (
+                idaapi.twinpos_t(),
+                idaapi.twinpos_t(),
+                idaapi.get_current_viewer(),
+            )
             if idaapi.read_selection(view, t0, t1):
                 start, end = t0.place(view).toea(), t1.place(view).toea()
                 idaapi.patch_bytes(start, b"\x90" * (end - start))
-                print("\n[+] Fill 0x%X - 0x%X (%u bytes) with NOPs" % (start, end, end - start))
+                print(
+                    "\n[+] Fill 0x%X - 0x%X (%u bytes) with NOPs"
+                    % (start, end, end - start)
+                )
         elif self.action == ACTION_SCANVUL:
             print("\n[+] Finding Format String Vulnerability...")
             found = []
             for addr in idautils.Functions():
                 name = idc.get_func_name(addr)
-                if "printf" in name and "v" not in name and idc.get_segm_name(addr) in (".text", ".plt", ".idata", ".plt.got"):
+                if (
+                    "printf" in name
+                    and "v" not in name
+                    and idc.get_segm_name(addr)
+                    in (".text", ".plt", ".idata", ".plt.got")
+                ):
                     xrefs = idautils.CodeRefsTo(addr, False)
                     for xref in xrefs:
                         vul = self.check_fmt_function(name, xref)
@@ -300,20 +364,32 @@ class menu_action_handler_t(idaapi.action_handler_t):
                 if op in ("mov", "lea") and dst.endswith(("r8", "r8d", "[esp+10h]")):
                     break
             elif name.endswith(("sprintf_chk",)):
-                if op in ("mov", "lea") and (dst.endswith(("rcx", "[esp+0Ch]", "R3")) or
-                                             dst.endswith("ecx") and BITS == 64):
+                if op in ("mov", "lea") and (
+                    dst.endswith(("rcx", "[esp+0Ch]", "R3"))
+                    or dst.endswith("ecx")
+                    and BITS == 64
+                ):
                     break
             elif name.endswith(("snprintf", "fnprintf")):
-                if op in ("mov", "lea") and (dst.endswith(("rdx", "[esp+8]", "R2")) or
-                                             dst.endswith("edx") and BITS == 64):
+                if op in ("mov", "lea") and (
+                    dst.endswith(("rdx", "[esp+8]", "R2"))
+                    or dst.endswith("edx")
+                    and BITS == 64
+                ):
                     break
             elif name.endswith(("sprintf", "fprintf", "dprintf", "printf_chk")):
-                if op in ("mov", "lea") and (dst.endswith(("rsi", "[esp+4]", "R1")) or
-                                             dst.endswith("esi") and BITS == 64):
+                if op in ("mov", "lea") and (
+                    dst.endswith(("rsi", "[esp+4]", "R1"))
+                    or dst.endswith("esi")
+                    and BITS == 64
+                ):
                     break
             elif name.endswith("printf"):
-                if op in ("mov", "lea") and (dst.endswith(("rdi", "[esp]", "R0")) or
-                                             dst.endswith("edi") and BITS == 64):
+                if op in ("mov", "lea") and (
+                    dst.endswith(("rdi", "[esp]", "R0"))
+                    or dst.endswith("edi")
+                    and BITS == 64
+                ):
                     break
 
         # format arg found, check its type and value
@@ -330,7 +406,9 @@ class menu_action_handler_t(idaapi.action_handler_t):
                 _op = idc.print_insn_mnem(_addr).lower()
                 if _op in ("ret", "retn", "jmp", "b") or _addr < function_head:
                     break
-                elif _op in ("mov", "lea", "ldr") and idc.print_operand(_addr, 0) == opnd:
+                elif (
+                    _op in ("mov", "lea", "ldr") and idc.print_operand(_addr, 0) == opnd
+                ):
                     op_type = idc.get_operand_type(_addr, 1)
                     opnd = idc.print_operand(_addr, 1)
                     addr = _addr
@@ -348,10 +426,12 @@ class menu_action_handler_t(idaapi.action_handler_t):
         print("0x%X: Possible Vulnerability: %s, format = %s" % (addr, name, opnd))
         return ["0x%X" % addr, name, opnd]
 
+
 class hexrays_action_handler_t(idaapi.action_handler_t):
     """
     Action handler for hexrays actions
     """
+
     def __init__(self, action):
         idaapi.action_handler_t.__init__(self)
         self.action = action
@@ -361,6 +441,10 @@ class hexrays_action_handler_t(idaapi.action_handler_t):
         if self.action == ACTION_HX_REMOVERETTYPE:
             vdui = idaapi.get_widget_vdui(ctx.widget)
             self.remove_rettype(vdui)
+            vdui.refresh_ctext()
+        elif self.action == ACTION_HX_MARK_FUNCTION_OUTLINED:
+            vdui = idaapi.get_widget_vdui(ctx.widget)
+            self.mark_function_outlined(vdui)
             vdui.refresh_ctext()
         elif self.action == ACTION_HX_COPYEA:
             ea = idaapi.get_screen_ea()
@@ -412,7 +496,11 @@ class hexrays_action_handler_t(idaapi.action_handler_t):
             old_func_type = idaapi.tinfo_t()
             if not vu.cfunc.get_func_type(old_func_type):
                 return False
-        elif vu.item.citype == idaapi.VDI_EXPR and vu.item.e.is_expr() and vu.item.e.type.is_funcptr():
+        elif (
+            vu.item.citype == idaapi.VDI_EXPR
+            and vu.item.e.is_expr()
+            and vu.item.e.type.is_funcptr()
+        ):
             # call xxx
             ea = vu.item.get_ea()
             old_func_type = idaapi.tinfo_t()
@@ -457,6 +545,30 @@ class hexrays_action_handler_t(idaapi.action_handler_t):
 
         return False
 
+    def mark_function_outlined(self, vu, should_rename=False):
+        if vu.item.citype == idaapi.VDI_FUNC:
+            func_ea = vu.cfunc.entry_ea
+            func = idaapi.get_func(func_ea)
+            flags = func.flags
+            if flags & idaapi.FUNC_OUTLINE:
+                return False
+
+            if not (flags & idc.FUNC_OUTLINE):
+                flags |= idaapi.FUNC_OUTLINE
+                func.flags = flags
+                idaapi.update_func(func)
+
+            if should_rename and func.name.startswith("sub_"):
+                new_name = f"outline_{func.name}"
+                if not idaapi.set_name(func_ea, new_name, idaapi.SN_NOWARN):
+                    idaapi.msg(
+                        "Failed to rename function '%s' to '%s'\n"
+                        % (func.name, new_name)
+                    )
+            return True
+        return False
+
+
 class UI_Hook(idaapi.UI_Hooks):
     def __init__(self):
         idaapi.UI_Hooks.__init__(self)
@@ -473,16 +585,25 @@ class UI_Hook(idaapi.UI_Hooks):
             dump_type = idaapi.BWN_DUMP
 
         if form_type == idaapi.BWN_DISASM or form_type == dump_type:
-            t0, t1, view = idaapi.twinpos_t(), idaapi.twinpos_t(), idaapi.get_current_viewer()
-            if idaapi.read_selection(view, t0, t1) or idc.get_item_size(idc.get_screen_ea()) > 1:
+            t0, t1, view = (
+                idaapi.twinpos_t(),
+                idaapi.twinpos_t(),
+                idaapi.get_current_viewer(),
+            )
+            if (
+                idaapi.read_selection(view, t0, t1)
+                or idc.get_item_size(idc.get_screen_ea()) > 1
+            ):
                 idaapi.attach_action_to_popup(form, popup, ACTION_XORDATA, None)
                 idaapi.attach_action_to_popup(form, popup, ACTION_FILLNOP, None)
                 for action in ACTION_CONVERT:
                     idaapi.attach_action_to_popup(form, popup, action, "Dump/")
 
-        if form_type == idaapi.BWN_DISASM and (ARCH, BITS) in [(idaapi.PLFM_386, 32),
-                                                               (idaapi.PLFM_386, 64),
-                                                               (idaapi.PLFM_ARM, 32),]:
+        if form_type == idaapi.BWN_DISASM and (ARCH, BITS) in [
+            (idaapi.PLFM_386, 32),
+            (idaapi.PLFM_386, 64),
+            (idaapi.PLFM_ARM, 32),
+        ]:
             idaapi.attach_action_to_popup(form, popup, ACTION_SCANVUL, None)
 
 
@@ -490,8 +611,17 @@ class HexRays_Hook(object):
     def callback(self, event, *args):
         if event == idaapi.hxe_populating_popup:
             form, phandle, vu = args
-            if vu.item.citype == idaapi.VDI_FUNC or (vu.item.citype == idaapi.VDI_EXPR and vu.item.e.is_expr() and vu.item.e.type.is_funcptr()):
-                idaapi.attach_action_to_popup(form, phandle, ACTION_HX_REMOVERETTYPE, None)
+            if vu.item.citype == idaapi.VDI_FUNC or (
+                vu.item.citype == idaapi.VDI_EXPR
+                and vu.item.e.is_expr()
+                and vu.item.e.type.is_funcptr()
+            ):
+                idaapi.attach_action_to_popup(
+                    form, phandle, ACTION_HX_REMOVERETTYPE, None
+                )
+                idaapi.attach_action_to_popup(
+                    form, phandle, ACTION_HX_MARK_FUNCTION_OUTLINED, None
+                )
         elif event == idaapi.hxe_double_click:
             vu, shift_state = args
             # auto jump to target if clicked item is xxx->func();
@@ -506,12 +636,15 @@ class HexRays_Hook(object):
                         e = vu.item.e
                         while e.x:
                             e = e.x
-                        addr = idc.get_name_ea_simple("%s::%s" % (str(e.type).split()[0], name))
+                        addr = idc.get_name_ea_simple(
+                            "%s::%s" % (str(e.type).split()[0], name)
+                        )
 
                     if addr != idaapi.BADADDR:
                         idc.jumpto(addr)
                         return 1
         return 0
+
 
 class LazyIDA_t(idaapi.plugin_t):
     flags = idaapi.PLUGIN_HIDE
@@ -547,23 +680,114 @@ class LazyIDA_t(idaapi.plugin_t):
             else:
                 BITS = 16
 
-        print("LazyIDA (v1.0.0.5) plugin has been loaded.")
+        print("LazyIDA (v1.1.0.0) plugin has been loaded.")
 
         # Register menu actions
         menu_actions = (
-            idaapi.action_desc_t(ACTION_CONVERT[0], "Dump as string", menu_action_handler_t(ACTION_CONVERT[0]), None, None, 80),
-            idaapi.action_desc_t(ACTION_CONVERT[1], "Dump as hex string", menu_action_handler_t(ACTION_CONVERT[1]), None, None, 8),
-            idaapi.action_desc_t(ACTION_CONVERT[2], "Dump as C/C++ array (BYTE)", menu_action_handler_t(ACTION_CONVERT[2]), None, None, 38),
-            idaapi.action_desc_t(ACTION_CONVERT[3], "Dump as C/C++ array (WORD)", menu_action_handler_t(ACTION_CONVERT[3]), None, None, 38),
-            idaapi.action_desc_t(ACTION_CONVERT[4], "Dump as C/C++ array (DWORD)", menu_action_handler_t(ACTION_CONVERT[4]), None, None, 38),
-            idaapi.action_desc_t(ACTION_CONVERT[5], "Dump as C/C++ array (QWORD)", menu_action_handler_t(ACTION_CONVERT[5]), None, None, 38),
-            idaapi.action_desc_t(ACTION_CONVERT[6], "Dump as python list (BYTE)", menu_action_handler_t(ACTION_CONVERT[6]), None, None, 201),
-            idaapi.action_desc_t(ACTION_CONVERT[7], "Dump as python list (WORD)", menu_action_handler_t(ACTION_CONVERT[7]), None, None, 201),
-            idaapi.action_desc_t(ACTION_CONVERT[8], "Dump as python list (DWORD)", menu_action_handler_t(ACTION_CONVERT[8]), None, None, 201),
-            idaapi.action_desc_t(ACTION_CONVERT[9], "Dump as python list (QWORD)", menu_action_handler_t(ACTION_CONVERT[9]), None, None, 201),
-            idaapi.action_desc_t(ACTION_XORDATA, "Get xored data", menu_action_handler_t(ACTION_XORDATA), None, None, 9),
-            idaapi.action_desc_t(ACTION_FILLNOP, "Fill with NOPs", menu_action_handler_t(ACTION_FILLNOP), None, None, 9),
-            idaapi.action_desc_t(ACTION_SCANVUL, "Scan format string vulnerabilities", menu_action_handler_t(ACTION_SCANVUL), None, None, 160),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[0],
+                "Dump as string",
+                menu_action_handler_t(ACTION_CONVERT[0]),
+                None,
+                None,
+                80,
+            ),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[1],
+                "Dump as hex string",
+                menu_action_handler_t(ACTION_CONVERT[1]),
+                None,
+                None,
+                8,
+            ),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[2],
+                "Dump as C/C++ array (BYTE)",
+                menu_action_handler_t(ACTION_CONVERT[2]),
+                None,
+                None,
+                38,
+            ),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[3],
+                "Dump as C/C++ array (WORD)",
+                menu_action_handler_t(ACTION_CONVERT[3]),
+                None,
+                None,
+                38,
+            ),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[4],
+                "Dump as C/C++ array (DWORD)",
+                menu_action_handler_t(ACTION_CONVERT[4]),
+                None,
+                None,
+                38,
+            ),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[5],
+                "Dump as C/C++ array (QWORD)",
+                menu_action_handler_t(ACTION_CONVERT[5]),
+                None,
+                None,
+                38,
+            ),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[6],
+                "Dump as python list (BYTE)",
+                menu_action_handler_t(ACTION_CONVERT[6]),
+                None,
+                None,
+                201,
+            ),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[7],
+                "Dump as python list (WORD)",
+                menu_action_handler_t(ACTION_CONVERT[7]),
+                None,
+                None,
+                201,
+            ),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[8],
+                "Dump as python list (DWORD)",
+                menu_action_handler_t(ACTION_CONVERT[8]),
+                None,
+                None,
+                201,
+            ),
+            idaapi.action_desc_t(
+                ACTION_CONVERT[9],
+                "Dump as python list (QWORD)",
+                menu_action_handler_t(ACTION_CONVERT[9]),
+                None,
+                None,
+                201,
+            ),
+            idaapi.action_desc_t(
+                ACTION_XORDATA,
+                "Get xored data",
+                menu_action_handler_t(ACTION_XORDATA),
+                None,
+                None,
+                9,
+            ),
+            idaapi.action_desc_t(
+                ACTION_FILLNOP,
+                "Fill with NOPs",
+                menu_action_handler_t(ACTION_FILLNOP),
+                None,
+                None,
+                9,
+            ),
+            idaapi.action_desc_t(
+                ACTION_SCANVUL,
+                "Scan format string vulnerabilities",
+                menu_action_handler_t(ACTION_SCANVUL),
+                None,
+                None,
+                160,
+            ),
         )
         for action in menu_actions:
             idaapi.register_action(action)
@@ -571,10 +795,34 @@ class LazyIDA_t(idaapi.plugin_t):
 
         # Register hotkey actions
         hotkey_actions = (
-            idaapi.action_desc_t(ACTION_COPYEA, "Copy EA", hotkey_action_handler_t(ACTION_COPYEA), "w", "Copy current EA", 0),
-            idaapi.action_desc_t(ACTION_COPYFO, "Copy FO", hotkey_action_handler_t(ACTION_COPYFO), "Shift-W", "Copy current FO", 0),
-            idaapi.action_desc_t(ACTION_GOTOCLIPEA, "Goto clipboard EA", hotkey_action_handler_t(ACTION_GOTOCLIPEA), "Shift-G"),
-            idaapi.action_desc_t(ACTION_GOTOCLIPFO, "Goto clipboard FO", hotkey_action_handler_t(ACTION_GOTOCLIPFO), "Ctrl-Shift-G"),
+            idaapi.action_desc_t(
+                ACTION_COPYEA,
+                "Copy EA",
+                hotkey_action_handler_t(ACTION_COPYEA),
+                "w",
+                "Copy current EA",
+                0,
+            ),
+            idaapi.action_desc_t(
+                ACTION_COPYFO,
+                "Copy FO",
+                hotkey_action_handler_t(ACTION_COPYFO),
+                "Shift-W",
+                "Copy current FO",
+                0,
+            ),
+            idaapi.action_desc_t(
+                ACTION_GOTOCLIPEA,
+                "Goto clipboard EA",
+                hotkey_action_handler_t(ACTION_GOTOCLIPEA),
+                "Shift-G",
+            ),
+            idaapi.action_desc_t(
+                ACTION_GOTOCLIPFO,
+                "Goto clipboard FO",
+                hotkey_action_handler_t(ACTION_GOTOCLIPFO),
+                "Ctrl-Shift-G",
+            ),
         )
         for action in hotkey_actions:
             idaapi.register_action(action)
@@ -591,16 +839,56 @@ class LazyIDA_t(idaapi.plugin_t):
             addon.name = "LazyIDA"
             addon.producer = "Lays"
             addon.url = "https://github.com/L4ys/LazyIDA"
-            addon.version = "1.0.0.5"
+            addon.version = "1.1.0.0"
             idaapi.register_addon(addon)
 
             hx_actions = (
-                idaapi.action_desc_t(ACTION_HX_REMOVERETTYPE, "Remove return type", hexrays_action_handler_t(ACTION_HX_REMOVERETTYPE), "v"),
-                idaapi.action_desc_t(ACTION_HX_COPYEA, "Copy EA", hexrays_action_handler_t(ACTION_HX_COPYEA), "w", "Copy current EA", 0),
-                idaapi.action_desc_t(ACTION_HX_COPYFO, "Copy FO", hexrays_action_handler_t(ACTION_HX_COPYFO), "Shift-W", "Copy current FO", 0),
-                idaapi.action_desc_t(ACTION_HX_GOTOCLIPEA, "Goto clipboard EA", hexrays_action_handler_t(ACTION_HX_GOTOCLIPEA), "Shift-G"),
-                idaapi.action_desc_t(ACTION_HX_GOTOCLIPFO, "Goto clipboard FO", hexrays_action_handler_t(ACTION_HX_GOTOCLIPFO), "Ctrl-Shift-G"),
-                idaapi.action_desc_t(ACTION_HX_COPYNAME, "Copy name", hexrays_action_handler_t(ACTION_HX_COPYNAME), "c"),
+                idaapi.action_desc_t(
+                    ACTION_HX_REMOVERETTYPE,
+                    "Remove return type",
+                    hexrays_action_handler_t(ACTION_HX_REMOVERETTYPE),
+                    "v",
+                ),
+                idaapi.action_desc_t(
+                    ACTION_HX_MARK_FUNCTION_OUTLINED,
+                    "Mark function outlined",
+                    hexrays_action_handler_t(ACTION_HX_MARK_FUNCTION_OUTLINED),
+                    "p",
+                ),
+                idaapi.action_desc_t(
+                    ACTION_HX_COPYEA,
+                    "Copy EA",
+                    hexrays_action_handler_t(ACTION_HX_COPYEA),
+                    "w",
+                    "Copy current EA",
+                    0,
+                ),
+                idaapi.action_desc_t(
+                    ACTION_HX_COPYFO,
+                    "Copy FO",
+                    hexrays_action_handler_t(ACTION_HX_COPYFO),
+                    "Shift-W",
+                    "Copy current FO",
+                    0,
+                ),
+                idaapi.action_desc_t(
+                    ACTION_HX_GOTOCLIPEA,
+                    "Goto clipboard EA",
+                    hexrays_action_handler_t(ACTION_HX_GOTOCLIPEA),
+                    "Shift-G",
+                ),
+                idaapi.action_desc_t(
+                    ACTION_HX_GOTOCLIPFO,
+                    "Goto clipboard FO",
+                    hexrays_action_handler_t(ACTION_HX_GOTOCLIPFO),
+                    "Ctrl-Shift-G",
+                ),
+                idaapi.action_desc_t(
+                    ACTION_HX_COPYNAME,
+                    "Copy name",
+                    hexrays_action_handler_t(ACTION_HX_COPYNAME),
+                    "c",
+                ),
             )
             for action in hx_actions:
                 idaapi.register_action(action)
@@ -630,6 +918,7 @@ class LazyIDA_t(idaapi.plugin_t):
             if self.hx_hook:
                 idaapi.remove_hexrays_callback(self.hx_hook.callback)
             idaapi.term_hexrays_plugin()
+
 
 def PLUGIN_ENTRY():
     return LazyIDA_t()

@@ -2,16 +2,25 @@
   "erase_logs_on_reload": true,
   "generate_z3_code": false,
   "dump_intermediate_microcode": false,
-  "log_dir": null,
+  "log_dir": "/Users/mahmoud/.idapro/logs",
   "configurations": [
+    "bogus_loops.json",
     "default_instruction_only.json",
+    "default_unflattening_approov.json",
     "default_unflattening_ollvm.json",
     "default_unflattening_switch_case.json",
-    "default_unflattening_approov.json",
+    "deflat_only.json",
+    "eidolon.json",
     "example_anel.json",
     "example_libobfuscated.json",
-    "eidolon.json",
-    "hodur_deobfuscation.json"
+    "flatfold-noswitch.json",
+    "flatfold.json",
+    "flatfold2.json",
+    "flatfold3.json",
+    "flatfold_no_predicate_loop_fix.json",
+    "hodur_deobfuscation.json",
+    "rotatehelper.json",
+    "rotatehelper_with_stk.json"
   ],
-  "last_project_index": 6
+  "last_project_index": 13
 }

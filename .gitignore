@@ -17,7 +17,11 @@ tmp/*.i64
 tmp/**/*
 
 
+scripts/poisonplug-scatterbrain
+
 plugins/D810.py
 plugins/d810
-scripts/poisonplug-scatterbrain
+
 themes/
+logs/
+cfg/d810

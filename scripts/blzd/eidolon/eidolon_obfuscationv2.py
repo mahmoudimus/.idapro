@@ -825,10 +825,10 @@ def simple_pattern_generator():
 
 def more_specific_pattern_generator():
     """Generates IDA string patterns based on Untitled-3 logic."""
-#
-# .text:0000000180233829 70 47                                               jo      short near ptr loc_18023386E+4
-# .text:000000018023382B C0 F6 00                                            sal     dh, 0
-# .text:000000018023382E 71 42                                               jno     short near ptr loc_18023386E+4
+    #
+    # .text:0000000180233829 70 47                                               jo      short near ptr loc_18023386E+4
+    # .text:000000018023382B C0 F6 00                                            sal     dh, 0
+    # .text:000000018023382E 71 42                                               jno     short near ptr loc_18023386E+4
     pads_ll_str = [[0xC0, -1, 0x00], [0x86, -1], [0x8A, -1]]
 
     multipart_defs_tuple_list_str: List[Tuple[List[int], List[int]]] = [
@@ -1221,13 +1221,16 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         Ignores mem_bytes_at_ea, uses IDA's database.
         Conforms to DecoderProtocol.
         """
-        # TODO:
-        # .text:00000001409451F3 000 18 F6                                               sbb     dh, dh
-        # .text:00000001409451F5 000 77 5A                                               ja      short loc_140945251
 
-        # TODO:
+        # TODO: (I think this case is already handled by increasing MAX_PATTERN_LEN to be 2x the original)
         # .text:0000000180002350 90                                                  nop
         # .text:0000000180002351 70 00                                               jo      short $+2
+
+        # TODO:
+        # .text:00000001803230EF 04 00                                               add     al, 0
+        # .text:00000001803230F1 00 C7                                               add     bh, al
+        # .text:00000001803230F3 44 24 2C                                            and     al, 2Ch
+        # .text:00000001803230F6 76 00                                               jbe     short $+2
 
         # TODO:
         # .text:0000000180002308 81 EF 3D 00 62 5E                                   sub     edi, 5E62003Dh
@@ -1237,6 +1240,184 @@ class CapstoneInstructionDecoder(InstructionDecoder):
         # .text:0000000180002310                                     loc_180002310:                          ; CODE XREF: sub_180001000+12E4↑j
         # .text:0000000180002310 86 FF                                               xchg    bh, bh
         #
+
+        # TODO:
+        # ,text:00000001802F1821 E9 4A A9 FB FF                                      jmp     def_1802AC183   ; jumptable 00000001802AC183 default case
+        #                        |=> when patched, this ends up being when E9 4A 90 90 90 and it messes up the jump target analysis
+        #                        |=> we need to figure out why.
+        # .text:00000001802F1826                                     ; ---------------------------------------------------------------------------
+        # .text:00000001802F1826
+        # .text:00000001802F1826                                     loc_1802F1826:                          ; CODE XREF: InitializeAntiCheat+63↑j
+        # .text:00000001802F1826                                                                             ; DATA XREF: .rdata:jpt_1802AC183↓o
+        # .text:00000001802F1826 70 11                                               jo      short loc_1802F1839
+        # .text:00000001802F1828 8A DB                                               mov     bl, bl
+        # .text:00000001802F182A 71 1B                                               jno     short loc_1802F1847
+
+        # TODO:#
+        # .text:00000001802E045B 48 C7 84 24 B0 03 00 00 00 00 00 00                 mov     [rsp+60F8h+var_5D48], 0
+        # .text:00000001802E0467 48 89 84 24 A0 16 00 00                             mov     [rsp+60F8h+var_4A58], rax
+        # .text:00000001802E046F 48 3B 84 24 58 30 00 00                             cmp     rax, [rsp+60F8h+var_30A0]
+        # .text:00000001802E0477 0F 90 90 90 90 90 C7                                seto    byte ptr [rax-386F6F70h]
+        #                        ^|_-> this is a bad pattern as well. i believe that 0F 90 90 90 90 90 causes
+        #                        ^|=> the disassembler to mess up by causing a byte-misalignment.
+        #                        ^|=> this should be 90 90 90 90 90 90 (noped).
+        #                        ^|=> the preceeding byte cannot be 74 or EB (look @ disassembler byte misalignment in the aegis project on ChatGPT)
+        # .text:00000001802E047E 44 24 38                                            and     al, 38h
+        # .text:00000001802E0481 B8 02 00 00 E9                                      mov     eax, 0E9000002h
+        # .text:00000001802E0486 E6 BC                                               out     0BCh, al        ; Interrupt Controller #2, 8259A
+        # .text:00000001802E0488 FC                                                  cld
+        # .text:00000001802E0489
+        # .text:00000001802E0489                                     loc_1802E0489:                          ; CODE XREF: sub_1802AC120+63↑j
+        # .text:00000001802E0489                                                                             ; DATA XREF: .rdata:jpt_1802AC183↓o
+        # .text:00000001802E0489 FF 48 8B                                            dec     dword ptr [rax-75h]
+        # .text:00000001802E048C 84 24 B8                                            test    [rax+rdi*4], ah
+        # .text:00000001802E048F 30 00                                               xor     [rax], al
+        # .text:00000001802E0491 00 0F                                               add     [rdi], cl
+        # .text:00000001802E0493 B6 00                                               mov     dh, 0
+        
+        # TODO: this will fail very heavily @ wow_loader.dll 11.2.5.63906 
+        # our patching will patch the first few jumps and the interval tree will just nop everything which will create a bad loop.
+        # .text:000000018028DA04                                                                             ; DATA XREF: .rdata:jpt_18028A1B4↓o
+        # .text:000000018028DA04 F8                                                  clc
+        # .text:000000018028DA05 86 D2                                               xchg    dl, dl
+        # .text:000000018028DA07 EB 40                                               jmp     short loc_18028DA49
+        # .text:000000018028DA09                                     ; ---------------------------------------------------------------------------
+        # .text:000000018028DA09 90                                                  nop
+        # .text:000000018028DA0A 90                                                  nop
+        # .text:000000018028DA0B 90                                                  nop
+        # .text:000000018028DA0C 90                                                  nop
+        # .text:000000018028DA0D 90                                                  nop
+        # .text:000000018028DA0E 90                                                  nop
+        # .text:000000018028DA0F 90                                                  nop
+        # .text:000000018028DA10 90                                                  nop
+        # .text:000000018028DA11 90                                                  nop
+        # .text:000000018028DA12 90                                                  nop
+        # .text:000000018028DA13 90                                                  nop
+        # .text:000000018028DA14 90                                                  nop
+        # .text:000000018028DA15 90                                                  nop
+        # .text:000000018028DA16 90                                                  nop
+        # .text:000000018028DA17 90                                                  nop
+        # .text:000000018028DA18 90                                                  nop
+        # .text:000000018028DA19 90                                                  nop
+        # .text:000000018028DA1A 90                                                  nop
+        # .text:000000018028DA1B 90                                                  nop
+        # .text:000000018028DA1C 90                                                  nop
+        # .text:000000018028DA1D 90                                                  nop
+        # .text:000000018028DA1E 90                                                  nop
+        # .text:000000018028DA1F 90                                                  nop
+        # .text:000000018028DA20 90                                                  nop
+        # .text:000000018028DA21 90                                                  nop
+        # .text:000000018028DA22 90                                                  nop
+        # .text:000000018028DA23 90                                                  nop
+        # .text:000000018028DA24 90                                                  nop
+        # .text:000000018028DA25 90                                                  nop
+        # .text:000000018028DA26 90                                                  nop
+        # .text:000000018028DA27 90                                                  nop
+        # .text:000000018028DA28 90                                                  nop
+        # .text:000000018028DA29 90                                                  nop
+        # .text:000000018028DA2A 90                                                  nop
+        # .text:000000018028DA2B 90                                                  nop
+        # .text:000000018028DA2C 90                                                  nop
+        # .text:000000018028DA2D 90                                                  nop
+        # .text:000000018028DA2E 90                                                  nop
+        # .text:000000018028DA2F 90                                                  nop
+        # .text:000000018028DA30 90                                                  nop
+        # .text:000000018028DA31 90                                                  nop
+        # .text:000000018028DA32 90                                                  nop
+        # .text:000000018028DA33 90                                                  nop
+        # .text:000000018028DA34 90                                                  nop
+        # .text:000000018028DA35 90                                                  nop
+        # .text:000000018028DA36 90                                                  nop
+        # .text:000000018028DA37 90                                                  nop
+        # .text:000000018028DA38 90                                                  nop
+        # .text:000000018028DA39 90                                                  nop
+        # .text:000000018028DA3A 90                                                  nop
+        # .text:000000018028DA3B 90                                                  nop
+        # .text:000000018028DA3C 90                                                  nop
+        # .text:000000018028DA3D 90                                                  nop
+        # .text:000000018028DA3E 90                                                  nop
+        # .text:000000018028DA3F 90                                                  nop
+        # .text:000000018028DA40 90                                                  nop
+        # .text:000000018028DA41 90                                                  nop
+        # .text:000000018028DA42 90                                                  nop
+        # .text:000000018028DA43 90                                                  nop
+        # .text:000000018028DA44 90                                                  nop
+        # .text:000000018028DA45 90                                                  nop
+        # .text:000000018028DA46 90                                                  nop
+        # .text:000000018028DA47 90                                                  nop
+        # .text:000000018028DA48 90                                                  nop
+        # .text:000000018028DA49
+        # .text:000000018028DA49                                     loc_18028DA49:                          ; CODE XREF: sub_18028A0E0+3927↑j
+        # .text:000000018028DA49 75 35                                               jnz     short loc_18028DA80
+        # .text:000000018028DA4B C0 F3 00                                            sal     bl, 0
+        # .text:000000018028DA4E 74 06                                               jz      short loc_18028DA56
+        # .text:000000018028DA50 90                                                  nop
+        # .text:000000018028DA51 90                                                  nop
+        # .text:000000018028DA52 90                                                  nop
+        # .text:000000018028DA53 90                                                  nop
+        # .text:000000018028DA54 90                                                  nop
+        # .text:000000018028DA55 90                                                  nop
+        # .text:000000018028DA56
+        # .text:000000018028DA56                                     loc_18028DA56:                          ; CODE XREF: sub_18028A0E0+396E↑j
+        # .text:000000018028DA56 74 32                                               jz      short loc_18028DA8A
+        # .text:000000018028DA58 90                                                  nop
+        # .text:000000018028DA59 90                                                  nop
+        # .text:000000018028DA5A 90                                                  nop
+        # .text:000000018028DA5B 90                                                  nop
+        # .text:000000018028DA5C 90                                                  nop
+        # .text:000000018028DA5D 90                                                  nop
+        # .text:000000018028DA5E 90                                                  nop
+        # .text:000000018028DA5F 90                                                  nop
+        # .text:000000018028DA60
+        # .text:000000018028DA60                                     loc_18028DA60:                          ; CODE XREF: sub_18028A0E0:loc_18028DA88↓j
+        # .text:000000018028DA60 75 28                                               jnz     short loc_18028DA8A
+        # .text:000000018028DA62 90                                                  nop
+        # .text:000000018028DA63 90                                                  nop
+        # .text:000000018028DA64 90                                                  nop
+        # .text:000000018028DA65 90                                                  nop
+        # .text:000000018028DA66 90                                                  nop
+        # .text:000000018028DA67 90                                                  nop
+        # .text:000000018028DA68 90                                                  nop
+        # .text:000000018028DA69 90                                                  nop
+        # .text:000000018028DA6A 90                                                  nop
+        # .text:000000018028DA6B 90                                                  nop
+        # .text:000000018028DA6C 90                                                  nop
+        # .text:000000018028DA6D 90                                                  nop
+        # .text:000000018028DA6E 90                                                  nop
+        # .text:000000018028DA6F 90                                                  nop
+        # .text:000000018028DA70 90                                                  nop
+        # .text:000000018028DA71 90                                                  nop
+        # .text:000000018028DA72 90                                                  nop
+        # .text:000000018028DA73 90                                                  nop
+        # .text:000000018028DA74 90                                                  nop
+        # .text:000000018028DA75 90                                                  nop
+        # .text:000000018028DA76 90                                                  nop
+        # .text:000000018028DA77 90                                                  nop
+        # .text:000000018028DA78 90                                                  nop
+        # .text:000000018028DA79 90                                                  nop
+        # .text:000000018028DA7A 90                                                  nop
+        # .text:000000018028DA7B 90                                                  nop
+        # .text:000000018028DA7C 90                                                  nop
+        # .text:000000018028DA7D 90                                                  nop
+        # .text:000000018028DA7E 90                                                  nop
+        # .text:000000018028DA7F 90                                                  nop
+        # .text:000000018028DA80
+        # .text:000000018028DA80                                     loc_18028DA80:                          ; CODE XREF: sub_18028A0E0:loc_18028DA49↑j
+        # .text:000000018028DA80 90                                                  nop
+        # .text:000000018028DA81 75 05                                               jnz     short loc_18028DA88
+        # .text:000000018028DA83 90                                                  nop
+        # .text:000000018028DA84 90                                                  nop
+        # .text:000000018028DA85 90                                                  nop
+        # .text:000000018028DA86 90                                                  nop
+        # .text:000000018028DA87 90                                                  nop
+        # .text:000000018028DA88
+        # .text:000000018028DA88                                     loc_18028DA88:                          ; CODE XREF: sub_18028A0E0+39A1↑j
+        # .text:000000018028DA88 75 D6                                               jnz     short loc_18028DA60
+        # .text:000000018028DA8A
+        # .text:000000018028DA8A                                     loc_18028DA8A:                          ; CODE XREF: sub_18028A0E0:loc_18028DA56↑j
+        # .text:000000018028DA8A                                                                             ; sub_18028A0E0:loc_18028DA60↑j
+        # .text:000000018028DA8A C7 44 24 28 ED 00 00 00                             mov     [rsp+0B38h+var_B10], 0EDh
+        # .text:000000018028DA92 E9 09 C7 FF FF                                      jmp     def_18028A1B4   ; jumptable 000000018028A1B4 default case
         self.load_buffer(mem_bytes_at_ea, ea)
         # Decode using Capstone
         insn = self.get_next_insn()
@@ -1251,6 +1432,7 @@ class CapstoneInstructionDecoder(InstructionDecoder):
             capstone.x86.X86_INS_XCHG,
             capstone.x86.X86_INS_MOV,
             capstone.x86.X86_GRP_CMOV,
+            capstone.x86.X86_INS_SBB,
         ):
             op1, op2 = insn.operands
             if op1.type == op2.type and op1.size == op2.size and op1.reg == op2.reg:
@@ -1311,6 +1493,7 @@ class CapstoneInstructionDecoder(InstructionDecoder):
             ):
                 decoded.is_jump = True
                 decoded.jump_target = insn.operands[0].imm
+
         return decoded
 
     def _is_self_recursive_jump(self, insn: capstone.CsInsn) -> bool:
@@ -1587,7 +1770,9 @@ class JumpTargetAnalyzer:
           - junk_length: int
           - stage1_type: SegmentType
         """
-        match_end = chain.overall_start() + MAX_PATTERN_LEN
+        # 2025-10-27 - added this here to avoid interrupting the analysis flow
+        # eidolon's anti-disassembly patterns are longer than aegis'
+        match_end = chain.overall_start() + (MAX_PATTERN_LEN * 2)
         logging.debug(
             "Processing jumps for chain @ 0x%X, match_end=0x%X",
             chain.overall_start(),
@@ -1839,11 +2024,13 @@ class CustomFilterProxyModel(QSortFilterProxyModel):
         return str(ldata_display) < str(rdata_display)
 
 
-pp = {
-    0x18009B27D,
-}
-
+pp = set()
 found = set()
+TARGET_DEBUG_ADDRESS = 0x18000AF89  # 0x18000AF13
+DEBUG_LOGGING_WINDOW_LARGE = 500
+DEBUG_LOGGING_WINDOW_SMALL = (
+    100  # For more detailed logs like instruction dumps and specific check results
+)
 
 
 # =====================================================================
@@ -1922,10 +2109,6 @@ class PatternAnalysisEngine:
         patterns = []
         if not USE_CAPSTONE or self.cs is None:
             return patterns
-
-        TARGET_DEBUG_ADDRESS = 0x18000AF89  # 0x18000AF13
-        DEBUG_LOGGING_WINDOW_LARGE = 500
-        DEBUG_LOGGING_WINDOW_SMALL = 100  # For more detailed logs like instruction dumps and specific check results
 
         if abs(base_address - TARGET_DEBUG_ADDRESS) <= DEBUG_LOGGING_WINDOW_LARGE:
             logging.info(  # Changed from debug to info to ensure visibility with default levels

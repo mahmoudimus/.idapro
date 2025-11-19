@@ -500,6 +500,34 @@ api_database = {
             "NtdllDialogWndProc_W",
         ],
     },
+    "wow_loader": {
+        "name": "wow_loader.dll",
+        "functions": ["eidolon_run", "g_warden_aegis_crash_callback_export"],
+    },
+    "Wow_loader": {
+        "name": "Wow_loader.dll",
+        "functions": ["eidolon_run", "g_warden_aegis_crash_callback_export"],
+    },
+    "WowB_loader": {
+        "name": "WowB_loader.dll",
+        "functions": ["eidolon_run", "g_warden_aegis_crash_callback_export"],
+    },
+    "WowT_loader": {
+        "name": "WowT_loader.dll",
+        "functions": ["eidolon_run", "g_warden_aegis_crash_callback_export"],
+    },
+    "WowClassic_loader.dll": {
+        "name": "WowClassic_loader.dll",
+        "functions": ["eidolon_run", "g_warden_aegis_crash_callback_export"],
+    },
+    "WowClassicT_loader.dll": {
+        "name": "WowClassicT_loader.dll",
+        "functions": ["eidolon_run", "g_warden_aegis_crash_callback_export"],
+    },
+    "WowClassicB_loader.dll": {
+        "name": "WowClassicB_loader.dll",
+        "functions": ["eidolon_run", "g_warden_aegis_crash_callback_export"],
+    },
     "kernel32": {"name": "kernel32.dll", "functions": []},
     "kernelbase": {"name": "kernelbase.dll", "functions": []},
     "user32": {"name": "user32.dll", "functions": []},
@@ -526,7 +554,7 @@ api_database = {
     "msvcp_win": {"name": "msvcp_win.dll", "functions": []},
     "bcryptprimitives": {"name": "bcryptprimitives.dll", "functions": []},
     "wintypes": {"name": "WinTypes.dll", "functions": []},
-    "gdi32full": {"name": "gdi32full.dll", "functions": []}
+    "gdi32full": {"name": "gdi32full.dll", "functions": []},
 }
 
 

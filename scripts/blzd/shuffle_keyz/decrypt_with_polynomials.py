@@ -105,14 +105,7 @@ def key_offset(PolynomialA, PolynomialB, PolynomialC, PolynomialD):
     return (PolynomialB << 8) + (PolynomialA << 12) + PolynomialD + (16 * PolynomialC)
 
 
-def undo_decryption(
-    PolynomialA,
-    PolynomialB,
-    PolynomialC,
-    PolynomialD,
-    key_size=0x89,
-    G_TLS_MIRROR_BASE=None,
-):
+def undo_decryption(PolynomialA, PolynomialB, PolynomialC, PolynomialD, key_size=0x89):
     # Dynamically obtain required addresses by symbol name.
     ENC_DATA_BASE = idc.get_name_ea_simple("?EncData_Transform_0@@YAXAEA_K0@Z")
     if ENC_DATA_BASE == idc.BADADDR:
@@ -237,7 +230,6 @@ def undo_decryption(
 
 
 if __name__ == "__main__":
-    G_TLS_MIRROR_BASE = 0  # <-- need to figure out how to get this?
     PolyA = 10
     PolyB = 498
     PolyC = 11279
