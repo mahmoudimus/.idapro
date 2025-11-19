@@ -160,9 +160,18 @@ def _check_keychain(variable_name: str) -> str:
 
 def configure_gepetto_api_keys():
     openai_api_key = get_api_key("OPENAI_API_KEY")
+    found = False
     if openai_api_key:
         os.environ["OPENAI_API_KEY"] = openai_api_key
-    else:
+        print("Configured OpenAI API key.")
+        found = True
+    gemini_api_key = get_api_key("Gemini API Key")
+    if gemini_api_key:
+        os.environ["GEMINI_API_KEY"] = gemini_api_key
+        print("Configured Gemini API key.")
+        found = True
+
+    if not found:
         print("OpenAI API key not found. Gepetto may not function correctly.")
 
 

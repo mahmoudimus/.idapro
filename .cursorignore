@@ -2,3 +2,13 @@
 **/tmp/
 **/tmp
 tmp/
+*.log           # File extension
+**/logs         # Nested directories
+libs/
+extras/
+
+.idea
+_gitless
+_backup
+
+*.code-workspace

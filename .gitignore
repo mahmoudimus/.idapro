@@ -8,9 +8,9 @@ extras/
 *.pydpackages
 
 packages/
-tmp/boombox.exe.i64
 sig
 til
+tmp/boombox.exe.i64
 tmp/*.db
 tmp/*.bin
 tmp/*.i64
@@ -20,3 +20,4 @@ tmp/**/*
 plugins/D810.py
 plugins/d810
 scripts/poisonplug-scatterbrain
+themes/
