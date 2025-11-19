@@ -25,6 +25,63 @@ VALID_CATEGORIES = [
 ]
 
 
+PLUGIN_TEMPLATE = """
+{
+  "name": str,
+  "entryPoint": path,
+  "version": str, use existing version number, or if none, current date like `2025.9.24`
+  "description": str, single concise sentence
+  "license": str,
+  "urls": {
+    "repository": str
+  },
+  "authors": [{
+    "name": str, handle or username is ok
+    "email": str, optionl
+  }],
+  "pythonDependencies": [
+    # for pure Python plugins.
+    # dependencies must be called out in the readme, not inferred from source.
+    "packagename[>=version]",
+  ],
+  "settings": [
+    # configuration values described in the readme or code
+    # that would typically require manual source code editing or config file changes
+    # but will be moved into the plugin system
+    {
+      "key": str, code identifier, like "api_key"
+      "type": "string"
+      "required": true or false
+      "default": optional str, default value
+      "name": human readable name
+      "documentation": optional human readable documentation, one line
+      "validation_pattern": optional regex pattern
+    }
+  ],
+  "categories": [
+    # choose from the following values,
+    # to help with discovery within the index and/or searching
+    "disassembly-and-processor-modules"
+    "file-parsers-and-loaders"
+    "decompilation"
+    "debugging-and-tracing"
+    "deobfuscation"
+    "collaboration-and-productivity"
+    "integration-with-third-parties-interoperability"
+    "api-scripting-and-automation"
+    "ui-ux-and-visualization"
+    "malware-analysis"
+    "vulnerability-research-and-exploit-development"
+    "other"
+  ],
+  "keywords": [
+    # pick a few keywords that describe the plugin, its purpose, and related technologies,
+    # to help with discovery within the index and/or searching
+  ]
+}
+"""
+
+
 def find_corresponding_folder(plugin_file):
     """Find a corresponding folder for a plugin file (.py or DLL).
 
