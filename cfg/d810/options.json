@@ -4,7 +4,6 @@
   "dump_intermediate_microcode": false,
   "log_dir": "/Users/mahmoud/.idapro/logs",
   "configurations": [
-    "bogus_loops.json",
     "default_instruction_only.json",
     "default_unflattening_approov.json",
     "default_unflattening_ollvm.json",
@@ -13,11 +12,9 @@
     "eidolon.json",
     "example_anel.json",
     "example_libobfuscated.json",
-    "flatfold-noswitch.json",
     "flatfold.json",
     "flatfold2.json",
     "flatfold3.json",
-    "flatfold_no_predicate_loop_fix.json",
     "hodur_deobfuscation.json",
     "rotatehelper.json",
     "rotatehelper_with_stk.json"
